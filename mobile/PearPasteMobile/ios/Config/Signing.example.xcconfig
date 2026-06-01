@@ -1,0 +1,12 @@
+// Copy this file to Config/Signing.local.xcconfig for local Xcode archive
+// attempts, or pass these as xcodebuild build-setting overrides.
+// Replace every placeholder before building Release for iphoneos.
+
+PEARPASTE_BUNDLE_IDENTIFIER = com.your-company.pearpaste
+PEARPASTE_DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID
+
+// Manual signing requires a provisioning profile name. For automatic signing,
+// set PEARPASTE_CODE_SIGN_STYLE = Automatic and leave the profile blank.
+PEARPASTE_CODE_SIGN_STYLE = Manual
+PEARPASTE_CODE_SIGN_IDENTITY = Apple Distribution
+PEARPASTE_PROVISIONING_PROFILE_SPECIFIER = YOUR_PROVISIONING_PROFILE_NAME

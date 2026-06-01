@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Paste — Android adaptive-icon FOREGROUND layer.
+
+  Spec: the foreground is a 108dp×108dp drawable but Android masks it to the
+  inner 66dp×66dp "safe zone" — the rest can be parallaxed off-screen by the
+  launcher. Rendered at 1024×1024 here, the brand mark is sized to fit inside
+  ~620×620 (~60% of the canvas) so it never gets clipped by the safe-zone
+  mask regardless of which mask the OEM uses (circle, squircle, rounded-square,
+  teardrop).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="brandGrad" x1="200" y1="200" x2="824" y2="824" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="0.6" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6aa9ff"/>
+    </linearGradient>
+    <filter id="markGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Safe-zone scale ~20 so the mark sits inside ~640×640 of the 1024 canvas -->
+  <g transform="translate(512 512) scale(20) translate(-16 -16)" filter="url(#markGlow)">
+    <rect x="6" y="4.5" width="20" height="23" rx="4.5"
+          fill="none" stroke="url(#brandGrad)" stroke-width="2.2"/>
+    <rect x="11.5" y="2.6" width="9" height="5.4" rx="2.4"
+          fill="none" stroke="url(#brandGrad)" stroke-width="2.2"/>
+    <circle cx="16" cy="18.2" r="3.1"
+            fill="none" stroke="url(#brandGrad)" stroke-width="2.1"/>
+    <path d="M16 21.3v3"
+          stroke="url(#brandGrad)" stroke-width="2.1" stroke-linecap="round"/>
+  </g>
+</svg>

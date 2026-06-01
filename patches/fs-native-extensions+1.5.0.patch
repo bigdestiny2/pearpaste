@@ -1,0 +1,17 @@
+diff --git a/node_modules/fs-native-extensions/index.js b/node_modules/fs-native-extensions/index.js
+index 5b7a5fa..137147a 100644
+--- a/node_modules/fs-native-extensions/index.js
++++ b/node_modules/fs-native-extensions/index.js
+@@ -25,6 +25,12 @@ exports.tryLock = function tryLock(fd, offset = 0, length = 0, opts = {}) {
+     binding.tryLock(fd, offset, length, opts.shared !== true)
+   } catch (err) {
+     if (err.code === 'EAGAIN') return false
++    // PearPaste patch: 32-bit Android (armeabi-v7a) kernels return EINVAL
++    // from fcntl/flock with LFS struct layouts. Advisory file-locks are
++    // redundant for a single-process mobile app whose data lives in its
++    // private files dir, so accept the lock as acquired. Captured at
++    // patches/fs-native-extensions+1.5.0.patch (applied via patch-package).
++    if (err.code === 'EINVAL') return true
+     throw err
+   }
+ 

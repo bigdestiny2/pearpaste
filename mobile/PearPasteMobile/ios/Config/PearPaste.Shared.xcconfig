@@ -1,0 +1,13 @@
+// Shared app identity/signing mapping. Keep real team IDs and provisioning
+// profile names out of committed files unless release policy says otherwise.
+// Config/Signing.local.xcconfig is optional and may override any PEARPASTE_*
+// setting below. xcodebuild command-line build settings override all of this.
+
+#include? "Signing.local.xcconfig"
+
+PRODUCT_BUNDLE_IDENTIFIER = $(PEARPASTE_BUNDLE_IDENTIFIER)
+DEVELOPMENT_TEAM = $(PEARPASTE_DEVELOPMENT_TEAM)
+PROVISIONING_PROFILE_SPECIFIER = $(PEARPASTE_PROVISIONING_PROFILE_SPECIFIER)
+CODE_SIGN_STYLE = $(PEARPASTE_CODE_SIGN_STYLE)
+CODE_SIGN_IDENTITY = $(PEARPASTE_CODE_SIGN_IDENTITY)
+CODE_SIGN_IDENTITY[sdk=iphoneos*] = $(PEARPASTE_CODE_SIGN_IDENTITY)

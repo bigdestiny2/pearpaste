@@ -1,0 +1,58 @@
+{
+  "expo": {
+    "name": "Paste",
+    "slug": "pearpaste",
+    "version": "1.0.0",
+    "newArchEnabled": true,
+    "orientation": "portrait",
+    "scheme": "pearpaste",
+    "userInterfaceStyle": "dark",
+    "icon": "./assets/images/icon.png",
+    "splash": {
+      "image": "./assets/images/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#07090c"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.pearpaste",
+      "icon": "./assets/images/icon.png",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Paste uses your camera only to scan a pairing QR code from another device. No images are stored or sent — only the decoded invite text is used, locally."
+      }
+    },
+    "android": {
+      "package": "com.pearpaste",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#07090c"
+      },
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-router"
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 29
+          }
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Paste uses your camera only to scan a pairing QR code from another device. No images are stored or sent — only the decoded invite text is used, locally.",
+          "recordAudioAndroid": false
+        }
+      ]
+    ]
+  }
+}

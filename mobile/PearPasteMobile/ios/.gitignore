@@ -1,0 +1,6 @@
+# Local Apple signing material and per-machine archive outputs.
+Config/Signing.local.xcconfig
+*.cer
+*.mobileprovision
+*.p12
+*.xcarchive

@@ -1,0 +1,12 @@
+#include "../Pods/Target Support Files/Pods-PearPaste/Pods-PearPaste.debug.xcconfig"
+
+// Development defaults are intentionally non-secret and simulator-friendly.
+// Override these through Config/Signing.local.xcconfig or xcodebuild settings
+// when building for a physical device.
+PEARPASTE_BUNDLE_IDENTIFIER = dev.pearpaste.PearPaste
+PEARPASTE_DEVELOPMENT_TEAM =
+PEARPASTE_PROVISIONING_PROFILE_SPECIFIER =
+PEARPASTE_CODE_SIGN_STYLE = Automatic
+PEARPASTE_CODE_SIGN_IDENTITY = Apple Development
+
+#include "PearPaste.Shared.xcconfig"

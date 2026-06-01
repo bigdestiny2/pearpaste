@@ -1,0 +1,133 @@
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+linkage = ENV['USE_FRAMEWORKS']
+if linkage != nil
+  Pod::UI.puts "Configuring Pod with #{linkage}ally linked Frameworks".green
+  use_frameworks! :linkage => linkage.to_sym
+end
+
+PEARPASTE_IOS_BARE_HOSTS = %w[
+  ios-arm64
+  ios-arm64-simulator
+  ios-x64-simulator
+].freeze
+
+def pearpaste_link_bare_addons!
+  repo_root = File.expand_path('../../..', __dir__)
+  bare_link = File.expand_path('../node_modules/.bin/bare-link', __dir__)
+  addons_dir = File.expand_path('../node_modules/react-native-bare-kit/ios/addons', __dir__)
+  node_binary = ENV['NODE_BINARY'].to_s
+  node_binary = 'node' if node_binary.empty?
+  unless File.executable?(bare_link)
+    raise "bare-link not found at #{bare_link}; run npm install in mobile/PearPasteMobile first"
+  end
+  Pod::UI.puts "[PearPaste] Linking Pear-end Bare iOS addons from #{repo_root}".green
+  Pod::Executable.execute_command(node_binary, [
+    bare_link,
+    repo_root,
+    *PEARPASTE_IOS_BARE_HOSTS.flat_map { |host| ['--host', host] },
+    '--out', addons_dir
+  ])
+end
+
+pre_install do |_installer|
+  pearpaste_link_bare_addons!
+end
+
+target 'PearPaste' do
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  # PearPaste: link the Pear-end's Bare native addons into react-native-bare-kit
+  # (iOS analogue of android/app/build.gradle's `pearpasteLinkBareAddons`).
+  # bare-kit's stock ios/link.mjs runs `bare-link` graph-rooted at THIS RN host,
+  # so it only finds bare-kit's own core addons. PearPaste's Pear-end native
+  # deps (sodium/rocksdb/udx/quickbit/rabin/crc/simdle/bare-crypto/…) are
+  # installed at the REPO ROOT and only referenced as `linked:` specifiers in
+  # the bare-pack bundle. Without this the app builds but the worklet crashes
+  # at runtime loading sodium/udx. bare-link merges into the out dir so it
+  # composes with bare-kit's own link step. Runs before compile, every build.
+  script_phase :name => 'PearPaste Link Bare Addons (repo root)',
+    :execution_position => :before_compile,
+    :script => <<-SH
+      set -e
+
+      REPO_ROOT="$SRCROOT/../../.."
+      BK_ADDONS="$SRCROOT/../node_modules/react-native-bare-kit/ios/addons"
+      BARE_LINK="$SRCROOT/../node_modules/.bin/bare-link"
+      NODE="${NODE_BINARY:-}"
+
+      if [ -z "$NODE" ]; then
+        NODE="$(command -v node || true)"
+      fi
+      if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
+        echo "node not found; set NODE_BINARY or add node to PATH" >&2
+        exit 1
+      fi
+      if [ ! -x "$BARE_LINK" ]; then
+        echo "bare-link not found at $BARE_LINK; run npm install in mobile/PearPasteMobile first" >&2
+        exit 1
+      fi
+
+      cd "$REPO_ROOT"
+      "$NODE" "$BARE_LINK" . --host ios-arm64 --host ios-arm64-simulator --host ios-x64-simulator --out "$BK_ADDONS"
+    SH
+
+  post_install do |installer|
+    # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+
+    # Xcode 26.4 clang rejects libfmt's consteval format-string checks
+    # ("call to consteval function ... is not a constant expression") used by
+    # RCT-Folly / glog / React core on RN 0.85. FMT_USE_CONSTEVAL=0 makes
+    # fmt's FMT_CONSTEVAL expand to nothing (disables compile-time format
+    # checking only) — the standard community workaround for this toolchain
+    # incompatibility. Applied to every pod target since fmt is header-included
+    # broadly.
+    installer.pods_project.targets.each do |t|
+      t.build_configurations.each do |cfg|
+        defs = cfg.build_settings['GCC_PREPROCESSOR_DEFINITIONS']
+        defs = ['$(inherited)'] if defs.nil?
+        defs = [defs] unless defs.is_a?(Array)
+        defs << 'FMT_USE_CONSTEVAL=0' unless defs.include?('FMT_USE_CONSTEVAL=0')
+        cfg.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = defs
+      end
+    end
+
+    # fmt's base.h UNCONDITIONALLY (no #ifndef guard) sets FMT_USE_CONSTEVAL via
+    # compiler detection; on Xcode 26.4 clang it picks `consteval`, whose
+    # format-string constructor clang then rejects ("not a constant
+    # expression"). The -D define above is therefore ignored. Authoritatively
+    # neutralize it by making FMT_CONSTEVAL expand to `constexpr` instead of
+    # `consteval` in the vendored fmt header (runtime-equivalent; only drops
+    # compile-time format-string checking). Idempotent; re-applied every
+    # `pod install` since the pod source is re-extracted.
+    fmt_base = File.join(__dir__, 'Pods', 'fmt', 'include', 'fmt', 'base.h')
+    if File.exist?(fmt_base)
+      src = File.read(fmt_base)
+      patched = src.gsub(/define(\s+)FMT_CONSTEVAL\s+consteval/, 'define\1FMT_CONSTEVAL constexpr')
+      if patched != src
+        File.write(fmt_base, patched)
+        Pod::UI.puts "[PearPaste] Patched fmt base.h: FMT_CONSTEVAL -> constexpr (Xcode 26 workaround)".green
+      end
+    end
+  end
+end

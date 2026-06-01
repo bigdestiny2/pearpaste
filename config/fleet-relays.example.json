@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy this file to config/fleet-relays.json and paste the real fleet entries from your HiveRelay handoff doc. Loaded at attach() time by backend/relay-service.js; missing/empty/malformed degrades silently to pure DHT auto-discovery.",
+
+  "knownRelays": {
+    "wss://relay1.example.com": "0000000000000000000000000000000000000000000000000000000000000000",
+    "wss://relay2.example.com": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+
+  "bootstrap": [
+    "2222222222222222222222222222222222222222222222222222222222222222"
+  ],
+
+  "_overrides": [
+    "Per-install override: drop fleet-relays.json into the app's Pear.config.storage dir (printed on boot as 'storagePath').",
+    "Runtime env override: PEARPASTE_RELAYS='wss://host=hexpubkey,wss://host2=hexpubkey' (highest priority)."
+  ]
+}

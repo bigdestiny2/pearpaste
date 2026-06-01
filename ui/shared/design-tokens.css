@@ -1,0 +1,46 @@
+/* Paste — shared design tokens. Source: docs/DESIGN_SPEC.md.
+   Imported by both website (eventually) and ui/desktop/styles.css. */
+
+:root {
+  /* Surfaces */
+  --bg: #07090c;
+  --bg-2: #0b0d10;
+  --surface: #0f1318;
+  --surface-2: #141a21;
+
+  /* Lines / borders */
+  --line: rgba(255, 255, 255, .08);
+  --line-2: rgba(255, 255, 255, .14);
+
+  /* Text */
+  --text: #e9eef3;
+  --muted: #9aa6b2;
+  --faint: #6b7682;
+
+  /* Brand accents */
+  --mint: #4ade80;
+  --cyan: #22d3ee;
+  --violet: #8b7bff;
+  --accent: #43e0a0;
+
+  /* Status */
+  --danger: #ff6b6b;
+  --warn: #f1c47b;
+  --ok: #4ade80;
+
+  /* Gradients (the signature) */
+  --grad: linear-gradient(120deg, #4ade80 0%, #22d3ee 60%, #6aa9ff 100%);
+  --grad-soft: linear-gradient(120deg, rgba(74, 222, 128, .16), rgba(34, 211, 238, .14));
+
+  /* Radii */
+  --radius: 16px;
+  --radius-lg: 22px;
+
+  /* Shadow / ring */
+  --shadow: 0 24px 60px -28px rgba(0, 0, 0, .8);
+  --ring: 0 0 0 1px var(--line) inset;
+
+  /* Typography stacks */
+  --ff: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", sans-serif;
+  --fm: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}

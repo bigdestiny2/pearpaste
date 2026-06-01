@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!--
+    Paste desktop entrypoint.
+    CSP: local assets only, no remote origins (spec §12 "No remote web assets").
+    'unsafe-inline' is limited to styles; scripts are local module files only.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none';
+                 script-src 'self';
+                 style-src 'self' 'unsafe-inline';
+                 img-src 'self' data:;
+                 font-src 'self';
+                 connect-src 'self';
+                 base-uri 'none';
+                 form-action 'none';
+                 object-src 'none'" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Paste</title>
+  <link rel="stylesheet" href="./ui/desktop/styles.css" />
+</head>
+<body>
+  <div class="aurora" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+  <div id="app" aria-busy="true">
+    <!-- Boot splash mirrors the in-app .brand-hero (icon-ring + gradient
+         wordmark + gradient underline bar). The renderer replaces this once
+         booted; this is just the first-frame visual so users see the brand
+         immediately, not a blank dark window. -->
+    <div class="boot">
+      <div class="brand-hero">
+        <div class="icon-ring">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="44" height="44" aria-hidden="true">
+            <defs><linearGradient id="bootGrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4ade80"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+            <rect x="6" y="4.5" width="20" height="23" rx="4.5" fill="none" stroke="url(#bootGrad)" stroke-width="2.4"/>
+            <rect x="11.5" y="2.6" width="9" height="5.4" rx="2.4" fill="none" stroke="url(#bootGrad)" stroke-width="2.4"/>
+            <circle cx="16" cy="18.2" r="3.1" fill="none" stroke="url(#bootGrad)" stroke-width="2.2"/>
+            <path d="M16 21.3v3" stroke="url(#bootGrad)" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="word">Paste</div>
+        <div class="bar" aria-hidden="true"></div>
+        <div class="tagline">Starting Paste…</div>
+      </div>
+    </div>
+  </div>
+  <!-- Local ES module only. The Pear-end is booted by ../index.js (root). -->
+  <script type="module" src="./ui/desktop/app.js"></script>
+</body>
+</html>

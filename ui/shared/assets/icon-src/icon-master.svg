@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Paste app icon — master master.
+
+  1024×1024, full-bleed rounded square (iOS rounds the corners; Android adaptive
+  takes the foreground from icon-foreground.svg, but legacy / launcher uses this
+  master). Mirrors the website brand mark (clipboard + lock) in the signature
+  mint→cyan gradient, sitting on a dark surface with a subtle aurora glow that
+  matches the website aurora field.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Brand mint to cyan to blue gradient — same stops as the brand grad var -->
+    <linearGradient id="brandGrad" x1="180" y1="180" x2="844" y2="844" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="0.6" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6aa9ff"/>
+    </linearGradient>
+
+    <!-- Surface (the rounded square background). Subtle vertical gradient
+         from the surface token to a hair below the bg token, matching cards. -->
+    <linearGradient id="surfaceGrad" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#101620"/>
+      <stop offset="1" stop-color="#07090c"/>
+    </linearGradient>
+
+    <!-- Aurora glow blobs (mint top-left + cyan top-right). Sit underneath the
+         brand mark, very low alpha, blurred via a filter. -->
+    <radialGradient id="auroraMint" cx="0.18" cy="0.12" r="0.55">
+      <stop offset="0" stop-color="#4ade80" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#4ade80" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="auroraCyan" cx="0.85" cy="0.20" r="0.50">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Soft outer glow around the brand mark so it reads from across the dock -->
+    <filter id="markGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Inner shadow / lift on the rounded square -->
+    <filter id="surfaceInner" x="0" y="0" width="100%" height="100%">
+      <feGaussianBlur stdDeviation="0" result="blur"/>
+    </filter>
+
+    <!-- Clip everything to the rounded square so the aurora doesn't bleed out
+         past the icon edges (iOS strips outside anyway, but on Android the
+         legacy square+round mask shows the full rect). -->
+    <clipPath id="squareMask">
+      <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squareMask)">
+    <!-- Base dark surface -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#surfaceGrad)"/>
+
+    <!-- Aurora glow layers (matches website .aurora) -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#auroraMint)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#auroraCyan)"/>
+
+    <!-- Thin gradient ring just inside the radius for a polished edge -->
+    <rect x="8" y="8" width="1008" height="1008" rx="216" ry="216"
+          fill="none" stroke="url(#brandGrad)" stroke-width="3" stroke-opacity="0.30"/>
+
+    <!--
+      Brand mark: clipboard outline + clip top + lock body + shackle.
+      Geometry is a direct port of website/index.html line 22 (32-unit viewBox
+      → 1024) scaled ×32 and centered. Stroke widths scaled correspondingly
+      (2.4 × 32 = ~77 originally; tuned down to 56 so it reads as polished
+      rather than chunky at small icon sizes).
+    -->
+    <g transform="translate(512 512) scale(28) translate(-16 -16)" filter="url(#markGlow)">
+      <!-- Clipboard body -->
+      <rect x="6" y="4.5" width="20" height="23" rx="4.5"
+            fill="none" stroke="url(#brandGrad)" stroke-width="2.0"/>
+      <!-- Clip / hat -->
+      <rect x="11.5" y="2.6" width="9" height="5.4" rx="2.4"
+            fill="none" stroke="url(#brandGrad)" stroke-width="2.0"/>
+      <!-- Lock body (circle) -->
+      <circle cx="16" cy="18.2" r="3.1"
+              fill="none" stroke="url(#brandGrad)" stroke-width="1.9"/>
+      <!-- Lock shackle (short downstroke from the lock) -->
+      <path d="M16 21.3v3"
+            stroke="url(#brandGrad)" stroke-width="1.9" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

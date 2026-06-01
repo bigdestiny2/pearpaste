@@ -1,0 +1,12 @@
+#include "../Pods/Target Support Files/Pods-PearPaste/Pods-PearPaste.release.xcconfig"
+
+// Release intentionally has no checked-in Apple identity. Archive/device builds
+// must provide real values via Config/Signing.local.xcconfig or xcodebuild
+// build-setting overrides, then the validation build phase checks them.
+PEARPASTE_BUNDLE_IDENTIFIER =
+PEARPASTE_DEVELOPMENT_TEAM =
+PEARPASTE_PROVISIONING_PROFILE_SPECIFIER =
+PEARPASTE_CODE_SIGN_STYLE = Manual
+PEARPASTE_CODE_SIGN_IDENTITY = Apple Distribution
+
+#include "PearPaste.Shared.xcconfig"
