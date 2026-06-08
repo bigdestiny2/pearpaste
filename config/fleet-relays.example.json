@@ -6,6 +6,8 @@
     "wss://relay2.example.com": "1111111111111111111111111111111111111111111111111111111111111111"
   },
 
+  "_bootstrapNote": "bootstrap[] is honored ONLY when the HiveRelay client owns its own swarm. Pear-native desktop runs in advanced mode and hands the client the app's shared Hyperswarm, so the client does NOT own the swarm and these entries are a no-op. Pear-native discovers relays over the DHT RELAY_DISCOVERY_TOPIC regardless. Leave empty unless you are an embedder running the client with its own swarm; if set in advanced mode the app logs 'relay-fleet-bootstrap-ignored' on boot.",
+
   "bootstrap": [
     "2222222222222222222222222222222222222222222222222222222222222222"
   ],

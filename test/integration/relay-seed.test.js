@@ -31,6 +31,32 @@ test('assertCiphertextOnly blocks plaintext / key material / sentinel', (t) => {
   t.exception(() => assertCiphertextOnly({ root: SENTINEL }),
     /relay blindness/, 'the plaintext sentinel anywhere is rejected')
 
+  // Generic secret-ish field names are also rejected (hardened guard): even if
+  // a future refactor introduces a generically-named secret/credential or
+  // leaks user content, the last-line guard stops it before it reaches a relay.
+  t.exception(() => assertCiphertextOnly({ secretKey: 'x' }),
+    /relay blindness/, 'a generic secretKey is rejected')
+  t.exception(() => assertCiphertextOnly({ secret: 'x' }),
+    /relay blindness/, 'a generic secret field is rejected')
+  t.exception(() => assertCiphertextOnly({ password: 'x' }),
+    /relay blindness/, 'a password field is rejected')
+  t.exception(() => assertCiphertextOnly({ note: { tags: ['a'] } }),
+    /relay blindness/, 'user-content tags are rejected')
+  t.exception(() => assertCiphertextOnly({ content: 'hello' }),
+    /relay blindness/, 'user-content body is rejected')
+
+  // ...while the existing safe relay identifiers still pass unchanged (the
+  // [^a-z] boundaries keep compound keys like appKey/discoveryKey/keyHex safe).
+  t.execution(() => assertCiphertextOnly({
+    appKey: 'a'.repeat(64),
+    discoveryKey: 'b'.repeat(64),
+    keyHex: 'c'.repeat(64),
+    ciphertextRoot: 'deadbeef',
+    privacyTier: 'p2p-only',
+    retainUntil: Date.now() + 60_000,
+    replicas: 5
+  }), 'safe relay identifiers (appKey/discoveryKey/keyHex/…) still pass')
+
   try {
     assertCiphertextOnly({ plaintext: 'x' })
     t.fail('should have thrown')

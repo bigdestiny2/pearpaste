@@ -33,7 +33,7 @@ import bundledFleet from '../config/fleet-relays.js'
 // constructs a bad payload, assertCiphertextOnly() throws before it leaves
 // the process.
 const RELAY_FORBIDDEN_KEY_RE =
-  /(^|[^a-z])(plaintext|mnemonic|passphrase|recoveryphrase|rootseed|vaultkey|indexkey|itemkey|signseed|signingsecretkey|boxsecretkey|devicesecretkey|deviceadminseed|notebody|clipbody|body|title)([^a-z]|$)/i
+  /(^|[^a-z])(plaintext|mnemonic|passphrase|recoveryphrase|rootseed|seed|secret|privatekey|secretkey|signingsecretkey|boxsecretkey|devicesecretkey|deviceadminseed|vaultkey|indexkey|itemkey|signseed|masterkey|password|passwd|notebody|clipbody|body|title|tag|tags|content)([^a-z]|$)/i
 
 export class RelayBlindnessError extends Error {
   constructor (msg) {
@@ -204,6 +204,19 @@ export async function attach (ctx) {
     log.info('relay-fleet-default', { mode: 'dht-auto-discovery' })
   }
 
+  // Observability only (no behavior change): bootstrap[] is honored by the
+  // 0.9.2 client ONLY when it owns its swarm. We run in advanced mode and pass
+  // ctx.swarm in (the client does NOT own it — §22 single-swarm contract), so
+  // any configured bootstrap entries are a silent no-op. Surface that clearly
+  // so an advanced operator isn't left wondering why their bootstrap[] had no
+  // effect, instead of debugging a phantom config knob.
+  if (fleet.bootstrap.length > 0) {
+    log.warn('relay-fleet-bootstrap-ignored', {
+      count: fleet.bootstrap.length,
+      reason: 'advanced-mode: client does not own the swarm'
+    })
+  }
+
   // Mutable service state. `enabled` defaults true but the whole subsystem is
   // optional: nothing here can block local use.
   const rstate = {
@@ -291,7 +304,7 @@ export async function attach (ctx) {
         log.debug('relay-disconnected', { pubkey: pub, total: rstate.connectedRelays.size })
         ctx.emit('relay-connected-changed', { count: rstate.connectedRelays.size })
       })
-      client.on('seeded', (e) => log.info('relay-seeded', { appKey: e && e.appKey }))
+      client.on('seeded', (e) => log.info('relay-seeded', { appKey: e && (e.appKey || e.key) }))
       client.on('seed-cap-warning', (e) => log.warn('relay-seed-cap', { appKey: e && e.appKey }))
       await client.start()
       rstate.client = client
