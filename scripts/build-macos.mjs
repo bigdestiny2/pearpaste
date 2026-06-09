@@ -64,6 +64,7 @@
 import { execFileSync } from 'child_process'
 import crypto from 'crypto'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -268,7 +269,16 @@ function findApp (target, wrapper) {
 function pearBuild (dry) {
   const wrapper = val('--app', 'PEARPASTE_MAC_APP')
   const target = val('--target', 'PEARPASTE_MAC_TARGET') || path.join(ROOT, 'dist', 'macos')
-  const buildArgs = ['build', BUILD_FLAG]
+  // EMPIRICAL (Pear v0.3243, verified on-device 2026-06-10): `pear build`
+  // prints its help text and EXITS 0 — producing NOTHING — unless (a)
+  // `--package=` is passed explicitly (its cwd project detection fails
+  // silently) and (b) every flag uses the `--flag=value` form
+  // (space-separated values are parsed as positionals and rejected with
+  // "Unrecognized Argument"). This was the "finicky arg" that blocked all
+  // three platform installers; build-windows.mjs / package-linux.mjs need the
+  // same forms. Because pear exits 0 either way, the produced app is
+  // VERIFIED on disk below — never trust the exit code.
+  const buildArgs = ['build', `--package=${path.join(ROOT, 'package.json')}`]
   if (wrapper) {
     // Validate the basename matches productName BEFORE invoking pear (it enforces
     // the same rule, but our message is friendlier and fails earlier).
@@ -277,23 +287,55 @@ function pearBuild (dry) {
     if (base !== PRODUCT_NAME) {
       die(`darwin app dir basename must equal productName "${PRODUCT_NAME}" (pear build enforces this); got "${path.basename(wrapper)}"`)
     }
-    buildArgs.push(wrapper)
+    buildArgs.push(`${BUILD_FLAG}=${wrapper}`)
   } else {
-    // No prebuilt wrapper supplied. `pear build` still needs an app-dir path
-    // argument; without one we cannot proceed in a real run.
-    // TODO(verify pear): confirm whether `pear build --darwin-arm64-app` can
-    // synthesize the .app from the staged project alone, or always requires a
-    // pre-staged pear-electron app dir as the path argument. Until verified,
-    // require PEARPASTE_MAC_APP so we never invent a flag/behaviour.
+    // No prebuilt wrapper supplied. Build one by copying the pear-electron
+    // runtime shell ("Pear Runtime.app") to <target-parent>/macos-wrapper/
+    // Paste.app, rebranding Info.plist + icon, and ad-hoc re-signing — the
+    // exact steps are in docs/RELEASE.md §3. Until that is automated here,
+    // require the path so we never package the wrong bundle.
     if (!dry) die('set PEARPASTE_MAC_APP to the prebuilt darwin app dir (basename "Paste"); pear build requires the platform app-dir path argument')
-    buildArgs.push(path.join('<path-to>', `${PRODUCT_NAME}.app`))
+    buildArgs.push(`${BUILD_FLAG}=${path.join('<path-to>', `${PRODUCT_NAME}.app`)}`)
   }
-  buildArgs.push('--target', target)
+  buildArgs.push(`--target=${target}`)
   log(`$ pear ${buildArgs.join(' ')}`)
   if (dry) { ok('dry-run: pear build not executed'); return target }
   execFileSync('pear', buildArgs, { cwd: ROOT, stdio: 'inherit' })
+  const produced = path.join(target, 'by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
+  if (!fs.existsSync(produced)) {
+    die(`pear build produced no app at ${path.relative(ROOT, produced)} — pear prints help + exits 0 on arg-parse failure; check the --flag=value forms above`)
+  }
+  completeRuntimeTree(target)
   ok(`packaged darwin app into ${path.relative(ROOT, target)}/by-arch/${ARCH}/app`)
   return target
+}
+
+// EMPIRICAL (2026-06-10): the deployment tree `pear build` emits contains only
+// package.json + by-arch/ — but the pear-electron shell .app is NOT
+// standalone: its Contents/Resources/app/boot.js requires
+// `../../../../../../../boot.bundle`, i.e. `<tree-root>/boot.bundle`, SEVEN
+// directories up. Complete the tree from the local pear-electron runtime
+// asset (boot.bundle + prebuilds) so the wrapped app can actually boot; a
+// .dmg of the bare .app launches nothing.
+function completeRuntimeTree (target) {
+  if (fs.existsSync(path.join(target, 'boot.bundle'))) return
+  const assetsRoot = path.join(os.homedir(), 'Library', 'Application Support', 'pear', 'assets')
+  let src = null
+  try {
+    for (const d of fs.readdirSync(assetsRoot)) {
+      const cand = path.join(assetsRoot, d)
+      if (fs.existsSync(path.join(cand, 'boot.bundle')) && fs.existsSync(path.join(cand, 'by-arch', ARCH))) { src = cand; break }
+    }
+  } catch (_) {}
+  if (!src) {
+    warn('no local pear-electron asset found to complete the runtime tree (boot.bundle/prebuilds) — the wrapped app will NOT boot standalone; run the app once via `pear run --dev .` to fetch the asset')
+    return
+  }
+  fs.copyFileSync(path.join(src, 'boot.bundle'), path.join(target, 'boot.bundle'))
+  if (fs.existsSync(path.join(src, 'prebuilds')) && !fs.existsSync(path.join(target, 'prebuilds'))) {
+    fs.cpSync(path.join(src, 'prebuilds'), path.join(target, 'prebuilds'), { recursive: true })
+  }
+  ok('completed deployment tree (boot.bundle + prebuilds from the local pear-electron asset)')
 }
 
 // ---- Create the .dmg (hdiutil) --------------------------------------------
@@ -302,16 +344,23 @@ function pearBuild (dry) {
 function makeDmg (app, signed, dry) {
   const ver = appVersion()
   const distDir = path.dirname(path.dirname(path.dirname(path.dirname(app)))) // .../dist/macos (best-effort)
+  // EMPIRICAL (2026-06-10): wrap the deployment TREE, not the bare .app — the
+  // shell boots `<tree-root>/boot.bundle` (see completeRuntimeTree), so a
+  // .dmg containing only Paste.app produces an app that cannot start. When
+  // the tree root (boot.bundle beside by-arch/) exists, image the whole tree.
+  const wrapTree = fs.existsSync(path.join(distDir, 'boot.bundle'))
+  const src = wrapTree ? distDir : app
+  // Never write the .dmg INSIDE the folder being imaged.
   const outDir = process.env.PEARPASTE_DIST_DIR
     ? path.join(ROOT, process.env.PEARPASTE_DIST_DIR)
-    : (fs.existsSync(distDir) ? distDir : path.join(ROOT, 'dist', 'macos'))
+    : (wrapTree ? path.dirname(distDir) : (fs.existsSync(distDir) ? distDir : path.join(ROOT, 'dist', 'macos')))
   const dmgName = signed ? `${PRODUCT_NAME}-${ver}.dmg` : `${PRODUCT_NAME}-${ver}-unsigned.dmg`
   const dmg = path.join(outDir, dmgName)
-  log(`hdiutil create -volname "${PRODUCT_NAME}" -srcfolder "${app}" -ov -format UDZO "${dmg}"`)
+  log(`hdiutil create -volname "${PRODUCT_NAME}" -srcfolder "${src}" -ov -format UDZO "${dmg}"`)
   if (dry) { ok('dry-run: hdiutil not executed'); return dmg }
   fs.mkdirSync(outDir, { recursive: true })
   fs.rmSync(dmg, { force: true })
-  execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', app, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
+  execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', src, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
   const digest = sha256(dmg)
   fs.writeFileSync(`${dmg}.sha256`, `${digest}  ${path.basename(dmg)}\n`)
   // Record which pear:// link this wrapper resolves (the .app embeds the runtime

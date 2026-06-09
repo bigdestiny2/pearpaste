@@ -113,6 +113,10 @@ Both auxiliary controls FAILED as the design first wrote them; **the core forwar
 
 ## 10. Parked non-revocation threads (context only)
 - **Going-public A/B decision** — the revocation work UNBLOCKS the confidentiality blocker.
-- **Desktop installers** `.dmg`/`.exe`/`.deb` — build boxes active (Flatpak spike, glibc 2.32+ docs); exact `pear build --<platform>-app` arg still finicky.
+- **Desktop installers** `.dmg`/`.exe`/`.deb` — **the "finicky `pear build` arg" is SOLVED (empirically, on-device, Pear v0.3243, 2026-06-10)** — Windows/Linux boxes read this:
+  1. `pear build` prints help + **exits 0** (producing NOTHING) unless `--package=<abs path to package.json>` is passed explicitly AND every flag uses the `--flag=value` form (space-separated values are parsed as positionals → "Unrecognized Argument"). Never trust its exit code — verify the output app dir exists.
+  2. The platform app dir passed to `--<platform>-app=` is the pear-electron runtime shell ("Pear Runtime.app" from `~/Library/Application Support/pear/assets/<id>/by-arch/<host>/bin/`), copied + renamed to `Paste`(.app), rebranded (Info.plist/icon) and — on macOS — ad-hoc re-signed (`codesign --force --deep --sign -`; Apple Silicon refuses unsealed binaries after a plist edit).
+  3. The shell is NOT standalone: its `Resources/app/boot.js` requires `<tree-root>/boot.bundle` (7 dirs up). The deployment tree from `pear build` (package.json + by-arch/) must be COMPLETED with `boot.bundle` + `prebuilds/` from the same pear-electron asset, and the installer must package the WHOLE TREE, not the bare app. `scripts/build-macos.mjs` now does all of this (see `pearBuild`/`completeRuntimeTree`/`makeDmg`); port the same fixes to `build-windows.mjs`/`package-linux.mjs`.
+  - macOS: `dist/Paste-0.1.0-unsigned.dmg` builds clean via `PEARPASTE_MAC_APP=... npm run build:mac` (UNSIGNED dev tier — Developer ID + notarization still needed for release, fails closed). Remaining verification: a GUI first-launch smoke test of the dmg app.
 - **Production link** `pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy` staged + seeding (this Mac is the seeder).
 - **Website** live on **www.paste.global** (separate repo `bigdestiny2/paste-site`; Vercel; SEO/LLMSEO done). paste-site commits NEED the noreply email or Vercel silently won't deploy.
