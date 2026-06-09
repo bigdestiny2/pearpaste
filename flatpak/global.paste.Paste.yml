@@ -1,0 +1,63 @@
+# Flatpak manifest for PearPaste — SPIKE (first Pear-on-Flatpak attempt).
+#
+# WHY THIS EXISTS
+# A pear-electron desktop app embeds Electron/Chromium, which is compiled against
+# glibc >= 2.32 — so the .deb / AppImage / `pear run` launcher all FAIL on Ubuntu
+# 20.04 (glibc 2.31) and older. Flatpak is the ONLY model that bundles its own
+# glibc + base libraries (the Freedesktop runtime), sandboxed from the host, so
+# the SAME artifact runs on 20.04 and older. We build against org.freedesktop.
+# Platform 24.08 (glibc ~2.39 INSIDE the sandbox), independent of the host glibc.
+#
+# STATUS: spike. The shape below is the standard, well-trodden Electron-on-Flatpak
+# pattern (Freedesktop runtime + Electron base app + zypak). The PEAR-SPECIFIC part
+# is the `payload/` — a materialized linux-x64 pear-electron app produced by
+# scripts/build-flatpak.mjs (pear dump + pear build). The exact `pear build
+# --linux-x64-app` arg is the same first-build unknown flagged for the .exe/.dmg;
+# see docs/handover/BUILD_FLATPAK.md. The build script assembles a context dir
+# (dist/flatpak/context/) holding this manifest + the support files + payload/,
+# and runs flatpak-builder there.
+id: global.paste.Paste
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+# The Electron base app ships Chromium's system deps + `zypak` — Chromium's
+# setuid/namespace sandbox cannot run under Flatpak's sandbox without it. Its
+# branch MUST match runtime-version. Install once:
+#   flatpak install flathub org.electronjs.Electron2.BaseApp//24.08
+base: org.electronjs.Electron2.BaseApp
+base-version: '24.08'
+command: paste
+separate-locales: false
+finish-args:
+  # --- P2P: the load-bearing permission ------------------------------------
+  # Hyperswarm / HyperDHT / UDX need raw network (UDP holepunching + TCP). Without
+  # --share=network PearPaste cannot reach peers or relays and nothing ever syncs.
+  - --share=network
+  - --share=ipc
+  # --- GUI ------------------------------------------------------------------
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri                 # GPU acceleration for Chromium
+  - --talk-name=org.freedesktop.Notifications
+  # --- storage --------------------------------------------------------------
+  # The encrypted vault lives in the per-app data dir
+  # (~/.var/app/global.paste.Paste/) by default — NO host filesystem access
+  # needed. xdg-download is granted only for explicit export/import.
+  - --filesystem=xdg-download
+modules:
+  - name: paste
+    buildsystem: simple
+    build-commands:
+      # payload/ = the materialized linux-x64 pear-electron app (Electron binary +
+      # bundled PearPaste), staged by scripts/build-flatpak.mjs.
+      - mkdir -p /app/paste
+      - cp -a payload/. /app/paste/
+      - install -Dm755 paste-launcher.sh /app/bin/paste
+      - install -Dm644 global.paste.Paste.desktop /app/share/applications/global.paste.Paste.desktop
+      - install -Dm644 global.paste.Paste.metainfo.xml /app/share/metainfo/global.paste.Paste.metainfo.xml
+      - install -Dm644 icon-512.png /app/share/icons/hicolor/512x512/apps/global.paste.Paste.png
+    sources:
+      # The build script runs flatpak-builder from dist/flatpak/context/, which
+      # contains this manifest, the support files, and payload/. "." pulls them in.
+      - type: dir
+        path: .

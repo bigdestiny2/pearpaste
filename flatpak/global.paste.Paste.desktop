@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Paste
+GenericName=Encrypted Notes & Clipboard
+Comment=End-to-end encrypted note and clipboard sync over Pear (peer-to-peer, no account)
+Exec=paste
+Icon=global.paste.Paste
+Terminal=false
+Categories=Utility;Office;Network;
+Keywords=notes;clipboard;encryption;p2p;pear;sync;privacy;
+StartupNotify=true
+StartupWMClass=Paste
