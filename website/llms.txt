@@ -20,7 +20,7 @@ Paste (internal package name "pearpaste") is built on the Pear / Holepunch peer-
 - Deletion is cryptographic erasure: destroying the keys makes any retained ciphertext unreadable, but Paste cannot prove a third-party relay operator never kept a copy of that ciphertext.
 
 ## Links
-- Website: https://paste.global/
+- Website: https://www.paste.global/
 - Source code: https://github.com/bigdestiny2/pearpaste
 - License: Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)
 
