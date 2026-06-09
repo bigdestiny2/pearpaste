@@ -60,13 +60,23 @@ npm run release:win
 then `signtool sign /fd SHA256 /tr <TSA> /td SHA256` over the produced
 `bin\*-app\*.exe`. It **fails closed** without `PEARPASTE_WIN_CERT`.
 
-> ⚠️ **First-build check:** `pear build --win32-x64-app` needs the win32-x64 app
-> dir (basename `Paste`). On the first real build, confirm whether `pear build`
-> synthesizes it from the staged project or needs a pre-built dir passed via
-> `PEARPASTE_WIN_WRAPPER` (a `TODO(verify pear)` is flagged in
-> `scripts/build-windows.mjs`). If it asks for one, point `PEARPASTE_WIN_WRAPPER`
-> at the produced app dir and re-run. Report what you see — the maintainer will
-> lock this down after the first run.
+> ⚠️ **`pear build` needs the Pear runtime materialized first** — it's a *fetched*
+> Pear app, not in node_modules. Do this once on the box, before step 4:
+> ```bat
+> :: 1. get pear-electron's runtime link
+> node -e "console.log(require('pear-electron/package.json').pear.ui.link)"
+> ::    -> pear://0.940.cktxzeti...
+> :: 2. dump it locally (~450 MB once; carries by-arch slices for all platforms)
+> pear dump --force <that-link> .\pear-runtime
+> :: 3. point the build at the win32-x64 slice (it holds the runtime app):
+> set PEARPASTE_WIN_WRAPPER=%CD%\pear-runtime\by-arch\win32-x64
+> ```
+> The precise `pear build --win32-x64-app <path>` arg form was still being pinned
+> at handover (it printed usage in my testing — a parser quirk, not a path
+> error). If `build:win` prints `pear build` usage instead of building, try
+> `PEARPASTE_WIN_WRAPPER` = the `by-arch\win32-x64` dir, then the runtime
+> `.exe`/app dir *inside* it, and adding `--package package.json`. **Report which
+> form builds** and I'll lock it into `scripts/build-windows.mjs` for everyone.
 
 ## 5. (Optional) Installer
 Wrap the signed app dir with NSIS or WiX → `PearPaste-Setup.exe`, then

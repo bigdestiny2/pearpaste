@@ -63,9 +63,13 @@ npm run release:linux
 **fails closed** if one is missing.
 
 ## 5. Sanity-check before sending back
-- Install + launch:
+- Install + launch — note the `.deb` is a **launcher** (it runs `pear run
+  pear://<link>`), so the target box needs the Pear runtime **and** the
+  production link must be staged+seeded, which is currently **held**. Until then
+  the `.deb` *builds* fine but won't *launch*:
   ```sh
-  sudo dpkg -i dist/linux/paste_<version>_amd64.deb    # (once the .deb exists)
+  npm i -g pear                                      # target needs the Pear runtime
+  sudo dpkg -i dist/linux/paste_<version>_amd64.deb
   paste        # or the .desktop entry — confirm it opens to the unlock screen
   ```
 - Optional independent check on a throwaway vault:

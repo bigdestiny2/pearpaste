@@ -19,8 +19,8 @@ Windows and Linux boxes (macOS `.dmg` is built on the Mac). Pair these with
 |---|------|-------|--------|
 | 1 | Land the multiwriter durability fix | maintainer (in progress) | ⏳ agent running |
 | 2 | Land the packaging pipeline (`.deb`, unsigned mode, `build-macos`, `release.yml`) | maintainer | ✅ landed (`5ce9ae5`) |
-| 3 | Push the build branch to GitHub so the boxes can `git clone`/checkout it | maintainer | ⏳ after 1–2 (will confirm repo visibility / whether to exclude internal `REVIEW.md`) |
-| 4 | Stage production on the Mac → versioned `pear://` link | maintainer | ⏳ after 1 (so the shipped app includes the fix) |
+| 3 | Push the build branch to GitHub so the boxes can `git clone`/checkout it | maintainer | ✅ pushed — `total-review-followups` (repo is private, so `REVIEW.md` is not exposed) |
+| 4 | Stage + seed production → live `pear://` link | maintainer | ⏸️ **HELD** until the silent-loss fix lands (key minted but inert — nothing staged/seeded yet) |
 | 5 | Hand off the build branch + the `pear://` link + the runbooks | maintainer | ⏳ |
 | 6 | Run the runbook on each box → **unsigned** `.exe` / `.deb`; send artifacts back | **you (boxes)** | blocked on 3–5 |
 | 7 | Buy certs → signed/notarized rebuild | **you** + maintainer | later |
