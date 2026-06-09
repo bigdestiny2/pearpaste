@@ -277,13 +277,14 @@ test('§16 replayed old op rejected after key rotation', async (t) => {
   // then update it (v2 wins, higher lamport). "Replaying" the v1 content via
   // a fresh upsert with the SAME noteId cannot resurrect v1: the reducer
   // keeps the highest-lamport write.
-  const created = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: 'v1', body: SENTINEL_PREFIX + 'V1' } })
+  const created = await call(pe, COMMANDS.NOTE_UPSERT, { note: { label: 'v1', body: SENTINEL_PREFIX + 'V1' } })
   const noteId = created.noteId
-  await call(pe, COMMANDS.NOTE_UPSERT, { note: { noteId, title: 'v2', body: SENTINEL_PREFIX + 'V2' } })
+  await call(pe, COMMANDS.NOTE_UPSERT, { note: { noteId, label: 'v2', body: SENTINEL_PREFIX + 'V2' } })
   await engine.refresh()
   const cur = await call(pe, COMMANDS.NOTE_OPEN, { noteId })
   await call(pe, COMMANDS.NOTE_CLOSE, { noteId })
-  t.is(cur.note.title, 'v2', 'LWW: current state is the latest (highest-lamport) write')
+  t.is(cur.note.label, 'v2', 'LWW: current state is the latest (highest-lamport) write')
+  t.is(cur.note.body, SENTINEL_PREFIX + 'V2', 'LWW: the latest body wins too')
   // A stale op with a LOWER lamport than current loses deterministically.
   const incomingStale = { lamport: 1, deviceId: 'zzz' }
   const currentLww = { lamport: 999999, deviceId: 'aaa' }

@@ -236,7 +236,9 @@ beta" gate. Each item names its enforcement and its automated check.
       `sec-storage.test.js`.
 - [x] Unlock does not bulk-decrypt — `openItems` empty after unlock.
       `sec-access.test.js`.
-- [x] Sealed list/search rows carry no title/body/clip text.
+- [x] Sealed list/search rows carry no note body, tags, or clip text. The
+      short note name (`label`) is shown for navigation, decrypted in-memory
+      only while unlocked (encrypted at rest, never seen by relays).
       `sec-access.test.js`.
 - [x] Selected-item plaintext cleared on close/background/timeout/lock.
       `sec-access.test.js`.

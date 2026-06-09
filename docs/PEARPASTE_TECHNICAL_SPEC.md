@@ -504,7 +504,7 @@ Default v1:
 
 - Local-only search index by default.
 - Optional encrypted replicated search index behind "faster search on new devices" setting.
-- Search should return sealed result rows by default. Titles, bodies, and clip text are decrypted only when the user taps a result.
+- Search should return sealed result rows by default. The short note name (`label`) is shown for navigation; bodies, tags, and clip text are decrypted only when the user taps a result.
 
 ### 9.4 Tap-to-Decrypt Item Lifecycle
 
@@ -525,7 +525,7 @@ Rules:
 - No decrypted title cache at rest.
 - No decrypted note preview cache at rest.
 - No decrypted clipboard history cache at rest.
-- List rows may show non-sensitive local metadata only: type icon, coarse modified bucket, device label if user chooses, and sealed/pinned status.
+- List rows may show the short note name (`label`) plus non-sensitive local metadata: type icon, coarse modified bucket, device label if user chooses, and sealed/pinned status. The note name is decrypted in-memory only while unlocked (encrypted at rest, never sent to relays); the body, tags, and clip text stay sealed until tapped.
 - Pinned does not mean decrypted. Pinned only changes ordering.
 - Copy action decrypts the selected item, writes it to the OS clipboard, then clears app-held plaintext immediately after the OS write completes.
 - Optional convenience mode may keep a selected note visible for a user-configured timeout, default 60 seconds, never across lock/background.
@@ -779,7 +779,7 @@ Renderer contract:
 
 - UI never receives vault keys.
 - UI receives plaintext only for the one note or clip the user explicitly opens, copies, pastes, or exports.
-- UI list views receive sealed metadata, not decrypted titles or bodies by default.
+- UI list views receive the short note name plus sealed metadata — not decrypted bodies, tags, or clip text — by default.
 - UI must discard plaintext on lock.
 - UI must discard selected-item plaintext when the item closes, the app backgrounds, or the visibility timer expires.
 - Backend can refuse clipboard reads when locked.
@@ -813,7 +813,7 @@ Security tests:
 - sentinel plaintext relay export scan,
 - logs scan,
 - unlock does not bulk-decrypt notes or clips,
-- sealed list rendering does not receive plaintext titles, bodies, or clip text,
+- sealed list rendering does not receive plaintext note bodies, tags, or clip text (the short note name is shown for navigation),
 - selected item plaintext is cleared on close, background, timeout, and lock,
 - revoked device cannot append,
 - modified ciphertext fails AEAD,

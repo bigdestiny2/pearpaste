@@ -87,38 +87,44 @@ test('§16 sealed list/search rendering never carries titles, bodies, or clip te
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
 
-  const title = SENTINEL_PREFIX + 'SEALED_TITLE_' + rnd()
+  // The note NAME (`label`) is intentionally shown in the list for navigation
+  // (decrypted in-memory only while unlocked; sealed at rest + hidden from
+  // relays — spec §16). The BODY, tags, and clip text stay sealed
+  // (tap-to-decrypt), so only those carry the leak sentinel.
+  const label = 'note-name-' + rnd()
   const body = SENTINEL_PREFIX + 'SEALED_BODY_' + rnd()
+  const tag = SENTINEL_PREFIX + 'SEALED_TAG_' + rnd()
   const clipText = SENTINEL_PREFIX + 'SEALED_CLIP_' + rnd()
-  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title, body, tags: ['secrettag'] } })
+  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { label, body, tags: [tag] } })
   await call(pe, COMMANDS.CLIP_CAPTURE, { kind: 'text', body: clipText })
 
   const list = JSON.stringify(await call(pe, COMMANDS.NOTE_LIST, {}))
-  t.absent(list.includes(title), 'NOTE_LIST response has no plaintext title')
   t.absent(list.includes(body), 'NOTE_LIST response has no plaintext body')
-  t.absent(list.includes(SENTINEL_PREFIX), 'NOTE_LIST response has zero sentinels (fully sealed)')
+  t.absent(list.includes(tag), 'NOTE_LIST response has no plaintext tags')
+  t.absent(list.includes(SENTINEL_PREFIX), 'NOTE_LIST carries no sealed plaintext (body/tags/clip)')
+  t.ok(list.includes(label), 'NOTE_LIST row shows the note label (name) for navigation')
 
   const clipList = JSON.stringify(await call(pe, COMMANDS.CLIP_LIST, {}))
   t.absent(clipList.includes(clipText), 'CLIP_LIST response has no plaintext clip text')
   t.absent(clipList.includes(SENTINEL_PREFIX), 'CLIP_LIST response has zero sentinels')
 
-  // Search returns sealed pointer rows only — never the matched title/body.
+  // Search returns sealed pointer rows only — never the matched body/clip text.
   const search = JSON.stringify(await call(pe, COMMANDS.SEARCH, { q: 'sealed' }))
-  t.absent(search.includes(title), 'SEARCH response carries no title')
   t.absent(search.includes(body), 'SEARCH response carries no body')
-  t.absent(search.includes(SENTINEL_PREFIX), 'SEARCH rows are sealed (no sentinel)')
+  t.absent(search.includes(SENTINEL_PREFIX), 'SEARCH rows are sealed (no body/tag/clip plaintext)')
 
-  // Inspect a row's shape: a sealed row must NOT carry title/body keys.
+  // Inspect a row's shape: the body is sealed (absent); the label/name is the
+  // only user-content field surfaced for the list.
   const rows = (await call(pe, COMMANDS.NOTE_LIST, {})).notes
   t.is(rows.length, 1, 'one row')
-  t.is(rows[0].sealed, true, 'row marked sealed')
-  t.absent('title' in rows[0], 'no `title` key on a sealed row')
+  t.is(rows[0].sealed, true, 'row marked sealed (body intentionally absent)')
   t.absent('body' in rows[0], 'no `body` key on a sealed row')
+  t.is(rows[0].label, label, 'sealed row carries the visible label (name)')
 
-  // Sanity: the data IS retrievable via the explicit open path (so we proved
-  // sealing, not just an empty store).
+  // Sanity: the body IS retrievable via the explicit open path (so we proved
+  // sealing, not just an empty store), and the name round-trips.
   const opened = await call(pe, COMMANDS.NOTE_OPEN, { noteId: up.noteId })
-  t.is(opened.note.title, title, 'explicit NOTE_OPEN returns the real title')
+  t.is(opened.note.label, label, 'explicit NOTE_OPEN returns the real label (name)')
   t.is(opened.note.body, body, 'explicit NOTE_OPEN returns the real body')
 })
 
