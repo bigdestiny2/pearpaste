@@ -79,7 +79,7 @@ function preflight () {
   }
   // Icon (reused from the native packager's asset set)
   if (fs.existsSync(path.join(ROOT, 'assets', 'icon-512.png'))) ok('assets/icon-512.png present')
-  else { warn('assets/icon-512.png missing — Flatpak will ship without a hicolor icon'); }
+  else { warn('assets/icon-512.png missing — Flatpak will ship without a hicolor icon') }
   // Tooling
   for (const cmd of ['flatpak', 'flatpak-builder']) {
     if (hasCommand(cmd)) ok(`${cmd} on PATH`)
@@ -149,8 +149,7 @@ function materializePayload (dryRun) {
   //    Electron binary differently, symlink the largest ELF executable to `Paste`.
   if (!fs.existsSync(path.join(payload, 'Paste'))) {
     const bin = findElectronBinary(payload)
-    if (bin) { fs.symlinkSync(path.relative(payload, bin), path.join(payload, 'Paste')); ok(`symlinked payload/Paste -> ${path.relative(payload, bin)}`) }
-    else warn('no obvious Electron binary in payload; verify paste-launcher.sh target')
+    if (bin) { fs.symlinkSync(path.relative(payload, bin), path.join(payload, 'Paste')); ok(`symlinked payload/Paste -> ${path.relative(payload, bin)}`) } else warn('no obvious Electron binary in payload; verify paste-launcher.sh target')
   }
   ok(`materialized payload -> ${path.relative(ROOT, payload)}`)
   return payload
