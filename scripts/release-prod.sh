@@ -46,6 +46,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CHANNEL="production"
+# Stable production link (pear://<key>). Mint it ONCE with `pear touch`, save the
+# key, and reuse the SAME link for every release so installed clients keep
+# updating over the P2P path. `pear stage` takes a link, NOT a channel name.
+PEARPASTE_LINK="${PEARPASTE_LINK:-}"
 DRY_RUN=0
 ASSUME_YES=0
 SKIP_PIN=0
@@ -60,6 +64,7 @@ die()  { printf '\033[31m[release:error]\033[0m %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --channel)     CHANNEL="$2"; shift 2;;
+    --link)        PEARPASTE_LINK="$2"; shift 2;;
     --dry-run)     DRY_RUN=1; shift;;
     --yes|-y)      ASSUME_YES=1; shift;;
     --skip-pin)    SKIP_PIN=1; shift;;
@@ -119,11 +124,19 @@ RELEASE_VERLINK="pear://<fork>.<length>.<production-key>"
 #    (`pear stage --help`: pear stage [flags] <link> [dir=.].)
 # ---------------------------------------------------------------------------
 log "STEP 1/5 — stage app"
+# `pear stage` takes a real pear:// link, NOT a channel name. Mint the stable
+# production link ONCE (`pear touch` -> save the printed key) and pass it via
+# PEARPASTE_LINK / --link; reuse the SAME link every release so installed
+# clients keep updating over the P2P path.
 if [ "$DRY_RUN" = "1" ]; then
-  log "(dry-run) would run: pear stage --json $CHANNEL"
+  log "(dry-run) would run: pear stage --no-ask --json ${PEARPASTE_LINK:-pear://<your-production-key>}"
 else
-  confirm "Stage Paste to channel '$CHANNEL'?" || die "aborted at stage"
-  STAGE_JSON="$(pear stage --json "$CHANNEL" | tee /dev/stderr)"
+  case "${PEARPASTE_LINK:-}" in
+    pear://*) : ;;
+    *) die "set PEARPASTE_LINK (or --link) to your production pear:// link — bootstrap once: 'pear touch' (save the printed key) then export PEARPASTE_LINK=pear://<key>" ;;
+  esac
+  confirm "Stage Paste ($CHANNEL) to $PEARPASTE_LINK?" || die "aborted at stage"
+  STAGE_JSON="$(pear stage --no-ask --json "$PEARPASTE_LINK" | tee /dev/stderr)"
   _link="$(printf '%s\n' "$STAGE_JSON" | json_field link || true)"
   _verlink="$(printf '%s\n' "$STAGE_JSON" | json_field verlink || true)"
   [ -n "${_link:-}" ] && RELEASE_LINK="$_link"
@@ -132,39 +145,45 @@ else
   log "staged verlink: $RELEASE_VERLINK"
 fi
 
-# Mirror the staged entrypoint set locally so the verifier scans exactly what
-# ships. We copy the same files Pear stages (package.json#pear stage.entrypoints
-# + index.html/js + ui/ + backend/), excluding tests/docs/.git/node_modules
-# cache. The manifest is package.json#pear (Pear's canonical source); pear.json
-# was removed to avoid a second, drift-prone manifest.
-log "preparing staged-file mirror for verification ($STAGE_DIR)"
-rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR"
-# rsync if available (clean excludes); fall back to cp.
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a \
-    --exclude '.git' --exclude 'test' --exclude 'docs' \
-    --exclude 'node_modules/.cache' --exclude "$STAGE_DIR" \
-    index.html index.js package.json ui backend scripts node_modules \
-    "$STAGE_DIR/" 2>/dev/null || true
-else
-  for p in index.html index.js package.json ui backend scripts; do
-    [ -e "$p" ] && cp -R "$p" "$STAGE_DIR/" 2>/dev/null || true
-  done
-fi
-
 # ---------------------------------------------------------------------------
-# 2. Run the verifier against the STAGED app files (spec §17/§8.4). This must
-#    pass before any production link is promoted.
+# 2. Verify the encryption invariant against a FRESHLY BUILT VAULT (spec
+#    §8.4/§17). We do NOT scan source: the app's own source legitimately
+#    contains the plaintext sentinel constant (backend/shared-ops.js) and the
+#    scanner (scripts/verify-encryption.js), so a source scan false-positives.
+#    Instead we drive the real Pear-end to create a vault with sentinel-laden
+#    content, then scan its on-disk STORAGE bytes (+ relay-export mirror) — the
+#    same gate CI's sentinel-guard enforces. PEARPASTE_DISABLE_SWARM keeps the
+#    gate offline/deterministic (no DHT/relay needed to prove storage is sealed).
 # ---------------------------------------------------------------------------
-log "STEP 2/5 — verify staged files (encryption invariant gate)"
+log "STEP 2/5 — verify encryption invariant (fresh-vault storage scan)"
 if [ "$SKIP_VERIFY" = "1" ]; then
   warn "--skip-verify set; SKIPPING the encryption gate (NOT for a real release)"
+elif [ "$DRY_RUN" = "1" ]; then
+  log "(dry-run) would build a sentinel-laden vault via the Pear-end, then scan its storage with verify-encryption.js"
 else
-  if node scripts/verify-encryption.js "$STAGE_DIR" --json; then
-    log "verifier PASSED on staged files"
+  VAULT_DIR="$(mktemp -d)"
+  if ! PEARPASTE_DISABLE_SWARM=1 VAULT_DIR="$VAULT_DIR" node -e '
+    import("./backend/index.js").then(async ({ createPearEnd }) => {
+      const { COMMANDS } = await import("./backend/rpc.js")
+      const { SENTINEL_PREFIX: S } = await import("./backend/shared-ops.js")
+      const pe = await createPearEnd({ storagePath: process.env.VAULT_DIR })
+      await pe.call(COMMANDS.CREATE_VAULT, { label: "release-gate", platform: "release", passphrase: "release-gate-pw" })
+      await pe.call(COMMANDS.NOTE_UPSERT, { note: { label: S + "NAME", body: S + "BODY_should_be_sealed", tags: [S + "TAG"] } })
+      await pe.call(COMMANDS.CLIP_CAPTURE, { kind: "text", body: S + "CLIP_should_be_sealed" })
+      if (pe.ctx.sync && pe.ctx.sync._opened) { try { await pe.ctx.sync.refresh() } catch (_) {} }
+      await pe.call(COMMANDS.LOCK_VAULT, {})
+      await new Promise(function (r) { setTimeout(r, 400) })
+      await pe.close()
+      process.exit(0)
+    }).catch(function (e) { console.error(e); process.exit(2) })
+  '; then
+    rm -rf "$VAULT_DIR"; die "could not build the verification vault (Pear-end failed)"
+  fi
+  if node scripts/verify-encryption.js "$VAULT_DIR" --json; then
+    log "verifier PASSED on a freshly built vault (storage is ciphertext-only)"
+    rm -rf "$VAULT_DIR"
   else
-    die "verifier FAILED on staged files — release blocked (spec §8.4 invariant)"
+    rm -rf "$VAULT_DIR"; die "verifier FAILED on a freshly built vault — release blocked (spec §8.4 invariant)"
   fi
 fi
 
