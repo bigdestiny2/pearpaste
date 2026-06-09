@@ -136,18 +136,45 @@ async function teardown (devices, testnet) {
   try { if (testnet) await testnet.destroy() } catch (_) {}
 }
 
-// Pump update() on a set of engines until `pred` returns truthy or we hit the
+// Drive one convergence step on every engine: pull remote updates AND run the
+// durability reconciler (the production `sync-converge` loop in
+// autobase-sync.js's attach() does both; this lightweight test ctx constructs
+// SyncEngine directly so the helpers stand in for that loop). The reconciler is
+// what re-materializes a content row an indexer-migration rolled out of the view
+// (FRESH-WRITER ORPHAN fix), so the tests must pump it too.
+async function convergeStep (engines) {
+  for (const e of engines) {
+    try { await e.refresh() } catch (_) {}
+    try { await e._reconcileDurability() } catch (_) {}
+  }
+}
+
+// Pump convergence on a set of engines until `pred` returns truthy or we hit the
 // deadline. Returns the last value pred produced (truthy on success).
 async function pumpUntil (engines, pred, { timeoutMs = 30000, every = 150 } = {}) {
   const deadline = Date.now() + timeoutMs
   let val = false
   while (Date.now() < deadline) {
-    for (const e of engines) { try { await e.refresh() } catch (_) {} }
+    await convergeStep(engines)
     await sleep(every)
     try { val = await pred() } catch (_) { val = false }
     if (val) return val
   }
   return val
+}
+
+// Run `fn` with a background convergence pump running on `engines` for its whole
+// duration — mirrors production, where every device's `sync-converge` loop keeps
+// calling refresh() + reconcile independently. The fresh-writer-orphan fix needs
+// the REMOTE device to keep pumping (its ack finalizes the migration) and the
+// LOCAL device to keep reconciling (to re-materialize a rolled-back row), so a
+// write issued in the membership window must be exercised under a live pump.
+async function withPump (engines, fn, { every = 100 } = {}) {
+  const ctl = { on: true }
+  const loop = (async () => {
+    while (ctl.on) { await convergeStep(engines); await sleep(every) }
+  })()
+  try { return await fn() } finally { ctl.on = false; await loop }
 }
 
 // Decrypt the full device set of an engine from its in-memory authz cache
@@ -281,10 +308,10 @@ test('concurrent writes + revoke converge to identical device + note views', { t
   // engine dictates — exercising re-linearization. We assert the note authored
   // by the freshly-integrated second writer (B) converges onto the bootstrap
   // engine (A): content from a just-added writer must replicate + materialize
-  // everywhere with no lost write. (We deliberately do NOT also assert that A's
-  // own note survives this particular fresh-writer reorg window: that is an
-  // Autobase linearization quirk reproducible on the UNMODIFIED engine — see
-  // findings — and is orthogonal to the two fixes under test.)
+  // everywhere with no lost write. (A's-own-note survival across the fresh-writer
+  // reorg window — the SILENT NOTE-LOSS durability gap — is now asserted directly
+  // in the dedicated "fresh-writer orphan" test below; the appendOp
+  // durability-confirm fix makes it genuinely assertable.)
   await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:from-A',
     { noteId: 'from-A', label: 'A', body: 'A-body', createdAt: 1, updatedAt: 1 })
   await B.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:from-B',
@@ -420,4 +447,217 @@ test('revoking B converges + a post-revoke op signed by B is rejected on both', 
   const postOnA = await openNote(A.engine, 'note:post-revoke')
   t.absent(postOnA, 'post-revoke op signed by B never materialized on engine A' +
     (bThrew ? ' (append threw ' + (bThrew.code || bThrew.message) + ')' : ''))
+})
+
+// ---------------------------------------------------------------------------
+// (d) CONCURRENT APPEND DROP — two appendOps in ONE event-loop tick BOTH land
+// ---------------------------------------------------------------------------
+// On the UNMODIFIED engine, Promise.all([appendOp(a), appendOp(b)]) on a live
+// two-writer base (ACKs flowing) drops one write: Autobase's append layer keeps
+// shared mutable bookkeeping (this._appending / this._appended / this._optimistic
+// and the bump-until-target loop in node_modules/autobase/index.js
+// _appendBatch) and two base.append() calls started in the same tick race it, so
+// the second op never lands. The per-engine append-serialization chain
+// (backend/autobase-sync.js _append/_appendChain) funnels every append so each
+// fully settles before the next. This asserts BOTH same-tick writes materialize
+// — it FAILS on baseline (one row missing).
+//
+// Uses the DETERMINISTIC in-memory corestore.replicate pipe (the same wiring
+// index.js drives on a swarm 'connection', and the same harness
+// test/unit/notes-service.test.js's convergence test uses). The concurrent-
+// append drop is a LOCAL append-layer race, so the in-memory pipe demonstrates
+// it reproducibly without DHT/testnet timing — and without the separate,
+// volume-sensitive apply-state wedge that a large unsettled burst can trigger
+// over a real testnet (see findings).
+test('two concurrent appendOps in the same tick BOTH land (no dropped write)', { timeout: 120000 }, async (t) => {
+  const dirA = tmp('ccA')
+  const dirB = tmp('ccB')
+  const storeA = new Corestore(dirA)
+  const storeB = new Corestore(dirB)
+  await storeA.ready()
+  await storeB.ready()
+
+  const vaultKey = crypto.randomBytes(crypto.KEY_BYTES)
+  const indexKey = crypto.randomBytes(32)
+  const vaultId = 'cc-vault'
+
+  function mkCtx (store, seedByte) {
+    const headerCache = {}
+    const device = identity.createDeviceIdentity({
+      label: store === storeA ? 'A' : 'B', platform: 'test', seed: b4a.alloc(32, seedByte)
+    })
+    return {
+      crypto,
+      ops,
+      log: { debug () {}, info () {}, warn () {}, error () {} },
+      state: { vaultId, vaultKeys: { vaultKey, indexKey }, device, lamport: new ops.Lamport(0), _vaultHeaderCache: headerCache },
+      vaultStore: {
+        store,
+        namespace: (ns) => store.namespace(ns),
+        getVaultHeader: async () => headerCache,
+        putVaultHeader: async (h) => { Object.assign(headerCache, h); return h }
+      },
+      emit () {},
+      isUnlocked: () => true
+    }
+  }
+
+  const ctxA = mkCtx(storeA, 31)
+  const engA = new SyncEngine(ctxA)
+  await engA.open()
+  const ctxB = mkCtx(storeB, 32)
+  ctxB.state._vaultHeaderCache.autobaseKey = b4a.toString(engA.base.key, 'hex')
+  const engB = new SyncEngine(ctxB)
+  await engB.open()
+
+  const s1 = storeA.replicate(true)
+  const s2 = storeB.replicate(false)
+  s1.pipe(s2).pipe(s1)
+  s1.on('error', () => {})
+  s2.on('error', () => {})
+
+  t.teardown(async () => {
+    try { s1.destroy() } catch (_) {}
+    try { s2.destroy() } catch (_) {}
+    try { await engA.close() } catch (_) {}
+    try { await engB.close() } catch (_) {}
+    try { await storeA.close() } catch (_) {}
+    try { await storeB.close() } catch (_) {}
+    try { fs.rmSync(dirA, { recursive: true, force: true }) } catch (_) {}
+    try { fs.rmSync(dirB, { recursive: true, force: true }) } catch (_) {}
+  })
+
+  // Authorize B as a real second writer (two-writer base, ACKs flowing).
+  await engA._appendDeviceAdd({
+    deviceId: ctxB.state.device.deviceId,
+    label: 'B',
+    platform: 'test',
+    signingPubkey: ctxB.state.device.signingPubkey,
+    boxPubkey: 'b',
+    roles: ['writer', 'reader'],
+    writerKey: b4a.toString(engB.base.local.key, 'hex')
+  }, { signer: engA._localSigner() })
+  await engA.refresh()
+  const settled = await pumpUntil([engA, engB], async () =>
+    engB.base.writable && engA.devices.size === 2 && engB.devices.size === 2)
+  t.ok(settled, 'B authorized; both engines see the 2-device set')
+
+  // SAME-TICK concurrent pairs issued right after B integrates — the live
+  // two-writer window (ACKs flowing, indexer just added) where baseline drops
+  // the second op of a same-tick pair. Each Promise.all fires both appendOps
+  // before either resolves. (noteId is the BARE id; the reducer keys the row by
+  // objectId 'note:'+noteId, matching the objectId we pass to appendOp and read
+  // back with openNote.) The serialization chain + durability reconciler land +
+  // keep all 12; baseline loses 2 (proven by toggling the fix off).
+  const ids = []
+  for (let r = 0; r < 6; r++) {
+    const na = 'cc-' + r + '-a'
+    const nb = 'cc-' + r + '-b'
+    const a = 'note:' + na
+    const b = 'note:' + nb
+    ids.push(a, b)
+    await Promise.all([
+      engA.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, a,
+        { noteId: na, title: 'a', body: 'A' + r, createdAt: 1, updatedAt: 1 }),
+      engA.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, b,
+        { noteId: nb, title: 'b', body: 'B' + r, createdAt: 1, updatedAt: 1 })
+    ])
+  }
+
+  // Every same-tick write must materialize (and decrypt) on BOTH engines
+  // (baseline loses one of each concurrent pair — proven on the unmodified
+  // engine via the in-memory-pipe repro).
+  const converged = await pumpUntil([engA, engB], async () => {
+    for (const id of ids) {
+      if (!(await openNote(engA, id))) return false
+      if (!(await openNote(engB, id))) return false
+    }
+    return true
+  }, { timeoutMs: 30000 })
+
+  const missing = []
+  for (const id of ids) {
+    if (!(await openNote(engA, id)) || !(await openNote(engB, id))) missing.push(id)
+  }
+  t.ok(converged, 'all same-tick concurrent writes converged on both engines')
+  t.is(missing.length, 0,
+    'every same-tick concurrent appendOp landed on BOTH engines (no drop): missing=' + JSON.stringify(missing))
+  t.is(ids.length, 12, 'issued 6 same-tick pairs (12 writes)')
+})
+
+// ---------------------------------------------------------------------------
+// (e) FRESH-WRITER ORPHAN — a note A writes around B's pairing/first write
+//     SURVIVES on BOTH converged engines (the SILENT NOTE-LOSS gap)
+// ---------------------------------------------------------------------------
+// On the UNMODIFIED engine this is the durability gap the prior agent had to
+// stop short of asserting: A writes a note in the window where B is added as a
+// writer/indexer and then writes. Adding an indexer makes Autobase migrate/
+// reboot the apply state and re-checkout the view at indexedLength, rolling A's
+// not-yet-indexed note out of the view — the op stays in the linearized log and
+// is re-applied (accepted), but the row never re-materializes, so the note
+// vanishes from the converged view on BOTH devices. The durability reconciler
+// (backend/autobase-sync.js _reconcileDurability, driven by the convergence
+// loop) tracks this device's additive content and re-materializes any row a
+// migration rolled back. This asserts A's note survives on BOTH engines — it
+// FAILS on baseline (absent on both). Makes the view a function of the
+// linearized log for CONTENT, not just authz.
+test('a note A writes around B\'s pairing SURVIVES on both engines (no orphan)', { timeout: 120000 }, async (t) => {
+  const vaultKey = crypto.randomBytes(crypto.KEY_BYTES)
+  const indexKey = crypto.randomBytes(32)
+  const vaultId = 'mwconv-e'
+  const testnet = await createTestnet(3)
+
+  const A = await makeDevice({ tag: 'A', vaultKey, indexKey, vaultId, bootstrap: testnet.bootstrap, seedByte: 41 })
+  const B = await makeDevice({
+    tag: 'B',
+    vaultKey,
+    indexKey,
+    vaultId,
+    bootstrap: testnet.bootstrap,
+    seedByte: 42,
+    autobaseKey: b4a.toString(A.engine.base.key, 'hex')
+  })
+  t.teardown(() => teardown([A, B], testnet))
+
+  await joinShared([A, B], vaultKey)
+
+  // Authorize B (grants B's writer/indexer seat — this is what triggers the
+  // apply-state migration that orphans A's un-indexed content).
+  await authorize(A.engine, B.device, b4a.toString(B.engine.base.local.key, 'hex'))
+  const bWritable = await pumpUntil([A.engine, B.engine], async () => B.engine.base.writable)
+  t.ok(bWritable, 'B became writable (writer seat linearized)')
+
+  // The orphan window: A writes a note RIGHT as B integrates, then B writes its
+  // first op (which finalizes the migration on A). Run under a live pump so B's
+  // ack — which both finalizes the migration AND lets appendOp's durability
+  // confirm observe re-materialization — flows exactly as production.
+  const survived = await withPump([A.engine, B.engine], async () => {
+    await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:A-at-pairing',
+      { noteId: 'A-at-pairing', label: 'A', body: 'A-at-pairing-body', createdAt: 1, updatedAt: 1 })
+    await B.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:B-first',
+      { noteId: 'B-first', label: 'B', body: 'B-first-body', createdAt: 1, updatedAt: 1 })
+    // Both notes must converge on both engines.
+    return pumpUntil([A.engine, B.engine], async () => {
+      const aOnA = await openNote(A.engine, 'note:A-at-pairing')
+      const aOnB = await openNote(B.engine, 'note:A-at-pairing')
+      const bOnA = await openNote(A.engine, 'note:B-first')
+      const bOnB = await openNote(B.engine, 'note:B-first')
+      return aOnA && aOnB && bOnA && bOnB
+    }, { timeoutMs: 45000 })
+  })
+
+  t.ok(survived, 'both A-at-pairing AND B-first converged on both engines')
+
+  // The load-bearing assertions: A's note — written in the fresh-writer window —
+  // is present and correct on BOTH engines (would be ABSENT on both at baseline).
+  const aOnA = await openNote(A.engine, 'note:A-at-pairing')
+  const aOnB = await openNote(B.engine, 'note:A-at-pairing')
+  t.ok(aOnA, 'A\'s pairing-window note present on engine A (not orphaned)')
+  t.ok(aOnB, 'A\'s pairing-window note replicated to engine B (not orphaned)')
+  t.is(aOnA && aOnA.body, 'A-at-pairing-body', 'A\'s note carries A\'s content on A')
+  t.is(aOnB && aOnB.body, 'A-at-pairing-body', 'A\'s note carries A\'s content on B')
+
+  // And B's first write still converges (the previously-fixed Critical #2 path).
+  const bOnA = await openNote(A.engine, 'note:B-first')
+  t.is(bOnA && bOnA.body, 'B-first-body', 'B\'s first write also converged onto A')
 })

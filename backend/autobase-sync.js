@@ -46,6 +46,35 @@ class SyncEngine {
     this.keyEpoch = 0 // bumped by KEY_ROTATE; ops below current epoch from a
     // revoked signer are rejected (spec §8.4 "replayed old op rejected").
     this._appliedOps = new Map() // opId -> op snapshot for verifier coverage.
+    // Per-engine append SERIALIZATION chain (CONCURRENT APPEND DROP fix).
+    // Autobase's append layer keeps shared mutable bookkeeping (this._appending
+    // / this._appended / this._optimistic and the bump-until-target loop in
+    // node_modules/autobase/index.js _appendBatch); two base.append() calls
+    // started in the same tick (e.g. Promise.all([appendOp(a), appendOp(b)]))
+    // interleave on that shared state and one write is silently dropped — proven
+    // on a live two-writer base where ACKs (which themselves call base.append())
+    // race user appends. The contract Autobase assumes is one append fully
+    // settled before the next, so we funnel EVERY base.append() through a single
+    // promise chain: each enqueued append runs only after the previous settles.
+    this._appendChain = Promise.resolve()
+    // Wall-clock of the last fresh-writer integration (host.addWriter). Gates
+    // the durability-reconciliation window (FRESH-WRITER ORPHAN fix).
+    this._lastWriterAddedAt = 0
+    // Pending durability set (FRESH-WRITER ORPHAN / SILENT NOTE-LOSS fix). Maps
+    // objectBlindId -> { type, schema, objectId, payload, tries } for every
+    // additive content op THIS device appended whose row must stay materialized
+    // in the committed view. Adding a paired device as an indexer makes Autobase
+    // migrate/reboot the apply state (re-checkout the view at indexedLength),
+    // which ASYNCHRONOUSLY — possibly seconds after appendOp returned — rolls a
+    // not-yet-indexed content row out of the view (proven over a real testnet:
+    // the op is in the log + re-applied, but its view row vanishes on ALL
+    // devices). A point-in-time confirm at append time can't catch a rollback
+    // that lands later, so the background convergence loop reconciles this set:
+    // any pending op whose row is missing is re-appended (idempotent upsert with
+    // a fresh Lamport) until it sticks. Non-indexer paired writers (which would
+    // avoid the migration) crash this Autobase version, so this app-layer
+    // reconciliation is the correct closure. Cleared on lock/close.
+    this._pendingDurable = new Map()
   }
 
   get vaultKey () { return this.ctx.state.vaultKeys && this.ctx.state.vaultKeys.vaultKey }
@@ -54,6 +83,9 @@ class SyncEngine {
   // --- open / close --------------------------------------------------------
   async open () {
     if (this._opened) return
+    this._closing = false
+    this._appendChain = Promise.resolve() // fresh chain per open (lock->unlock)
+    this._pendingDurable.clear()
     const { ctx } = this
     const crypto = ctx.crypto
     const ops = ctx.ops
@@ -121,6 +153,9 @@ class SyncEngine {
   async close () {
     if (!this._opened) return
     this._opened = false
+    // Signal queued appends + the durability-confirm loop to abort promptly so
+    // a closing engine never blocks shutdown waiting on the append chain.
+    this._closing = true
     try { if (this.base) await this.base.close() } catch (_) {}
     try { if (this._searchBee) await this._searchBee.close() } catch (_) {}
     this.base = null
@@ -130,6 +165,7 @@ class SyncEngine {
     this.devices.clear()
     this.writerToDevice.clear()
     this._appliedOps.clear()
+    this._pendingDurable.clear()
   }
 
   // --- op construction -----------------------------------------------------
@@ -188,7 +224,27 @@ class SyncEngine {
     this._appliedOps.set(opId, { ...op, __accepted: !!accepted })
   }
 
+  // Serialized append. Every base.append() (content ops, DEVICE_ADD/REVOKE,
+  // KEY_ROTATE) goes through the per-engine promise chain so no two appends are
+  // ever in flight at once (CONCURRENT APPEND DROP fix — see constructor). The
+  // chain link is installed synchronously so same-tick callers queue in call
+  // order; a rejected predecessor must not poison the chain, so the tail is
+  // swallowed for chaining while the caller still sees its own result/error.
   async _append (op) {
+    const run = this._appendChain.then(
+      () => this._appendNow(op),
+      () => this._appendNow(op) // predecessor failed/teardown — still run ours
+    )
+    // advance the chain on a swallowed copy so a future link never rejects on
+    // an earlier caller's error.
+    this._appendChain = run.then(() => {}, () => {})
+    return run
+  }
+
+  async _appendNow (op) {
+    if (!this.base || this._closing) {
+      const e = new Error('sync engine closing'); e.code = 'ENGINE_CLOSING'; throw e
+    }
     await this.base.append(op)
   }
 
@@ -452,6 +508,12 @@ class SyncEngine {
     if (rec.writerKey && host && typeof host.addWriter === 'function') {
       try {
         await host.addWriter(b4a.from(rec.writerKey, 'hex'), { indexer: true })
+        // Mark the fresh-writer integration window open. Adding an indexer makes
+        // Autobase migrate/reboot the apply state, which can roll an un-indexed
+        // content row out of the view (the SILENT NOTE-LOSS). appendOp's
+        // durability-confirm engages its bounded wait+retry only inside this
+        // window so steady-state writes keep baseline latency. See appendOp.
+        this._lastWriterAddedAt = Date.now()
       } catch (_) { /* already a writer / fork in progress */ }
     }
 
@@ -646,9 +708,134 @@ class SyncEngine {
     // (retryable) if the seat never converges within the bound.
     await this._awaitWritable()
     const op = this._makeOp({ type, schema, objectId, payload, signer: this._localSigner() })
+    // Track additive content BEFORE the append so the durability reconciler
+    // (FRESH-WRITER ORPHAN fix) owns it even if a migration rolls its view row
+    // back milliseconds later. Re-keyed by objectBlindId so a same-object
+    // re-upsert just refreshes the pending payload (no duplicate tracking).
+    if (this._isAdditiveContentOp(type)) {
+      this._pendingDurable.set(op.header.objectBlindId, {
+        type, schema, objectId, payload, bucket: op.header.createdAtBucket, tries: 0
+      })
+    } else if (this._isDeleteContentOp(type)) {
+      // A delete supersedes any pending durability re-append for this object —
+      // otherwise the reconciler could re-materialize a row the user just
+      // (hard-)deleted within the fresh-writer window. The delete op is itself
+      // serialized + durable in the log; the tombstone reducer re-applies it on
+      // any reorg, so the delete needs no durability tracking of its own.
+      this._pendingDurable.delete(op.header.objectBlindId)
+    }
     await this._append(op)
     await this.base.update()
+    // NB: we do NOT retire the pending entry here even if the row looks present
+    // now. The indexer-migration rollback is ASYNCHRONOUS — the row can be
+    // present immediately after update() and then vanish seconds later when a
+    // remote indexer's ack finalizes the migration. Retirement is owned solely
+    // by _reconcileDurability, which only drops an entry once the row is present
+    // AND stable (past the fresh-writer window, or observed present across
+    // several passes), so a transient post-append presence can never strand a
+    // write that a later reorg rolls back.
     return op.header.objectBlindId
+  }
+
+  // True iff this op type writes an additive row whose post-state is PRESENCE
+  // of a materialized view row (so absence later == a rolled-back loss we should
+  // re-append). Deletes intentionally remove rows, so they are excluded.
+  _isAdditiveContentOp (type) {
+    const T = this.ctx.ops.OP_TYPES
+    return type === T.NOTE_UPSERT || type === T.CLIP_ADD
+  }
+
+  // Delete ops cancel any pending durability re-append for their object (see
+  // appendOp) so the reconciler never resurrects a just-deleted row.
+  _isDeleteContentOp (type) {
+    const T = this.ctx.ops.OP_TYPES
+    return type === T.NOTE_DELETE || type === T.CLIP_DELETE
+  }
+
+  // Read back the committed-view row for an additive op by (type, blindId,
+  // bucket). Presence here is the post-state the reconciler watches: a NOTE_UPSERT
+  // / CLIP_ADD row that is absent after its op was applied has been rolled back.
+  async _rowPresentFor (type, objectBlindId, bucket) {
+    if (!this.view) return false
+    const T = this.ctx.ops.OP_TYPES
+    try {
+      if (type === T.NOTE_UPSERT) {
+        return !!(await this.view.getNoteSealed(objectBlindId))
+      }
+      if (type === T.CLIP_ADD) {
+        return !!(await this.view.getSealedRaw(this.view.clipsKey(bucket, objectBlindId)))
+      }
+    } catch (_) { return false }
+    return false
+  }
+
+  // True while a fresh-writer integration could still be migrating the apply
+  // state (and thus rolling content rows out of the view). Adding an indexer
+  // bumps _lastWriterAddedAt; the window is generous because the remote device's
+  // ack — which finalizes the migration — arrives on ITS schedule (its periodic
+  // update loop), not ours, so the rollback can land seconds after our append.
+  _inFreshWriterWindow () {
+    return (Date.now() - (this._lastWriterAddedAt || 0)) < 30000
+  }
+
+  // Durability reconciler (FRESH-WRITER ORPHAN / SILENT NOTE-LOSS fix). Called
+  // from the background convergence loop. For each additive content op this
+  // device appended whose view row is currently MISSING from the committed
+  // view, re-append it (idempotent upsert with a fresh Lamport so it
+  // deterministically re-materializes over the rolled-back state). Rows that are
+  // present are retired from the pending set. This runs continuously, so it
+  // closes the gap even when the indexer-migration rollback lands asynchronously
+  // — long after appendOp returned — which a point-in-time confirm cannot catch.
+  // Bounded re-appends per op (so a genuinely un-converging base can't churn
+  // unbounded) but the cap only advances when we ACT, and is generous; once the
+  // migration settles the very next pass observes the row and retires it.
+  async _reconcileDurability () {
+    if (!this.base || this._closing || !this.view) return
+    if (this._pendingDurable.size === 0) return
+    const stable = !this._inFreshWriterWindow()
+    for (const [obid, rec] of [...this._pendingDurable]) {
+      if (!this.base || this._closing) return
+      let present = false
+      try { present = await this._rowPresentFor(rec.type, obid, rec.bucket) } catch (_) { present = false }
+      if (present) {
+        // Retire ONLY once the row has been CONTINUOUSLY present long enough to
+        // outlast an in-flight indexer migration (the rollback is asynchronous —
+        // a row can show present then vanish when a remote ack finalizes the
+        // migration). A sustained present-streak is the reliable signal; a single
+        // transient presence must not retire the entry. ~10 passes at the
+        // tightened 300ms cadence (~3s) comfortably exceeds observed migration
+        // settle time, and we additionally require being past the fresh-writer
+        // window so no further migration is imminent.
+        rec.presentStreak = (rec.presentStreak || 0) + 1
+        if (stable && rec.presentStreak >= 6) this._pendingDurable.delete(obid)
+        continue
+      }
+      // Missing -> rolled back (or not yet flushed). Reset the streak and
+      // re-append (idempotent upsert, fresh Lamport) while writable. The attempt
+      // cap is generous and only advances when we actually re-append, so a
+      // long-running migration can't exhaust it before settling; once the
+      // migration finishes the very next pass sees the row and retires it.
+      rec.presentStreak = 0
+      if (!this.base.writable) continue
+      if ((rec.tries || 0) >= 12) continue
+      rec.tries = (rec.tries || 0) + 1
+      try {
+        const reop = this._makeOp({
+          type: rec.type, schema: rec.schema, objectId: rec.objectId, payload: rec.payload, signer: this._localSigner()
+        })
+        // Re-append through the serialized chain but do NOT await base.update()
+        // here: update() can block for the full duration of an in-flight
+        // migration, which would stall the whole reconcile pass after a single
+        // entry. The background loop pumps update()/refresh() between passes, so
+        // the next pass observes the re-materialized row. Race a short timeout so
+        // a base wedged mid-migration (base.append can block until it resolves)
+        // can never freeze the convergence loop — we just retry on the next pass.
+        await Promise.race([
+          this._append(reop),
+          new Promise((resolve) => { const t = setTimeout(resolve, 1500); if (t.unref) t.unref() })
+        ])
+      } catch (_) { /* not writable mid-migration / closing — next pass re-checks */ }
+    }
   }
 
   async refresh () {
@@ -782,13 +969,24 @@ export async function attach (ctx) {
   if (ctx.isUnlocked()) await openEngine()
 
   // background convergence loop: periodic update() so a device that comes
-  // online catches up. Cancellable via scope.signal (spec §22).
+  // online catches up, PLUS durability reconciliation (FRESH-WRITER ORPHAN fix):
+  // re-materialize any of this device's additive content rows that an
+  // asynchronous indexer-migration rolled out of the view. Cancellable via
+  // scope.signal (spec §22). Tightens to a short interval while there is pending
+  // durability work (so a rolled-back note re-materializes within ~hundreds of
+  // ms of the migration settling) and relaxes back to the idle cadence
+  // otherwise (no steady-state overhead).
   ctx.scope.spawn(async (scope) => {
     while (!scope.cancelled) {
+      let pending = 0
       try {
-        if (engine._opened) await engine.refresh()
+        if (engine._opened) {
+          await engine.refresh()
+          await engine._reconcileDurability()
+          pending = engine._pendingDurable ? engine._pendingDurable.size : 0
+        }
       } catch (_) {}
-      try { await scope.sleep(2000) } catch (_) { break }
+      try { await scope.sleep(pending > 0 ? 300 : 2000) } catch (_) { break }
     }
   }, 'sync-converge')
 
