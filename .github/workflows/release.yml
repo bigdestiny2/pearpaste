@@ -1,0 +1,354 @@
+# Paste — native installer release workflow (Agent 3 desktop distribution).
+#
+# Builds the three native installers from the current Pear `pear build
+# --<platform>-app` path (verified against Pear v0.3243):
+#   macos-latest   -> .dmg   (scripts/build-macos.mjs)
+#   windows-latest -> .exe   (scripts/build-windows.mjs)
+#   ubuntu-latest  -> .deb (+ AppImage + tarball)  (scripts/package-linux.mjs)
+#
+# Triggers:
+#   workflow_dispatch — manual run. Inputs:
+#       pear_link (required string)  the pear:// link the wrappers resolve
+#       signed    (boolean, default false)  sign/notarize when the matching
+#                 secrets exist; otherwise produce a clearly-marked UNSIGNED
+#                 artifact (dev/CI before certs are bought).
+#   push: tags ['v*'] — tagging a release builds all three; SIGNED by default,
+#       and the installers are attached to a GitHub Release. The pear link for
+#       tag builds comes from the `PEARPASTE_LINK` repo variable/secret (a tag
+#       push carries no workflow inputs).
+#
+# Required repo secrets (referenced by name; sign only when present):
+#   macOS:    APPLE_DEV_ID            "Developer ID Application: <Name> (<TEAM>)"
+#             APPLE_NOTARY_PROFILE    OR the triple below
+#             APPLE_NOTARY_APPLE_ID / APPLE_NOTARY_TEAM_ID / APPLE_NOTARY_PASSWORD
+#   Windows:  WIN_CERT_BASE64         base64-encoded Authenticode .pfx
+#             WIN_CERT_PASS           .pfx password
+#   Link:     PEARPASTE_LINK          (repo variable OR secret) production link
+#                                     used for tag builds (workflow_dispatch uses
+#                                     the `pear_link` input instead).
+#
+# !! The Pear runtime install + `pear build` platform-asset fetch in CI is
+# !! UNVERIFIED until the first real run. Steps that depend on it are marked
+# !! `# TODO(verify on first CI run)` rather than asserted to work. Signing certs
+# !! are out of repo scope (spec §17); without them the jobs emit UNSIGNED
+# !! artifacts and the tag-release path should be treated as a dry run.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pear_link:
+        description: "pear:// link the installers resolve (e.g. pear://<fork>.<length>.<z32-key>)"
+        required: true
+        type: string
+      signed:
+        description: "Sign/notarize when the matching secrets exist (else unsigned)"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # needed to create/attach a GitHub Release on tag builds
+
+env:
+  # Resolve the pear link: workflow_dispatch input wins; tag builds fall back to
+  # the PEARPASTE_LINK repo variable (define under Settings > Secrets and
+  # variables > Actions > Variables). Never hardcode a real key here.
+  PEARPASTE_LINK: ${{ github.event.inputs.pear_link || vars.PEARPASTE_LINK }}
+  # Tag builds sign by default; workflow_dispatch signs only when `signed=true`.
+  SIGN_REQUESTED: ${{ github.event.inputs.signed == 'true' || startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # macOS .dmg
+  # ---------------------------------------------------------------------------
+  macos-dmg:
+    name: macOS .dmg (darwin-arm64)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Install Pear CLI
+        # TODO(verify on first CI run): `npm i -g pear` provides the `pear`
+        # launcher; the first `pear` invocation may need to fetch the runtime
+        # (`pear run pear://runtime`). Confirm the runtime is available headless
+        # on macos-latest before relying on `pear build` here.
+        run: npm i -g pear
+
+      - name: macOS preflight
+        run: npm run preflight:mac
+
+      - name: Decide sign vs unsigned (macOS)
+        id: mode
+        shell: bash
+        # Sign only when signing was requested AND a Developer ID secret exists.
+        # Otherwise fall back to an UNSIGNED dev/CI .dmg (does not fail the run).
+        run: |
+          set -euo pipefail
+          if [ "${SIGN_REQUESTED}" = "true" ] && [ -n "${APPLE_DEV_ID:-}" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            if [ "${SIGN_REQUESTED}" = "true" ]; then
+              echo "::warning::signing requested but APPLE_DEV_ID secret is absent — producing an UNSIGNED .dmg"
+            fi
+          fi
+        env:
+          APPLE_DEV_ID: ${{ secrets.APPLE_DEV_ID }}
+
+      - name: Build SIGNED + notarized .dmg
+        if: steps.mode.outputs.sign == 'true'
+        # TODO(verify on first CI run): build-macos.mjs runs `pear build
+        # --darwin-arm64-app <Paste.app>`; this assumes a prebuilt pear-electron
+        # darwin app dir (PEARPASTE_MAC_APP). Confirm how the app dir is produced
+        # in CI (pear-electron app-dir bootstrap) on the first run.
+        run: npm run release:mac
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+          PEARPASTE_MAC_APP: ${{ secrets.PEARPASTE_MAC_APP }}
+          PEARPASTE_MAC_IDENTITY: ${{ secrets.APPLE_DEV_ID }}
+          PEARPASTE_NOTARY_PROFILE: ${{ secrets.APPLE_NOTARY_PROFILE }}
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+
+      - name: Build UNSIGNED .dmg (dev/CI)
+        if: steps.mode.outputs.sign != 'true'
+        # TODO(verify on first CI run): same `pear build` asset-fetch caveat.
+        run: npm run build:mac
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+          PEARPASTE_MAC_APP: ${{ secrets.PEARPASTE_MAC_APP }}
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-macos-dmg
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.dmg.sha256
+          if-no-files-found: warn
+
+      - name: Attach .dmg to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/macos/*.dmg
+            dist/macos/*.dmg.sha256
+
+  # ---------------------------------------------------------------------------
+  # Windows .exe
+  # ---------------------------------------------------------------------------
+  windows-exe:
+    name: Windows .exe (win32-x64)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Install Pear CLI
+        # TODO(verify on first CI run): `npm i -g pear` + first-run runtime fetch
+        # on windows-latest; confirm `pear build --win32-x64-app` works headless.
+        run: npm i -g pear
+
+      - name: Windows preflight
+        run: npm run preflight:win
+
+      - name: Decide sign vs unsigned (Windows)
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${SIGN_REQUESTED}" = "true" ] && [ -n "${WIN_CERT_BASE64:-}" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            if [ "${SIGN_REQUESTED}" = "true" ]; then
+              echo "::warning::signing requested but WIN_CERT_BASE64 secret is absent — producing an UNSIGNED .exe"
+            fi
+          fi
+        env:
+          WIN_CERT_BASE64: ${{ secrets.WIN_CERT_BASE64 }}
+
+      - name: Materialize Authenticode cert from secret
+        if: steps.mode.outputs.sign == 'true'
+        shell: bash
+        # Decode the base64 .pfx into a runner-local file; path is exported for
+        # the signed build step. The file lives only on the ephemeral runner.
+        run: |
+          set -euo pipefail
+          printf '%s' "${WIN_CERT_BASE64}" | base64 --decode > "$RUNNER_TEMP/authenticode.pfx"
+          echo "PEARPASTE_WIN_CERT=$RUNNER_TEMP/authenticode.pfx" >> "$GITHUB_ENV"
+        env:
+          WIN_CERT_BASE64: ${{ secrets.WIN_CERT_BASE64 }}
+
+      - name: Build SIGNED .exe
+        if: steps.mode.outputs.sign == 'true'
+        # TODO(verify on first CI run): `pear build --win32-x64-app` asset fetch.
+        run: npm run release:win
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+          PEARPASTE_WIN_WRAPPER: ${{ secrets.PEARPASTE_WIN_WRAPPER }}
+          PEARPASTE_WIN_CERT: ${{ env.PEARPASTE_WIN_CERT }}
+          PEARPASTE_WIN_CERT_PASS: ${{ secrets.WIN_CERT_PASS }}
+
+      - name: Build UNSIGNED .exe (dev/CI)
+        if: steps.mode.outputs.sign != 'true'
+        # TODO(verify on first CI run): same `pear build` asset-fetch caveat.
+        run: npm run build:win:unsigned
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+          PEARPASTE_WIN_WRAPPER: ${{ secrets.PEARPASTE_WIN_WRAPPER }}
+
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-windows-exe
+          path: |
+            dist/win32/**/*.exe
+            dist/win32/**/*.sha256
+          if-no-files-found: warn
+
+      - name: Attach .exe to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/win32/**/*.exe
+            dist/win32/**/*.sha256
+
+  # ---------------------------------------------------------------------------
+  # Linux .deb (+ AppImage + tarball)
+  # ---------------------------------------------------------------------------
+  linux-deb:
+    name: Linux .deb (+ AppImage + tarball)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Install Pear CLI
+        # TODO(verify on first CI run): Pear runtime availability on ubuntu-latest
+        # for the packaged launcher (the .deb only ships a `pear run` launcher, so
+        # this job does NOT itself need `pear build`, but the CLI is installed for
+        # parity + any future asset bootstrap).
+        run: npm i -g pear
+
+      - name: Install Debian packaging tools
+        # dpkg-deb ships with Ubuntu; appimagetool is fetched so the AppImage
+        # branch is exercised. Both are optional in package-linux.mjs (graceful
+        # skip), so a failure here must not block the .deb/tarball.
+        run: |
+          set -uo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y dpkg-dev desktop-file-utils || true
+          # appimagetool (optional) — TODO(verify on first CI run): URL/permissions.
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
+            && sudo chmod +x /usr/local/bin/appimagetool || echo "::warning::appimagetool fetch failed — AppImage will be skipped (tarball + .deb still produced)"
+
+      - name: Linux preflight
+        run: npm run preflight:linux
+
+      - name: Decide sign vs unsigned (Linux)
+        id: mode
+        shell: bash
+        # Linux signing is a detached sidecar (GPG/minisign). No signing key is
+        # provisioned in this repo, so the default is the UNSIGNED dev/CI lane
+        # (build:linux:unsigned). A maintainer with a key signs the artifacts and
+        # runs `npm run release:linux` (which fails closed without sidecars).
+        run: |
+          set -euo pipefail
+          if [ "${SIGN_REQUESTED}" = "true" ] && [ -n "${LINUX_MINISIGN_KEY:-}" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            if [ "${SIGN_REQUESTED}" = "true" ]; then
+              echo "::warning::signing requested but no Linux signing key secret (LINUX_MINISIGN_KEY) — producing UNSIGNED artifacts"
+            fi
+          fi
+        env:
+          LINUX_MINISIGN_KEY: ${{ secrets.LINUX_MINISIGN_KEY }}
+
+      - name: Build UNSIGNED .deb + AppImage + tarball (dev/CI)
+        if: steps.mode.outputs.sign != 'true'
+        run: npm run build:linux:unsigned
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+
+      - name: Build + sign .deb + AppImage + tarball (release)
+        if: steps.mode.outputs.sign == 'true'
+        shell: bash
+        # TODO(verify on first CI run): wire the real signing key import here.
+        # Build first (so sidecars can be produced), then sign each artifact with
+        # minisign/GPG, then `release:linux` enforces a sidecar per artifact.
+        run: |
+          set -euo pipefail
+          npm run build:linux
+          # minisign each distributable artifact -> .minisig sidecar.
+          # (Provision the secret key via LINUX_MINISIGN_KEY; import shown as a
+          # placeholder — real key handling is out of repo scope, spec §17.)
+          # for f in dist/linux/*.tar.gz dist/linux/*.deb dist/linux/*.AppImage; do
+          #   minisign -S -s minisign.key -m "$f"   # -> "$f.minisig"
+          # done
+          npm run release:linux
+        env:
+          PEARPASTE_LINK: ${{ env.PEARPASTE_LINK }}
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-linux
+          path: |
+            dist/linux/*.deb
+            dist/linux/*.deb.sha256
+            dist/linux/*.AppImage
+            dist/linux/*.AppImage.sha256
+            dist/linux/*.tar.gz
+            dist/linux/*.tar.gz.sha256
+          if-no-files-found: warn
+
+      - name: Attach Linux artifacts to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/linux/*.deb
+            dist/linux/*.deb.sha256
+            dist/linux/*.AppImage
+            dist/linux/*.AppImage.sha256
+            dist/linux/*.tar.gz
+            dist/linux/*.tar.gz.sha256

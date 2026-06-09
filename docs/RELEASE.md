@@ -87,14 +87,36 @@ Per spec §12/§17:
 - Preserve the Pear P2P update path so the wrapper rarely needs a rebuild.
 
 > **Signing TODO (real certificates are out of scope of this repository).**
-> The signing steps in `scripts/release-prod.sh` are wired but **fail closed**
-> without credentials. Before public beta a maintainer must provide: an Apple
-> Developer ID Application identity + notarization credentials (macOS,
-> `codesign` + `notarytool` + `stapler`), an Authenticode certificate (Windows,
-> `signtool`), and the chosen Linux signing convention (GPG/minisign). Until
-> then, native installers are **internal/dev only** and the CI `release-guard`
-> job blocks any unsigned artifact from being treated as a release (see §6).
-> Accounts, certificate types, and costs are tabulated in **docs/SHIPPING.md**.
+> The signing steps in `scripts/release-prod.sh`, `scripts/build-macos.mjs`, and
+> `scripts/build-windows.mjs` are wired but **fail closed** without credentials.
+> Before public beta a maintainer must provide: an Apple Developer ID Application
+> identity + notarization credentials (macOS, `codesign` + `notarytool` +
+> `stapler`), an Authenticode certificate (Windows, `signtool`), and the chosen
+> Linux signing convention (GPG/minisign). Until then, native installers are
+> **internal/dev only** and the CI `release-guard` job blocks any unsigned
+> artifact from being treated as a release (see §6). Accounts, certificate
+> types, and costs are tabulated in **docs/SHIPPING.md**.
+
+> **Unsigned / dev mode (before certs are bought).** Each platform script can
+> emit a **clearly-marked UNSIGNED** artifact so dev/CI can produce installers
+> before certificates exist — **without** weakening the fail-closed `--release`
+> path:
+>
+> | Platform | Unsigned (dev/CI) | Signed release (fails closed) |
+> |---|---|---|
+> | macOS | `npm run build:mac` → `Paste-<ver>-unsigned.dmg` | `npm run release:mac` (needs `PEARPASTE_MAC_IDENTITY` + notary auth) |
+> | Windows | `npm run build:win:unsigned` (packs the app dir, skips `signtool`) | `npm run release:win` (needs `PEARPASTE_WIN_CERT`) |
+> | Linux | `npm run build:linux:unsigned` (`.deb`/AppImage/tarball, no sidecar required) | `npm run release:linux` (requires a `.sig/.asc/.minisig/.p7s` sidecar per artifact) |
+>
+> `--unsigned` is rejected in combination with `--release` (a signed release must
+> not silently become unsigned). Unsigned artifacts still trip the CI
+> `release-guard` signature gate if dropped into `dist/`, so they are never
+> mistaken for a release.
+
+The whole matrix is also driven by the `release.yml` GitHub Actions workflow
+(§3.4): `workflow_dispatch` (with a `signed` boolean) or a `v*` tag builds all
+three installers, signing only when the relevant secret exists, else emitting
+the unsigned artifact.
 
 ### 3.1 Windows (win32-x64)
 
@@ -171,13 +193,149 @@ entrypoints, `pear-electron/pre`, Linux `sodium-native` prebuilds, `tar`, and
 optional distro tooling (`desktop-file-validate`, `dpkg-deb`, `rpmbuild`,
 `appimagetool`). `build:linux` must run on Linux and emits
 `dist/linux/pearpaste-<version>-linux-<arch>.tar.gz` plus a `.sha256` file.
-The tarball is a distro-neutral launcher for the production `pear://` link and
-can be wrapped into .deb/.rpm by a maintainer. When `appimagetool` is on PATH,
-`build:linux`/`release:linux` **additionally** emit a `…​.AppImage` + `.sha256`
-(skipped gracefully if `appimagetool` is absent — the tarball stays primary).
-`release:linux` requires a detached signature sidecar
-(`.sig/.asc/.minisig/.p7s`) for the tarball **and** for any AppImage produced,
-matching the CI release-artifact gate.
+The tarball is a distro-neutral launcher for the production `pear://` link.
+
+**Native `.deb` (when `dpkg-deb` is on PATH).** `build:linux`/`release:linux`
+**additionally** build a proper Debian package
+`dist/linux/paste_<version>_amd64.deb` + `.sha256` via `maybeBuildDeb()`:
+
+- `DEBIAN/control` — `Package: pearpaste`, `Maintainer`, `Architecture: amd64`
+  (Node `x64` → Debian `amd64`), `Priority: optional`, `Section`,
+  `Installed-Size`, `Recommends: pear`, multi-line `Description`.
+- A launcher at `/usr/lib/pearpaste/pearpaste` that runs `pear run
+  "$PEARPASTE_LINK"` (the production link, override-able), a `/usr/bin/pearpaste`
+  symlink to it, a `/usr/share/applications/pearpaste.desktop` entry, and a
+  `/usr/share/icons/hicolor/512x512/apps/pearpaste.png` icon.
+- Built with `dpkg-deb --root-owner-group --build` (deterministic root:root
+  ownership, no `fakeroot`).
+
+The Pear runtime is **not** an apt package, so it is a `Recommends` note (the
+launcher needs `pear` on PATH; install from <https://pears.com>) rather than a
+hard `Depends`. **`maybeBuildDeb()` is never fatal:** absent `dpkg-deb` it logs a
+graceful skip and the tarball remains the primary artifact (same contract as
+the AppImage path).
+
+**AppImage (when `appimagetool` is on PATH).** Also emitted alongside the
+tarball + `.deb`; `…​.AppImage` + `.sha256` (skipped gracefully otherwise).
+
+`release:linux` requires a detached signature sidecar (`.sig/.asc/.minisig/.p7s`)
+for the tarball **and** for any `.deb` **and** for any AppImage produced,
+matching the CI release-artifact gate. `build:linux:unsigned` (or
+`build:linux -- --unsigned`) produces the same artifacts for dev/CI **without**
+the sidecar requirement; `--unsigned` cannot be combined with `--release`.
+
+### 3.3 macOS (darwin-arm64)
+
+Orchestrated by `scripts/build-macos.mjs` (npm: `preflight:mac`, `build:mac`,
+`build:mac:dry`, `release:mac`), the macOS sibling of `build-windows.mjs`. It is
+the **single source of truth** for the macOS chain — `release-prod.sh`'s
+`mac_sign_notarize()` now **delegates to `npm run release:mac`** (it previously
+inlined `codesign`/`hdiutil` and **skipped `pear build`**; that drift is fixed).
+
+**Readiness (any OS):**
+
+```sh
+npm run preflight:mac
+```
+
+Asserts macOS-capability: `sodium-native` ships a `darwin-arm64` prebuild (the
+only native addon), `pear-electron`'s `pear.assets.ui` resolves the darwin
+runtime via `/by-arch/%%HOST%%`, `assets/Paste.icns` is present, `pear.pre =
+pear-electron/pre`, no unguarded Node-only globals remain (Bare-safe), and — on
+darwin — `hdiutil`/`codesign`/`xcrun` are available.
+
+**Unsigned `.dmg` (dev/CI, no Developer ID):**
+
+```sh
+npm run build:mac     # pear build --darwin-arm64-app + hdiutil -> Paste-<ver>-unsigned.dmg
+```
+
+Runs **`pear build --darwin-arm64-app <Paste.app> --target dist/macos`** (the
+app-dir basename must equal the product name `Paste`), then `hdiutil create …
+-format UDZO` to produce `dist/macos/Paste-<ver>-unsigned.dmg` + `.sha256`. The
+build is unsigned, so **Gatekeeper quarantines it** — internal/dev only; a
+console warning makes this explicit.
+
+**Signed + notarized `.dmg` (Channel B):**
+
+Must run on **macOS** (or CI `macos-latest`) with a real Apple Developer ID
+identity + notarization credentials:
+
+```sh
+export PEARPASTE_MAC_APP="<prebuilt darwin-arm64 app dir; basename must be 'Paste'>"
+export PEARPASTE_MAC_IDENTITY="Developer ID Application: <Name> (<TEAMID>)"
+# notarytool auth — EITHER a stored keychain profile:
+export PEARPASTE_NOTARY_PROFILE="<profile from: xcrun notarytool store-credentials>"
+# OR the Apple-ID triple:
+export APPLE_ID="you@example.com" APPLE_TEAM_ID="<TEAMID>" APP_SPECIFIC_PASSWORD="<app-specific-pw>"
+npm run release:mac
+```
+
+`release:mac` runs `pear build --darwin-arm64-app`, then `codesign --deep
+--force --options runtime --timestamp` (hardened runtime) + `codesign --verify`,
+`hdiutil create` the `.dmg`, `codesign` the `.dmg`, `xcrun notarytool submit
+--wait`, and `xcrun stapler staple`, emitting `dist/macos/Paste-<ver>.dmg` +
+`.sha256`. With **no `PEARPASTE_MAC_IDENTITY`** (or no notary auth) it **fails
+closed**. `--arch darwin-x64` / `PEARPASTE_MAC_ARCH=darwin-x64` targets Intel
+Macs (one-flag change). A notarized `.dmg` is still subject to the CI
+`release-guard` signature-sidecar gate, so produce a `.sig/.asc/.minisig/.p7s`
+in the release lane.
+
+> One `# TODO(verify pear)` remains in `build-macos.mjs`: whether `pear build
+> --darwin-arm64-app` can synthesize the `.app` from the staged project alone or
+> always requires a pre-built pear-electron app dir as the path argument. Until
+> verified, the script **requires `PEARPASTE_MAC_APP`** so it never invents a
+> flag/behaviour.
+
+### 3.4 CI release workflow (`.github/workflows/release.yml`)
+
+A dedicated workflow builds all three installers (separate from the always-on
+`ci.yml`). Triggers:
+
+- **`workflow_dispatch`** — manual, inputs: **`pear_link`** (required string —
+  the `pear://` link the wrappers resolve) and **`signed`** (boolean, default
+  `false`).
+- **`push: tags: ['v*']`** — tagging a release builds all three, **signs by
+  default**, and attaches the installers to a **GitHub Release** (via
+  `softprops/action-gh-release@v2`). A tag push has no inputs, so the link comes
+  from the **`PEARPASTE_LINK`** repo variable/secret.
+
+Three jobs, each `actions/checkout@v4` → `actions/setup-node@v4` (Node 22) →
+`npm ci` → `npm i -g pear` → the platform script with `PEARPASTE_LINK` →
+`actions/upload-artifact@v4`:
+
+| Job | Runner | Script | Artifact(s) |
+|---|---|---|---|
+| `macos-dmg` | `macos-latest` | `release:mac` / `build:mac` | `.dmg` + `.sha256` |
+| `windows-exe` | `windows-latest` | `release:win` / `build:win:unsigned` | `.exe` + `.sha256` |
+| `linux-deb` | `ubuntu-latest` | `release:linux` / `build:linux:unsigned` | `.deb` + AppImage + tarball (+ `.sha256`) |
+
+Each job **signs only when `signed` (or a tag) is set AND the relevant secret
+exists**; otherwise it builds the **unsigned** artifact (it does not fail the
+run). The `linux-deb` job `apt-get install`s `dpkg-dev` and fetches
+`appimagetool` so both wrappers are exercised.
+
+**Required repo secrets / variables** (referenced by name; signing is skipped
+when absent):
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `PEARPASTE_LINK` | variable or secret | production `pear://` link for **tag** builds (dispatch uses the `pear_link` input) |
+| `APPLE_DEV_ID` | secret | `Developer ID Application: <Name> (<TEAM>)` (macOS signing) |
+| `APPLE_NOTARY_PROFILE` | secret | stored notarytool keychain profile (macOS) — OR the triple below |
+| `APPLE_NOTARY_APPLE_ID` / `APPLE_NOTARY_TEAM_ID` / `APPLE_NOTARY_PASSWORD` | secrets | Apple-ID notarization triple (macOS) |
+| `PEARPASTE_MAC_APP` | secret | path to the prebuilt darwin app dir on the runner (macOS) |
+| `WIN_CERT_BASE64` | secret | base64-encoded Authenticode `.pfx` (Windows) |
+| `WIN_CERT_PASS` | secret | `.pfx` password (Windows) |
+| `PEARPASTE_WIN_WRAPPER` | secret | path to the prebuilt win32 app dir on the runner (Windows) |
+| `LINUX_MINISIGN_KEY` | secret | Linux signing key (enables the signed Linux lane) |
+
+> **The Pear runtime + `pear build` platform-asset fetch in CI is UNVERIFIED
+> until the first real run.** Those steps carry `# TODO(verify on first CI run)`
+> markers in `release.yml` (Pear CLI install, runtime fetch, `pear build` asset
+> resolution, the `appimagetool` download URL). Without signing certs the jobs
+> emit **unsigned** artifacts and the tag-release path should be treated as a dry
+> run.
 
 ---
 

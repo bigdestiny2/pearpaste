@@ -35,7 +35,13 @@
 //   node scripts/build-windows.mjs --preflight        # readiness report (any OS)
 //   node scripts/build-windows.mjs --dry-run           # show the plan, no writes
 //   node scripts/build-windows.mjs --stage --link pear://<key>
+//   node scripts/build-windows.mjs --build --wrapper <dir>          # UNSIGNED .exe (dev/CI)
 //   node scripts/build-windows.mjs --release --link pear://<key>   # build + sign
+//
+// --build (or --release --unsigned, which is REJECTED) is the dev/CI escape
+// hatch: it runs `pear build --win32-x64-app` to package the app dir but SKIPS
+// Authenticode signing, emitting a clearly-marked unsigned artifact. It does NOT
+// weaken --release: a signed release still FAILS CLOSED without PEARPASTE_WIN_CERT.
 //
 // Env:
 //   PEARPASTE_LINK            pear:// link (or channel) to stage to
@@ -61,7 +67,12 @@ const val = (f, env) => {
 
 const MODE = has('--release')
   ? 'release'
-  : has('--stage') ? 'stage' : has('--dry-run') ? 'dry-run' : 'preflight'
+  : has('--build') ? 'build' : has('--stage') ? 'stage' : has('--dry-run') ? 'dry-run' : 'preflight'
+// Explicit dev/CI escape hatch: package the platform app dir (the .exe) WITHOUT
+// Authenticode signing, clearly marked. --build implies unsigned. --unsigned is
+// accepted as an intent marker but MUST NOT combine with --release (a signed
+// release must fail closed without a cert).
+const UNSIGNED = has('--unsigned') || MODE === 'build'
 const LINK = val('--link', 'PEARPASTE_LINK')
 // Deliberate product/display name. `pear build` requires the platform app dir's
 // basename to equal (package.json) productName ?? name; we pin productName to
@@ -75,6 +86,10 @@ const log = (m) => console.log(`[win] ${m}`)
 const ok = (m) => console.log(`${C.ok}[win:ok]${C.x} ${m}`)
 const warn = (m) => console.log(`${C.warn}[win:warn]${C.x} ${m}`)
 const die = (m) => { console.error(`${C.err}[win:error]${C.x} ${m}`); process.exit(1) }
+
+if (has('--unsigned') && MODE === 'release') {
+  die('--unsigned cannot be combined with --release (a signed release must fail closed without an Authenticode cert); use --build for an unsigned dev/CI .exe')
+}
 
 // ---- Preflight: everything verifiable from any OS --------------------------
 function preflight () {
@@ -239,7 +254,7 @@ function findWin32Exe (wrapper) {
 // it into the deployment folder; then signtool signs the produced .exe.
 function buildSignAndPack (dry) {
   const wrapper = val('--wrapper', 'PEARPASTE_WIN_WRAPPER')
-  if (!wrapper) die('release requires --wrapper / PEARPASTE_WIN_WRAPPER (the prebuilt win32-x64 app dir; its basename must be the product name "Paste")')
+  if (!wrapper) die(`${MODE} requires --wrapper / PEARPASTE_WIN_WRAPPER (the prebuilt win32-x64 app dir; its basename must be the product name "Paste")`)
   if (!fs.existsSync(wrapper)) die(`win32-x64 app dir not found: ${wrapper}`)
   if (path.basename(wrapper).replace(/\.[^.]*$/, '') !== PRODUCT_NAME) {
     die(`win32-x64 app dir basename must equal productName "${PRODUCT_NAME}" (pear build enforces this); got "${path.basename(wrapper)}"`)
@@ -252,6 +267,16 @@ function buildSignAndPack (dry) {
   } else {
     execFileSync('pear', buildArgs, { cwd: ROOT, stdio: 'inherit' })
     ok(`packaged win32 app dir into ${path.relative(ROOT, target)}/by-arch/win32-x64/app`)
+  }
+
+  // Unsigned dev/CI artifact (--build / --unsigned): package the app dir but
+  // SKIP Authenticode signing entirely. Clearly marked; never treated as a
+  // release (the CI release-guard still blocks it without a signature sidecar).
+  if (UNSIGNED) {
+    warn('UNSIGNED build: packaged the win32 app dir WITHOUT Authenticode signing — SmartScreen will warn ("unknown publisher"). Do NOT distribute as a release; use --release with PEARPASTE_WIN_CERT for a signed, fail-closed build.')
+    if (process.platform !== 'win32') warn('(Note: on ' + process.platform + ' `pear build` packages the supplied win32 app dir; produce the .exe on a Windows host for a runnable artifact.)')
+    log(`unsigned artifact dir: ${path.relative(ROOT, path.join(target, 'by-arch', 'win32-x64', 'app'))}`)
+    return
   }
 
   // Signing must run on Windows with a real Authenticode cert — fail closed.
@@ -294,6 +319,11 @@ if (MODE === 'preflight') {
 } else if (MODE === 'stage') {
   preflight()
   stage(false)
+} else if (MODE === 'build') {
+  // Dev/CI: package the win32 app dir into an UNSIGNED .exe artifact. Does NOT
+  // stage to the network (that's the P2P-link path); just the local Tier-2 pack.
+  preflight()
+  buildSignAndPack(false)
 } else if (MODE === 'release') {
   preflight()
   stage(false)

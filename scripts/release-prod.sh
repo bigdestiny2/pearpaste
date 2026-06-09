@@ -259,39 +259,31 @@ log "wrote $NOTES_FILE"
 PRODUCT_NAME="Paste"   # package.json productName; pear build enforces basename
 DIST_DIR="${PEARPASTE_DIST_DIR:-dist}"
 
-# macOS: codesign (Developer ID, hardened runtime) -> .dmg -> codesign dmg ->
-# notarytool submit --wait -> stapler staple. Fails closed without the identity
-# and notarytool auth.
+# macOS: delegated to scripts/build-macos.mjs (`npm run release:mac`), which runs
+# the FULL Tier-2 chain: `pear build --darwin-arm64-app <Paste.app>` ->
+# codesign (Developer ID, hardened runtime) -> hdiutil .dmg -> codesign dmg ->
+# `xcrun notarytool submit --wait` -> `xcrun stapler staple`. build-macos.mjs is
+# the single source of truth for the macOS chain (mirrors win_sign -> release:win),
+# so this script no longer duplicates the codesign/hdiutil steps (which had
+# drifted: the old inline version SKIPPED `pear build`). It FAILS CLOSED without
+# PEARPASTE_MAC_IDENTITY + notarytool auth. Only invoke on macOS.
 mac_sign_notarize() { # <app-path> e.g. dist/macos/by-arch/darwin-arm64/app/Paste.app
   local app="$1"
   if [ "$(uname -s)" != "Darwin" ]; then
-    warn "macOS signing/notarization must run on macOS; skipping on $(uname -s)."
+    warn "macOS signing/notarization must run on macOS; skipping on $(uname -s). Use 'npm run release:mac' on a Mac (see docs/RELEASE.md §3.3)."
     return 0
   fi
-  [ -n "${PEARPASTE_MAC_IDENTITY:-}" ] || \
-    die "macOS release requires PEARPASTE_MAC_IDENTITY (\"Developer ID Application: <Name> (<TEAM>)\") — fail closed (spec §17)."
-  # notarytool auth: a stored keychain profile OR Apple-ID triple. Fail closed.
-  local notary_auth=()
-  if [ -n "${PEARPASTE_NOTARY_PROFILE:-}" ]; then
-    notary_auth=(--keychain-profile "$PEARPASTE_NOTARY_PROFILE")
-  elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APP_SPECIFIC_PASSWORD:-}" ]; then
-    notary_auth=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APP_SPECIFIC_PASSWORD")
-  else
-    die "macOS notarization requires PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD — fail closed (spec §17)."
+  log "macOS wrapper: npm run release:mac (pear build --darwin-arm64-app + codesign + hdiutil + notarytool + stapler)"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "(dry-run) would run: PEARPASTE_MAC_APP=\"$app\" PEARPASTE_LINK=\"$RELEASE_VERLINK\" npm run release:mac"
+    log "(dry-run) build-macos.mjs FAILS CLOSED without PEARPASTE_MAC_IDENTITY + notarytool auth"
+    ok "(dry-run) macOS sign+notarize plan printed"
+    return 0
   fi
-  local dmg="${DIST_DIR}/${PRODUCT_NAME}-${APP_VERSION}.dmg"
-  log "codesign (hardened runtime) -> $app"
-  log "  codesign --deep --force --options runtime --timestamp --sign \"\$PEARPASTE_MAC_IDENTITY\" \"$app\""
-  log "hdiutil create -> $dmg ; codesign the dmg ; notarytool submit --wait ; stapler staple"
-  if [ "$DRY_RUN" = "1" ]; then ok "(dry-run) macOS sign+notarize plan printed"; return 0; fi
-  codesign --deep --force --options runtime --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "$app"
-  codesign --verify --deep --strict --verbose=2 "$app"
-  rm -f "$dmg"
-  hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$app" -ov -format UDZO "$dmg"
-  codesign --force --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "$dmg"
-  xcrun notarytool submit "$dmg" "${notary_auth[@]}" --wait
-  xcrun stapler staple "$dmg"
-  ok "notarized + stapled $dmg"
+  # build-macos.mjs enforces PEARPASTE_MAC_IDENTITY + notarytool auth (fail closed)
+  # and emits dist/macos/${PRODUCT_NAME}-${APP_VERSION}.dmg + .sha256.
+  PEARPASTE_MAC_APP="$app" PEARPASTE_LINK="$RELEASE_VERLINK" PEARPASTE_DIST_DIR="${DIST_DIR}/macos" npm run release:mac
+  ok "macOS .dmg built + notarized via build-macos.mjs (dist: ${DIST_DIR}/macos)"
 }
 
 # Windows: delegated to scripts/build-windows.mjs (pear build --win32-x64-app +
@@ -315,23 +307,25 @@ cat <<EOF
 
   macOS (Apple Developer ID; out of scope here — fail closed without identity):
     1. Build the darwin app dir (basename must be "${PRODUCT_NAME}").
-    2. pear build --darwin-arm64-app <path-to/${PRODUCT_NAME}.app> --target ${DIST_DIR}/macos
-    3. codesign --deep --force --options runtime --timestamp \\
-         --sign "\$PEARPASTE_MAC_IDENTITY" .../${PRODUCT_NAME}.app
-    4. hdiutil create ${DIST_DIR}/${PRODUCT_NAME}-${APP_VERSION}.dmg ; codesign the dmg
-    5. xcrun notarytool submit ... --wait ; xcrun stapler staple
-       -> automated by mac_sign_notarize() in this script.
+    2. npm run release:mac  (pear build --darwin-arm64-app + codesign hardened
+         runtime + hdiutil .dmg + xcrun notarytool submit --wait + stapler
+         staple) — see scripts/build-macos.mjs
+       -> automated by mac_sign_notarize() (delegates to release:mac).
+       For an UNSIGNED dev/CI .dmg (no Developer ID): npm run build:mac.
 
   Windows (Authenticode; out of scope here — fail closed without cert):
     1. Build the win32 app dir (basename must be "${PRODUCT_NAME}").
     2. npm run release:win  (pear build --win32-x64-app + signtool
          /fd SHA256 /tr <RFC3161 TSA> /td SHA256) — see scripts/build-windows.mjs
+       For an UNSIGNED dev/CI .exe (no cert): npm run build:win:unsigned.
 
-  Linux (no mandatory signing; GPG/minisign + optional AppImage):
+  Linux (no mandatory signing; GPG/minisign + optional .deb/AppImage):
     1. npm run preflight:linux
-    2. PEARPASTE_LINK="$RELEASE_VERLINK" npm run build:linux
-    3. release:linux requires a detached signature sidecar; optionally wraps an
-       AppImage when appimagetool is present (skipped gracefully otherwise).
+    2. PEARPASTE_LINK="$RELEASE_VERLINK" npm run build:linux  (tarball + .deb +
+         AppImage when dpkg-deb/appimagetool present; skipped gracefully if not)
+    3. release:linux requires a detached signature sidecar for EVERY artifact
+       (tarball, .deb, AppImage); fails closed otherwise. For unsigned dev/CI
+       artifacts: npm run build:linux -- --unsigned.
 
   The Pear P2P auto-update path is preserved by all wrappers, so a wrapper
   rarely needs a rebuild — content updates flow over the pear:// link.
