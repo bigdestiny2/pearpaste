@@ -57,19 +57,39 @@ transport.
 
 ### 2.3 Malicious paired (then revoked) device
 
-**Capability:** was a legitimate writer; may try to keep writing or replay old
-ops after the user revokes it.
+**Capability:** was a legitimate writer; retains its full local replica,
+`vaultKey`, and every epoch key it was entitled to before the revoke; may try
+to keep reading, keep writing, replay old ops, keep replicating the log, or
+get itself re-admitted.
 
-- **Enforced:** `DEVICE_REVOKE` (signed by root/admin) + `KEY_ROTATE`. The
-  reducer authorization gate drops every content op from the revoked device
-  at/after the revoke Lamport; stale replays lose deterministic LWW; the
-  revoked device cannot produce content under the post-rotation epoch.
-- **Residual risk:** ops the device legitimately authored *before* revocation
-  remain valid history (retroactive rejection would corrupt the log). It may
-  retain plaintext it already decrypted while trusted — revocation is forward,
-  not retroactive, secrecy. Autobase writer-core eviction is a documented
-  no-op on the pinned Autobase version; the load-bearing control is the
-  reducer gate (fully active, tested in `sec-auth.test.js`).
+- **Enforced — reads:** `KEY_ROTATE` is a REAL rotation (fresh random epoch
+  key sealed only to survivors' box pubkeys; the revoked device gets no
+  lockbox). It cannot decrypt anything created after its revoke, even from
+  bytes it obtains — proven by the decisive test, which attacks post-revoke
+  ciphertext with every key the device ever held
+  (`revocation-rotation.test.js`).
+- **Enforced — writes:** the reducer rejects every newly-arriving op from a
+  committed-revoked signer regardless of claimed Lamport (closes timestamp
+  backdating); writer-core eviction (`removeWriter` — real on Autobase
+  7.28.1, host-side, liveness-gated, deferred for offline targets) is
+  defense-in-depth on top.
+- **Enforced — replication, where the user controls the edge:** the
+  per-connection replication firewall refuses unauthenticated/revoked peers
+  and destroys live streams on revoke; the discovery topic and relay seed
+  re-derive from the new epoch key the device cannot compute.
+- **Enforced — re-admission:** pairing delivers only the current epoch key by
+  default (selective chain), so a re-paired ex-device cannot read its
+  revoked-interval content; an N-of-M admit policy blocks quiet lone-admin
+  self-admission; reused revoked key material trips a loud warning.
+- **Residual risk:** it keeps everything it already had — replicated history,
+  decrypted plaintext, `vaultKey`, its old epoch keys (revocation is forward,
+  not retroactive, secrecy; epoch-0 content rides with `vaultKey`). Against a
+  third-party relay still seeding the immutable core key, or any
+  non-firewalled peer, it can keep REPLICATING the opaque post-revoke
+  ciphertext indefinitely and traffic-analyze it (cadence/sizes/timing) — it
+  just cannot decrypt it. Pre-revoke ops remain valid history; replay loses
+  LWW. A phrase-holder is outside this adversary class: the phrase is root —
+  that scenario requires a new vault, not revocation (§3 trust boundaries).
 
 ### 2.4 Lost / stolen device
 

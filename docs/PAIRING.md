@@ -127,10 +127,17 @@ short code can't be used to fetch a newer invite.
    already-authorized admin/root device — spec §14 step 7). Only after this
    succeeds does it consume the one-time invite.
 6. The existing device seals the **vault bootstrap** (vault id, wrapped
-   `vaultKey`/`indexKey`/`deviceAdminSeed`, vault header, Autobase key) to the
-   new device's box public key using a libsodium **sealed box**
+   `vaultKey`/`indexKey`/`deviceAdminSeed`, vault header, Autobase key, the
+   active epoch id, the **current epoch content key**, and the follow seed)
+   to the new device's box public key using a libsodium **sealed box**
    (`pairing.sealBootstrap` → `identity.sealToDevice`). Only the new device's
-   box secret key can open it.
+   box secret key can open it. **Selective chain by default**
+   (REVOCATION_DESIGN §3.8): the bootstrap carries ONLY the current epoch
+   key — older rotated-epoch keys ride along only when the approver passes an
+   explicit `grantHistory` on `PAIR_APPROVE`. (`vaultKey` itself always
+   ships: it is the system key every committed record is sealed under, so
+   pre-rotation epoch-0 content is readable to any paired device — stated
+   honestly in SECURITY.md §4.2.)
 7. The new device opens the sealed bootstrap, persists its local-only device
    blob, joins the vault topic, and starts sync. Sealed rows resolve and
    tap-to-decrypt works because it now holds the vault keys.
@@ -181,23 +188,38 @@ unrecoverable. This is by design (SECURITY.md §4.1, §4.4).
   cannot resolve are returned sealed.
 - `DEVICE_REVOKE { deviceId }` must be signed by the **root identity or an
   admin device** (`NOT_AUTHORIZED` otherwise). It appends a signed
-  `DEVICE_REVOKE` and then a `KEY_ROTATE` op that **bumps the content-key
-  epoch by one** (spec §23 recommendation: always rotate for future writes).
+  `DEVICE_REVOKE` and then a `KEY_ROTATE` op that performs a **real
+  content-key rotation**: a fresh random epoch key sealed only to the
+  surviving devices' box pubkeys — the revoked device gets no lockbox and
+  cannot derive the key from anything it retains.
 
 After revocation:
 
-- the reducer's authorization gate (`_signerAuthorized`) drops every content
-  op from the revoked device whose Lamport is at/after the revoke epoch — it
-  cannot land new operations;
-- a replay of the revoked device's *old* ops loses deterministic
-  last-writer-wins (stale Lamport);
-- it cannot produce content under the post-rotation epoch.
+- the revoked device **cannot decrypt any content created after the revoke**
+  (forward secrecy — the deliverable guarantee, proven by the decisive test);
+- the reducer rejects every newly-arriving op from the committed-revoked
+  signer regardless of its claimed Lamport — it cannot land new operations,
+  and backdating its timestamps does not help; a replay of its *old* ops
+  loses deterministic last-writer-wins;
+- writer-core eviction (`removeWriter`) runs host-side as best-effort
+  defense-in-depth — it is real on Autobase 7.28.1, but liveness-gated and
+  deferred when the target is offline;
+- the replication firewall destroys its live streams and refuses its new
+  connections wherever survivors run it; survivors move to a discovery topic
+  it cannot compute;
+- re-pairing it (fresh identity) under the default selective-chain bootstrap
+  does NOT hand back the keys minted during its revoked interval, and an
+  N-of-M admit policy can require a second admin's cosignature for any
+  re-admission.
 
-Honest limits (SECURITY.md §4.2): ops legitimately authored *before*
-revocation remain valid history; content the device already decrypted while
-trusted is not retroactively protected; on the pinned Autobase version,
-writer-core eviction is a documented no-op so the reducer authz gate is the
-load-bearing control. Revoke promptly and from a still-trusted device.
+Honest limits (SECURITY.md §4.2, THREAT_MODEL.md §2.3): ops legitimately
+authored *before* revocation remain valid history; content the device
+already decrypted or replicated while trusted is not retroactively protected
+(epoch-0 content rides with `vaultKey`, which it still holds); a third-party
+relay or non-firewalled peer keeps serving it OPAQUE post-revoke ciphertext
+it cannot read; and none of this defends against a compromised recovery
+phrase — that needs a new vault. Revoke promptly and from a still-trusted
+device.
 
 ---
 

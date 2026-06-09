@@ -1,6 +1,9 @@
 # PearPaste Device Revocation — Real Content-Key Rotation with Forward Secrecy
 
-Status: **LOCKED (post-red-team).** Author: Lead Architect. Date: 2026-06-09.
+Status: **IMPLEMENTED (Phases 0–6 complete, 2026-06-09).** See **Appendix A**
+for the empirical GATE findings and the deviations the implementation forced —
+read it before treating any §3/§5 mechanism description as exact.
+Originally: LOCKED (post-red-team). Author: Lead Architect. Date: 2026-06-09.
 Supersedes the "epoch bump is cosmetic" behavior described in SECURITY.md §4.2,
 THREAT_MODEL.md §2.3, PAIRING.md §5.
 
@@ -1242,3 +1245,127 @@ the revocation feature.**
    survivors. Scope and cost to be assessed separately.
 7. **(v2) Per-epoch survivor box-keypair rotation** for post-compromise security
    against a leaked survivor box key (L5).
+
+---
+
+## Appendix A — Implementation outcome (Phases 0–6) + empirical GATE findings
+
+All seven phases shipped 2026-06-09 on `total-review-followups`
+(P0 `02d154a` → P1 `d9076e6` → P2 `5b7ebf5` → P3 `aa6a72f` → P4 `16d5b57` →
+P5 `62421c2` → P6 docs). The decisive forward-secrecy test, the SB1
+regression, the SB2 firewall tests, the B1 selective-chain test, and the
+B4/B9 durability tests are all green on the deterministic
+`@hyperswarm/testnet` harness. This appendix records what EMPIRICAL testing
+proved versus what the locked design assumed, and the deviations the code
+forced. Where this appendix and §3/§5 disagree, this appendix wins.
+
+### A.1 GATE finding SB1 — `removeWriter` on an OFFLINE indexer freezes the base
+
+Proven on a real testnet (Autobase 7.28.1): calling `removeWriter` inside the
+reducer on an OFFLINE indexer deterministically freezes `indexedLength` — the
+indexer-set migration is itself an indexed op that needs the REMOVED device's
+ack. The design's "ensure another live indexer first" precondition (§3.6) is
+insufficient: the *removed* device must be online to ack the migration.
+
+**Implemented instead:** eviction is fully DECOUPLED from rotation.
+`removeWriter` runs HOST-SIDE in the `DEVICE_REVOKE` dispatcher, gated on
+`_isWriterLive(target)`, and is skipped+deferred when the target is offline.
+The load-bearing write-exclusion is the reducer's
+reject-committed-revoked-signer rule (B12) — which also gates on "revoked at
+all" rather than the Lamport inequality, closing the backdated-lamport hole.
+The SB1 regression test asserts a revoke of an offline device commits and the
+base stays live.
+
+### A.2 GATE finding SB2 — relay `unseed`/`revocable` is cosmetic; the firewall is the sole real control
+
+Proven against a live HiveRelay + testnet: Hypercore replication streams
+persist through `swarm.leave`, and `p2p-hiverelay-client.unseed()` only
+broadcasts a message — it never closes a stream. Topic rotation and relay
+re-seed are therefore DISCOVERY conveniences only (§3.7's demotion,
+confirmed harder than written).
+
+**Implemented instead:** `backend/replication-firewall.js` — a
+per-connection gate that (a) runs `store.replicate(conn)` only after the
+peer authenticates as a committed NON-REVOKED device, and (b) on every
+device that APPLIES a `DEVICE_REVOKE`, actively `conn.destroy()`s the live
+streams authenticated to the revoked device. Residual L2 stands exactly as
+§7.2 states it.
+
+### A.3 Deviation — firewall identity is a signed handshake, not an `onauthenticate` lookup
+
+§3.7.2/§5.10 assumed the peer could be authenticated by keying the
+connection's Noise `remotePublicKey` to the committed device set. Committed
+device records carry signing/box/writer pubkeys but NO swarm pubkeys, so
+that binding does not exist. Implemented instead: a `pearpaste/repl-auth/1`
+protomux channel on which each side sends a credential signed with its
+device signing key, binding its deviceId to BOTH Noise session pubkeys
+(replay onto another session fails; forgery needs a survivor's signing
+secret key). Bootstrap allowance for fresh joiners (empty committed set),
+relay allowance (the L2 channel), `PEARPASTE_REPL_FIREWALL=off` kill-switch.
+
+### A.4 Deviation — `vaultKey` ships in every bootstrap; selective-chain withholds ROTATED epochs only
+
+§5.8 wanted `vaultKey` itself behind `grantHistory`. Impossible as specified:
+every committed system row (device records, vault-state, objmeta, epoch-key
+wraps) is sealed under `vaultKey` — it is the system KEK, and a joiner
+without it cannot even read the device set. Implemented: `vaultKey` always
+ships; selective-chain withholds every ROTATED epoch key except the current
+one — exactly the keys minted during a revoked device's exile, which is what
+the B1 adversary (who already holds `vaultKey` on disk) was after. The B1
+decisive pairing test proves the revoked-interval denial. Honest
+consequence, stated in SECURITY.md §4.2: epoch-0 content rides with
+`vaultKey`.
+
+### A.5 Deviation — device lifecycle ops seal under epoch 0
+
+Required to make A.4's selective chain SAFE: a joiner deliberately not given
+intermediate epoch keys must still be able to APPLY a `DEVICE_REVOKE` minted
+under one of those epochs (otherwise the revoked device stays alive in its
+auth view, which both the reducer gates and the firewall consult).
+`DEVICE_ADD` / `DEVICE_REVOKE` / `ADMIT_POLICY_SET` bodies — roster metadata,
+never user content — seal under epoch 0 (header `epoch:'0'`/`epochTag:''`).
+`KEY_ROTATE` is NOT in this set: its body stays sealed under the NEW epoch
+key (B3/B10 roster-blindness unchanged). Trade-off accepted: a revoked
+device that still obtains ciphertext via the L2 channel can read FUTURE
+membership changes (it holds `vaultKey`) — metadata, not content, and
+consistent with the §7.1 statement that headers/roster-counts are the
+accepted leak surface.
+
+### A.6 Deviation — followSeed is vaultKey-derived in v1
+
+§4 specified `followSeed = randomBytes(32)` delivered at pairing. A
+phrase-restored device (no blob, no pairing) could never recover a random
+seed without sealing it into the view under `vaultKey` — which gives it the
+identical security posture to simply DERIVING it from `vaultKey`. v1 derives
+`followSeed = HKDF(vaultKey, 'follow-seed-v1')` (the bootstrap also carries
+it explicitly for forward-compat). Follow topics are discovery-only; the
+firewall, not topic secrecy, is the exclusion control (A.2). Metadata
+posture is identical to the epoch-0 topic, which is also vaultKey-derived.
+
+### A.7 Admit policy — implemented shape
+
+`ADMIT_POLICY_SET` op (additive `OP_TYPES`/`SCHEMAS` entries) persists
+`admitPolicyN` in vault-state. The `DEVICE_ADD` reducer requires N DISTINCT
+non-revoked admin signatures — the op signer plus detached cosignatures
+bound to the exact identity tuple being admitted — and enforces this for
+ROOT-signed adds too (the lone-phrase-holder hole). The policy CHANGE itself
+requires the current effective N signatures (no lone downgrade). Effective N
+clamps to the live non-revoked admin count so revocation cannot deadlock
+admission; the honest residual is that a root willing to LOUDLY revoke the
+other admins first returns to N=1 — the policy stops QUIET re-admission
+(documented under L3).
+
+### A.8 Open questions — disposition
+
+- Open-q #1 (single-indexer linearization after last-indexer removal):
+  superseded by A.1 — eviction is never attempted against an offline target,
+  and rotation never depends on it. SB1 regression test green.
+- Open-q #2 (does `unseed`/`revocable` really evict): answered NO (A.2). L2
+  is mitigated only at firewalled edges, exactly as §7.2 documents.
+- §3.10 catch-up re-wrap and §3.5.1 chained-rotation-on-provisional-winner:
+  the reducer marks the provisional state and records pending gaps; the
+  automated chained rotation / re-wrap APPEND remains future work (v1.1) —
+  survivors currently heal via the next rotation or re-pair. Documented
+  residual, low frequency (requires a reorg exactly straddling a rotation).
+- v2 items unchanged: Autobase core-identity rotation (the real L2 fix) and
+  per-epoch survivor box-keypair rotation (L5).

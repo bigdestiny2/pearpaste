@@ -1,7 +1,8 @@
 # Revocation Implementation — HANDOFF
 
 **Date:** 2026-06-09 · **Branch:** `total-review-followups` · **Repo:** `bigdestiny2/pearpaste` (private)
-**Status:** Phases 0–5 DONE + verified + pushed. **Phase 6 (docs honesty pass) is the LAST remaining phase.**
+**Status: ✅ ALL 7 PHASES COMPLETE (0–6), verified, pushed. The revocation build is SHIPPED.**
+Forward secrecy is real and proven; the network firewall, selective-chain pairing, admit policy, epoch-faithful durability, and the docs honesty pass are all in. Remaining follow-ups are tracked in `REVOCATION_DESIGN.md` **Appendix A.8** (v1.1: automated catch-up re-wrap + chained rotation on provisional winner; v2: core-identity rotation for L2, survivor box-key rotation for L5).
 
 > Read this first, then `docs/REVOCATION_DESIGN.md` (the full design + 7-phase plan + adversarial red-team findings). Continue the per-phase loop below.
 
@@ -22,9 +23,9 @@ Make device revocation REAL: a revoked device must lose READ access to content c
 | 3 | Discovery-topic rotation + REPLICATION FIREWALL + relay re-seed + follow-topic | ✅ green (SB2 incorporated) | `aa6a72f` |
 | 4 | Pairing: selective-chain-by-default + N-of-M admit | ✅ green (B1 decisive test) | `16d5b57` |
 | 5 | Durability reconciler (epoch-faithful) + tombstones | ✅ green (B4+B9 closed) | `62421c2` |
-| **6** | **Docs honesty pass (SECURITY/THREAT_MODEL/PAIRING) + fold in GATE findings** | ⏭️ **NEXT — the LAST phase** | — |
+| 6 | Docs honesty pass (SECURITY/THREAT_MODEL/PAIRING) + GATE findings appendix + doc-lint | ✅ done | (this commit) |
 
-**Green baseline (sandbox OFF, Node 22):** unit 44/44 · integration 26/26 (×2) · e2e 3/3 · security 25/25 · mobile 4/4 · lint clean.
+**Final green baseline (sandbox OFF, Node 22):** unit 44/44 · integration 26/26 · e2e 3/3 · security 27/27 (incl. the new doc-lint) · mobile 4/4 · lint clean.
 **Current HEAD:** `62421c2` (P5) → `98ff9db` (handoff) → `16d5b57` (P4) → `772573c` (handoff) → `aa6a72f` (P3) → `07f0fe9` (handoff doc) → `e136187` (lint) → `5b7ebf5` (P2) → `f2df0c2` (Flatpak spike) → `d9076e6` (P1) → `02d154a` (P0).
 
 **Phase 5 outcome:**
@@ -64,7 +65,19 @@ Both auxiliary controls FAILED as the design first wrote them; **the core forwar
 - **SB1 — DONE (folded into Phase 2):** `removeWriter` on an **OFFLINE** indexer deterministically FREEZES the base's `indexedLength` (the durable checkpoint); the "ensure another live indexer first" mitigation is insufficient (the *removed* device must be online to ack the indexer-set migration). FIX: eviction DECOUPLED from rotation — `removeWriter` is host-side best-effort gated on `_isWriterLive`, skipped+deferred when offline; the reducer **reject-committed-revoked-signer (B12)** is the load-bearing primary write-exclusion (gate on "revoked at all", closing the backdated-lamport hole). ✅ SB1-regression test green.
 - **SB2 — for Phase 3:** relay `unseed`/`revocable` is **COSMETIC** against an already-connected peer (Hypercore replication streams persist through `swarm.leave`; `p2p-hiverelay-client.unseed()` only broadcasts a msg, never closes a stream). The per-connection **REPLICATION FIREWALL is the SOLE real control**, and it MUST **actively `conn.destroy()` existing streams to revoked peers on DEVICE_REVOKE**, not just refuse new ones. Topic rotation is a discovery convenience, not an exclusion barrier (a revoked device can still dial the immutable Autobase core key). Honest residual **L2**: a third-party non-firewalled relay keeps serving the OPAQUE post-revoke ciphertext — decrypt stays blocked by rotation.
 
-## 6. NEXT — Phase 6 brief (docs honesty pass — the LAST phase; see §3 workflow + §9 gotchas)
+## 6. DONE — Phase 6 brief (executed; kept for the record)
+
+> **Phase 6 shipped.** SECURITY.md §4.2, THREAT_MODEL.md §2.3, PAIRING.md
+> §3.2/§5 rewritten to the implemented guarantee (one-line promise + L1–L8
+> residuals); the `removeWriter` "no-op" claim corrected everywhere
+> (`sec-auth.test.js` was already honest from Phase 2); GATE findings +
+> implementation deviations folded into `REVOCATION_DESIGN.md` **Appendix A**
+> (A.1 SB1, A.2 SB2, A.3 signed-handshake firewall identity, A.4 vaultKey-in-
+> bootstrap/selective-chain scope, A.5 lifecycle-ops-epoch-0, A.6 derived
+> followSeed, A.7 admit-policy shape, A.8 open-question disposition);
+> `test/security/sec-doc-claims.test.js` doc-lint pins both directions —
+> falsified claims can never reappear, honesty statements can never silently
+> vanish. Original brief below.
 > Rewrite the security documentation to the IMPLEMENTED guarantee and fold in the GATE findings (RT-FIX L8, design §8 Phase 6). The code is done (Phases 0–5); this phase makes the DOCS stop overclaiming and the stale tests stop asserting falsehoods.
 >
 > READ FIRST: `docs/REVOCATION_DESIGN.md` §1.3 (the `removeWriter` "no-op" correction), §7.1/§7.2 (the guarantee + residuals L0–L8 — the source of truth for every wording change), the GATE findings in this handoff §5, and the Phase 3/4/5 outcome notes in §2 (the honest deviations that must be reflected: vaultKey ships in every bootstrap → epoch-0 content rides with it; lifecycle ops epoch-0-sealed; relay unseed cosmetic; firewall is the real control; follow-seed currently vaultKey-derived).
