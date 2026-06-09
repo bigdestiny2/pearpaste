@@ -290,6 +290,17 @@ details.q .a b { color: var(--text); }
 .cta-final h2 { font-size: clamp(28px, 4.6vw, 50px); }
 .cta-final p { color: var(--muted); margin: 16px auto 30px; max-width: 52ch; }
 
+/* Install steps (get section) */
+.install-steps { display: grid; gap: 20px; max-width: 680px; margin: 36px auto 0; text-align: left; }
+.install-step { display: flex; gap: 20px; align-items: flex-start; border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; background: var(--surface); }
+.install-num { font-family: var(--fm); font-size: 22px; font-weight: 700; color: var(--accent); flex: none; min-width: 36px; }
+.install-body h3 { font-size: 17px; margin-bottom: 8px; }
+.install-body p { color: var(--muted); font-size: 14.5px; margin-bottom: 16px; }
+.inline-link { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.cmd-block { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.peer-cmd { font-family: var(--fm); font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 13px; word-break: break-all; }
+.copy-btn { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+
 /* Footer */
 footer { border-top: 1px solid var(--line); padding: 56px 0 44px; color: var(--muted); }
 .foot { display: grid; grid-template-columns: 1.6fr 1fr 1fr 1fr; gap: 32px; }
