@@ -287,19 +287,29 @@ jobs:
 
       - name: Unsigned release artifact guard (§21 Agent 5 acceptance #2)
         # HONEST MODEL (real signing certs are out of scope per the brief):
-        # a release artifact directory (RELEASE_ARTIFACTS, default dist/) must
-        # contain, for every distributable file, a detached signature sidecar
-        # (.sig / .asc / .minisig / .p7s). If artifacts exist with NO matching
-        # signature -> FAIL the build (unsigned release blocked). If no
-        # artifacts are present (normal PR/CI), the gate is documented and
-        # passes — it activates on release builds that produce artifacts. The
-        # signing procedure + the real cert TODO live in docs/RELEASE.md.
+        # for every distributable file in the release-artifact dir, a detached
+        # signature sidecar (.sig / .asc / .minisig / .p7s) must exist. Any
+        # artifact with NO matching signature -> FAIL the build.
+        #
+        # INERT ON PR CI BY DESIGN: no job in this workflow populates dist/, so
+        # on a normal push/PR the gate finds no artifacts and passes (a no-op).
+        # The gate becomes LIVE only once a release workflow (tag- or
+        # workflow_dispatch-triggered) builds + signs artifacts into the
+        # directory named by $RELEASE_ARTIFACTS (default dist/). Until then it
+        # is documented and inert — see docs/RELEASE.md §6 and docs/SHIPPING.md.
+        # (We do NOT force RELEASE_ARTIFACTS="" — that previously masked the
+        # gate behind an always-empty default and hid this inertness.)
         run: |
           set -euo pipefail
           ART_DIR="${RELEASE_ARTIFACTS:-dist}"
           if [ ! -d "$ART_DIR" ]; then
-            echo "no release artifacts in '$ART_DIR' — signing gate documented;"
-            echo "it activates on release builds (see docs/RELEASE.md §17)."
+            echo "no '$ART_DIR/' directory — signing gate is INERT on this run."
+            echo "It activates when a release workflow populates artifacts there"
+            echo "(see docs/RELEASE.md §6, docs/SHIPPING.md). Nothing to check."
+            exit 0
+          fi
+          if [ -z "$(find "$ART_DIR" -type f -print -quit)" ]; then
+            echo "'$ART_DIR/' is empty — signing gate is INERT on this run."
             exit 0
           fi
           UNSIGNED=0
@@ -318,8 +328,6 @@ jobs:
             exit 1
           fi
           echo "all release artifacts have a detached signature sidecar"
-        env:
-          RELEASE_ARTIFACTS: ""
 
   # Windows build readiness (spec §12/§17, Agent 3 distribution). Proves the
   # app installs + runs its encryption invariant on win32: npm ci pulls the

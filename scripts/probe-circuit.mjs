@@ -47,10 +47,10 @@ await client.start()
 // catch more candidates.
 const t0 = Date.now()
 while (seen.size === 0 && Date.now() - t0 < WAIT_MS) {
-  await new Promise(r => setTimeout(r, 500))
+  await new Promise(resolve => setTimeout(resolve, 500))
 }
 // Give 4 more seconds to collect any additional connections.
-await new Promise(r => setTimeout(r, 4000))
+await new Promise(resolve => setTimeout(resolve, 4000))
 
 console.log('\n=== probe result ===')
 const relays = client.getRelays() || []

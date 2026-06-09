@@ -4,6 +4,14 @@
 // §17 (release; sign Windows artifacts; preserve Pear P2P update path),
 // §21 Agent 3 (desktop distribution). Companion: docs/RELEASE.md §3.
 //
+// Verified against Pear v0.3243 (`pear stage --help`, `pear build --help`):
+//   - `pear stage <link> [dir]` syncs disk changes into a project link. It has
+//     NO platform-app flags. (`pear init`/`pear release` were removed.)
+//   - `pear build --win32-x64-app <app-dir> [--target <dir>]` packages an
+//     ALREADY-BUILT win32 app dir into the deployment folder. Pear enforces
+//     `basename(app) === (package.json productName ?? name)`; here we pin
+//     `productName: "Paste"`, so the expected app dir basename is `Paste`.
+//
 // Paste is a Pear app. There are two Windows distribution tiers:
 //
 //   Tier 1 (v1, P2P link — produced from ANY OS incl. macOS):
@@ -13,11 +21,12 @@
 //     `pear.assets.ui` with `/by-arch/%%HOST%%` + `/prebuilds/%%HOST%%`, and
 //     sodium-native ships a win32-x64 prebuild). No cross-compile needed.
 //
-//   Tier 2 (v1.5, standalone signed PearPaste-Setup.exe):
-//     `pear stage <link> --win32-x64-app <wrapper>` + Authenticode signtool +
-//     an installer. This REQUIRES a Windows host (or CI windows-latest) and a
-//     real code-signing certificate — out of repo scope per spec §17. The
-//     steps are scripted and gated here; they fail closed without a cert.
+//   Tier 2 (v1.5, standalone signed installer):
+//     `pear build --win32-x64-app <app-dir>` (package the platform app) +
+//     Authenticode signtool over the produced .exe + an installer. This
+//     REQUIRES a Windows host (or CI windows-latest) and a real code-signing
+//     certificate — out of repo scope per spec §17. The steps are scripted and
+//     gated here; they fail closed without a cert.
 //
 // This script is safe to run from macOS for preflight/dry-run. The signing
 // and installer steps only execute on win32 with the cert env present.
@@ -26,13 +35,15 @@
 //   node scripts/build-windows.mjs --preflight        # readiness report (any OS)
 //   node scripts/build-windows.mjs --dry-run           # show the plan, no writes
 //   node scripts/build-windows.mjs --stage --link pear://<key>
-//   node scripts/build-windows.mjs --release --link pear://<key>   # win32 + sign
+//   node scripts/build-windows.mjs --release --link pear://<key>   # build + sign
 //
 // Env:
 //   PEARPASTE_LINK            pear:// link (or channel) to stage to
 //   PEARPASTE_WIN_CERT        path to the Authenticode .pfx (Tier 2 signing)
 //   PEARPASTE_WIN_CERT_PASS   password for the .pfx
-//   PEARPASTE_WIN_WRAPPER     path to a prebuilt win32-x64 pear-electron app
+//   PEARPASTE_WIN_WRAPPER     path to a prebuilt win32-x64 pear-electron app dir
+//                             (its basename must be the product name "Paste")
+//   PEARPASTE_WIN_TSA         RFC3161 timestamp authority URL (optional override)
 
 import { execFileSync } from 'child_process'
 import fs from 'fs'
@@ -52,6 +63,13 @@ const MODE = has('--release')
   ? 'release'
   : has('--stage') ? 'stage' : has('--dry-run') ? 'dry-run' : 'preflight'
 const LINK = val('--link', 'PEARPASTE_LINK')
+// Deliberate product/display name. `pear build` requires the platform app dir's
+// basename to equal (package.json) productName ?? name; we pin productName to
+// "Paste" so the win32 app dir + .exe path are predictable for signing.
+const PRODUCT_NAME = 'Paste'
+// RFC3161 timestamp authority used by signtool (`/tr`). Overridable via env so a
+// maintainer can point at their CA's TSA without editing the script.
+const TSA_URL = process.env.PEARPASTE_WIN_TSA || 'http://timestamp.digicert.com'
 const C = { ok: '\x1b[32m', warn: '\x1b[33m', err: '\x1b[31m', dim: '\x1b[2m', x: '\x1b[0m' }
 const log = (m) => console.log(`[win] ${m}`)
 const ok = (m) => console.log(`${C.ok}[win:ok]${C.x} ${m}`)
@@ -132,18 +150,34 @@ function grepUnguarded () {
   //   | Buffer( | setImmediate( | __dirname | __filename
   const re = /(?:[^.\w]process\.)|(?:\bnew\s+AbortController\b)|(?:\bAbortController\s*\()|(?:[^.\w]Buffer\.)|(?:\bnew\s+Buffer\b)|(?:[^.\w]Buffer\s*\()|(?:\bsetImmediate\s*\()|(?:\b__dirname\b)|(?:\b__filename\b)/
   const stripComments = (ln) => ln.replace(/\/\*.*?\*\//g, '').replace(/\/\/.*$/, '')
+  // A usage is GUARDED if a typeof/globalThis guard for the same global is in
+  // scope. Guards frequently live on a preceding line of the same logical
+  // expression (e.g. `typeof process !== 'undefined' &&\n  process.env && ...`),
+  // so we test each code line joined with its guard context, not in isolation.
+  const guarded = (ctx) =>
+    /typeof\s+(process|AbortController|Buffer)\s*!==?\s*['"]undefined['"]/.test(ctx) ||
+    /globalThis\.(process|AbortController|Buffer)/.test(ctx)
   const out = []
   for (const rel of files) {
     const fp = path.join(ROOT, rel)
     if (!fs.existsSync(fp)) continue
     const lines = fs.readFileSync(fp, 'utf8').split('\n')
+    const codeLines = lines.map(stripComments)
     lines.forEach((ln, i) => {
       const s = ln.trim()
       if (s.startsWith('//') || s.startsWith('*') || s.startsWith('/*')) return
-      const code = stripComments(ln)
+      const code = codeLines[i]
       if (!code.trim()) return
-      if (/typeof\s+(process|AbortController|Buffer)\s*!==?\s*['"]undefined['"]/.test(code)) return
-      if (/globalThis\.(process|AbortController|Buffer)/.test(code)) return
+      // Build guard context: this line plus contiguous preceding lines that are
+      // part of the same boolean expression (each ends with a `&&` / `||`).
+      let ctx = code
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = codeLines[j].trimEnd()
+        if (!prev.trim()) break
+        ctx = prev + '\n' + ctx
+        if (!/(\|\||&&)\s*$/.test(prev)) break
+      }
+      if (guarded(ctx)) return
       if (re.test(code)) out.push(`${rel}:${i + 1}: ${s.slice(0, 80)}`)
     })
   }
@@ -151,27 +185,76 @@ function grepUnguarded () {
 }
 
 // ---- Stage (Tier 1) -------------------------------------------------------
+// `pear stage <link> [dir]` (verified: pear stage --help, v0.3243). It has NO
+// platform-app flag — the Tier-1 deliverable is just the staged pear:// link.
 function stage (dry) {
-  if (!LINK) die('no link: pass --link pear://<key> or set PEARPASTE_LINK (run `pear stage <channel>` once to bootstrap it; `pear init` was removed)')
-  const wrapper = val('--wrapper', 'PEARPASTE_WIN_WRAPPER')
+  // A real stage needs a link; a dry run only previews the plan, so fall back
+  // to a placeholder so `build:win:dry` works with no PEARPASTE_LINK set.
+  let link = LINK
+  if (!link) {
+    if (!dry) die('no link: pass --link pear://<key> or set PEARPASTE_LINK (run `pear stage <channel>` once to bootstrap it; `pear init`/`pear release` were removed)')
+    link = 'pear://<production-key>'
+    warn('no PEARPASTE_LINK set — dry run uses placeholder pear://<production-key>')
+  }
   const args = ['stage']
   if (dry) args.push('--dry-run')
-  args.push(LINK, '.')
-  if (wrapper) {
-    if (!fs.existsSync(wrapper)) die(`--win32-x64-app path not found: ${wrapper}`)
-    args.push('--win32-x64-app', wrapper)
-    log(`staging WITH standalone win32 wrapper: ${wrapper}`)
-  } else {
-    log('staging Tier 1 (P2P link). Windows users: `pear run pear://<key>` — Pear fetches the win32 runtime automatically.')
-  }
+  args.push(link, '.')
+  log('staging Tier 1 (P2P link). Windows users: `pear run pear://<key>` — Pear fetches the win32 runtime automatically.')
   log(`$ pear ${args.join(' ')}`)
   if (dry) { ok('dry-run: not executed'); return }
   execFileSync('pear', args, { cwd: ROOT, stdio: 'inherit' })
   ok('staged')
 }
 
-// ---- Sign + installer (Tier 2 — Windows host + cert) ----------------------
-function signAndPack () {
+// Locate the win32 .exe inside the prebuilt app dir. pear-electron lays the
+// binary out as bin\<kebab>-app\<Cased>.exe; rather than hardcode a name we
+// glob bin\*-app\*.exe and require exactly one match (fail closed otherwise).
+function findWin32Exe (wrapper) {
+  const binDir = path.join(wrapper, 'bin')
+  if (!fs.existsSync(binDir)) {
+    die(`no bin/ directory under the win32 app dir: ${wrapper} ` +
+        '(expected pear-electron layout bin\\<App>-app\\<App>.exe)')
+  }
+  const candidates = []
+  for (const appDir of fs.readdirSync(binDir)) {
+    if (!appDir.endsWith('-app')) continue
+    const full = path.join(binDir, appDir)
+    if (!fs.statSync(full).isDirectory()) continue
+    for (const f of fs.readdirSync(full)) {
+      if (f.toLowerCase().endsWith('.exe')) candidates.push(path.join(full, f))
+    }
+  }
+  if (candidates.length === 0) {
+    die(`no bin\\*-app\\*.exe found under ${wrapper} — did 'pear build --win32-x64-app' produce the app dir?`)
+  }
+  if (candidates.length > 1) {
+    die(`ambiguous win32 exe (${candidates.length} matches): ${candidates.join(', ')} — point PEARPASTE_WIN_WRAPPER at a single app dir`)
+  }
+  return candidates[0]
+}
+
+// ---- Build platform app dir + sign + installer (Tier 2 — Windows + cert) --
+// Pear enforces basename(app) === productName ("Paste"), so the supplied
+// wrapper dir must be named "Paste". `pear build --win32-x64-app <dir>` packages
+// it into the deployment folder; then signtool signs the produced .exe.
+function buildSignAndPack (dry) {
+  const wrapper = val('--wrapper', 'PEARPASTE_WIN_WRAPPER')
+  if (!wrapper) die('release requires --wrapper / PEARPASTE_WIN_WRAPPER (the prebuilt win32-x64 app dir; its basename must be the product name "Paste")')
+  if (!fs.existsSync(wrapper)) die(`win32-x64 app dir not found: ${wrapper}`)
+  if (path.basename(wrapper).replace(/\.[^.]*$/, '') !== PRODUCT_NAME) {
+    die(`win32-x64 app dir basename must equal productName "${PRODUCT_NAME}" (pear build enforces this); got "${path.basename(wrapper)}"`)
+  }
+  const target = val('--target', 'PEARPASTE_WIN_TARGET') || path.join(ROOT, 'dist', 'win32')
+  const buildArgs = ['build', '--win32-x64-app', wrapper, '--target', target]
+  log(`$ pear ${buildArgs.join(' ')}`)
+  if (dry) {
+    ok('dry-run: pear build not executed')
+  } else {
+    execFileSync('pear', buildArgs, { cwd: ROOT, stdio: 'inherit' })
+    ok(`packaged win32 app dir into ${path.relative(ROOT, target)}/by-arch/win32-x64/app`)
+  }
+
+  // Signing must run on Windows with a real Authenticode cert — fail closed.
   if (process.platform !== 'win32') {
     warn('Authenticode signing + installer packaging must run on a Windows host (or CI windows-latest).')
     warn('Skipping sign/pack on ' + process.platform + '. Tier 1 link is the cross-platform deliverable.')
@@ -179,22 +262,40 @@ function signAndPack () {
   }
   const cert = process.env.PEARPASTE_WIN_CERT
   const pass = process.env.PEARPASTE_WIN_CERT_PASS
-  const wrapper = val('--wrapper', 'PEARPASTE_WIN_WRAPPER')
   if (!cert || !fs.existsSync(cert)) {
     die('release requires an Authenticode certificate. Set PEARPASTE_WIN_CERT (.pfx) + PEARPASTE_WIN_CERT_PASS. ' +
         'Real certs are out of repo scope (spec §17); CI release-guard blocks unsigned artifacts.')
   }
-  if (!wrapper) die('release requires --wrapper / PEARPASTE_WIN_WRAPPER (the staged win32-x64 app dir)')
-  const exe = path.join(wrapper, 'PearPaste.exe')
-  log(`signtool sign /f ${cert} /fd SHA256 /tr <timestamp> /td SHA256 "${exe}"`)
-  execFileSync('signtool', ['sign', '/f', cert, '/p', pass || '', '/fd', 'SHA256',
-    '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', exe], { stdio: 'inherit' })
-  ok('Authenticode-signed PearPaste.exe')
+  // Sign the .exe inside the packaged app dir (glob, never hardcode the name).
+  const packagedApp = path.join(target, 'by-arch', 'win32-x64', 'app')
+  const exe = findWin32Exe(fs.existsSync(packagedApp) ? packagedApp : wrapper)
+  log(`signtool sign /fd SHA256 /tr ${TSA_URL} /td SHA256 "${exe}"`)
+  if (dry) { ok('dry-run: signtool not executed'); return }
+  const signArgs = ['sign', '/f', cert]
+  if (pass) signArgs.push('/p', pass)
+  signArgs.push('/fd', 'SHA256', '/tr', TSA_URL, '/td', 'SHA256', exe)
+  execFileSync('signtool', signArgs, { stdio: 'inherit' })
+  ok(`Authenticode-signed ${path.basename(exe)}`)
   // Installer: package the signed app dir. NSIS/WiX is environment-specific;
   // documented in docs/RELEASE.md §3. Sign the installer too.
-  warn('Installer packaging (NSIS/WiX) is documented in docs/RELEASE.md §3 — wire your packager here, then signtool the resulting Setup.exe.')
+  warn('Installer packaging (NSIS/WiX) is documented in docs/RELEASE.md §3 — wire your packager here, then signtool the resulting Setup.exe with the same /fd SHA256 /tr ' + TSA_URL + ' /td SHA256 flags.')
 }
 
 // ---- main -----------------------------------------------------------------
 log(`mode=${MODE} platform=${process.platform} arch=${process.arch}`)
-if (MODE === 'preflight') { preflight() } else if (MODE === 'dry-run') { preflight(); console.log(''); stage(true) } else if (MODE === 'stage') { preflight(); stage(false) } else if (MODE === 'release') { preflight(); stage(false); signAndPack() }
+if (MODE === 'preflight') {
+  preflight()
+} else if (MODE === 'dry-run') {
+  preflight()
+  console.log('')
+  stage(true)
+  // Only print the Tier-2 build/sign plan when a wrapper is supplied.
+  if (val('--wrapper', 'PEARPASTE_WIN_WRAPPER')) { console.log(''); buildSignAndPack(true) }
+} else if (MODE === 'stage') {
+  preflight()
+  stage(false)
+} else if (MODE === 'release') {
+  preflight()
+  stage(false)
+  buildSignAndPack(false)
+}

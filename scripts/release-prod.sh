@@ -1,26 +1,44 @@
 #!/usr/bin/env bash
 # Paste desktop production release flow (Agent 3 owns this script).
 #
-# Spec §17 "Production Pear release":
-#   1. stage the app
-#   2. release the production Pear link
-#   3. pin the app package on HiveRelay (scripts/pin-on-hiverelay.js)
-#   4. run the verifier against the STAGED app files (scripts/verify-encryption.js)
+# Spec §17 "Production Pear release", reworked for the CURRENT Pear CLI
+# (verified against v0.3243 — `pear init` and `pear release` were REMOVED):
+#   1. stage the app                       -> `pear stage <channel>` (--json)
+#   2. run the verifier against STAGED files (scripts/verify-encryption.js)
+#   3. capture the VERSIONED production link (verlink) + seed it
+#                                          -> `pear seed <link>`
+#   4. pin the app package on HiveRelay    -> scripts/pin-on-hiverelay.js
 #   5. publish release notes
 #
-# Native desktop wrappers (macOS/Windows/Linux signed installers) are scripted
-# as the Pear binary-wrapper path with the signing steps clearly TODO'd —
-# real signing certificates are out of scope here (spec §17, §21 Agent 3).
+# The versioned link is Pear's `verlink` = pear://<fork>.<length>.<z32-key>
+# (Pear keys are z-base-32, encoded by hypercore-id-encoding). `pear stage
+# --json` emits both `link` (pear://<z32-key>) and `verlink`. A signed/multisig
+# PRODUCTION link is `pear provision` + `pear multisig` (quorum cosign), a
+# maintainer step documented below — it replaces the removed `pear release`.
+#
+# Native desktop wrappers (macOS/Windows/Linux signed installers) use the
+# current `pear build --<platform>-app` path. Cert-dependent steps (macOS
+# codesign/notarytool, Windows signtool) FAIL CLOSED when their identity/cert
+# env vars are absent — real signing certificates are out of scope here
+# (spec §17, §21 Agent 3).
 #
 # This script is intentionally conservative: every destructive/publishing step
 # is gated behind an explicit confirmation or --yes, and a --dry-run prints the
-# plan without staging/releasing. It never edits package.json or backend code.
+# plan without staging/seeding. It never edits package.json or backend code.
 #
 # Usage:
 #   scripts/release-prod.sh [--channel production] [--dry-run] [--yes]
 #                           [--skip-pin] [--skip-verify] [--replicas N]
 #
-# Requires: a global `pear` (>= 2.x) on PATH and `node`.
+# Native-wrapper signing env (fail closed when unset):
+#   macOS:   PEARPASTE_MAC_IDENTITY   "Developer ID Application: <Name> (<TEAM>)"
+#            notarytool auth — EITHER PEARPASTE_NOTARY_PROFILE (a stored
+#            `xcrun notarytool store-credentials` keychain profile)
+#            OR APPLE_ID + APPLE_TEAM_ID + APP_SPECIFIC_PASSWORD
+#   Windows: PEARPASTE_WIN_CERT (.pfx) + PEARPASTE_WIN_CERT_PASS
+#            (see scripts/build-windows.mjs)
+#
+# Requires: a global `pear` (>= v0.3243) on PATH and `node`.
 
 set -euo pipefail
 
@@ -63,10 +81,30 @@ confirm() {
 command -v pear >/dev/null 2>&1 || die "pear runtime not found on PATH (install Pear)"
 command -v node >/dev/null 2>&1 || die "node not found on PATH"
 
-PEAR_VER="$(pear --version 2>/dev/null | head -n1 || echo unknown)"
+# `pear --version` is not a flag in current Pear; the short flag is `-v`
+# (verified: `pear --help` reports only `-v  Print version`).
+PEAR_VER="$(pear -v 2>/dev/null | head -n1 || echo unknown)"
 log "pear runtime: $PEAR_VER"
+
+# Extract a single string field from Pear's newline-delimited --json output.
+# Prefers jq when present; falls back to a conservative grep/sed.
+json_field() { # <field> ; reads NDJSON on stdin
+  local field="$1" input; input="$(cat)"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$input" \
+      | jq -rs --arg f "$field" 'map(select(type=="object" and has($f)))[-1][$f] // empty' 2>/dev/null
+  else
+    printf '%s\n' "$input" \
+      | grep -Eo "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" \
+      | tail -n1 | sed -E "s/.*:[[:space:]]*\"([^\"]+)\".*/\1/"
+  fi
+}
 log "channel: $CHANNEL"
-[ "$DRY_RUN" = "1" ] && warn "DRY RUN — no staging, release, or pinning will occur"
+[ "$DRY_RUN" = "1" ] && warn "DRY RUN — no staging, seeding, or pinning will occur"
+
+# Captured from `pear stage --json`: unversioned + versioned production links.
+RELEASE_LINK="pear://<production-key>"
+RELEASE_VERLINK="pear://<fork>.<length>.<production-key>"
 
 # ---------------------------------------------------------------------------
 # 0. Pre-flight: lockfile present, no obvious plaintext sentinel in tree.
@@ -74,20 +112,31 @@ log "channel: $CHANNEL"
 [ -f package-lock.json ] || warn "package-lock.json missing — commit a lockfile before public beta (spec §17)"
 
 # ---------------------------------------------------------------------------
-# 1. Stage the app (spec §17). `pear stage <channel>` uploads to the local
-#    Pear application store and prints the staged key/diff.
+# 1. Stage the app (spec §17). `pear stage <channel>` syncs disk changes into
+#    the project link and prints the staged key/diff. We run it with --json to
+#    capture `link` (pear://<z32-key>) and `verlink` (pear://<fork>.<length>.
+#    <z32-key>) — the versioned production link to publish in STEP 3.
+#    (`pear stage --help`: pear stage [flags] <link> [dir=.].)
 # ---------------------------------------------------------------------------
 log "STEP 1/5 — stage app"
 if [ "$DRY_RUN" = "1" ]; then
-  log "(dry-run) would run: pear stage $CHANNEL"
+  log "(dry-run) would run: pear stage --json $CHANNEL"
 else
   confirm "Stage Paste to channel '$CHANNEL'?" || die "aborted at stage"
-  pear stage "$CHANNEL"
+  STAGE_JSON="$(pear stage --json "$CHANNEL" | tee /dev/stderr)"
+  _link="$(printf '%s\n' "$STAGE_JSON" | json_field link || true)"
+  _verlink="$(printf '%s\n' "$STAGE_JSON" | json_field verlink || true)"
+  [ -n "${_link:-}" ] && RELEASE_LINK="$_link"
+  [ -n "${_verlink:-}" ] && RELEASE_VERLINK="$_verlink"
+  log "staged link:    $RELEASE_LINK"
+  log "staged verlink: $RELEASE_VERLINK"
 fi
 
 # Mirror the staged entrypoint set locally so the verifier scans exactly what
-# ships. We copy the same files Pear stages (pear.json stage.entrypoints +
-# index.html/js + ui/ + backend/), excluding tests/docs/.git/node_modules cache.
+# ships. We copy the same files Pear stages (package.json#pear stage.entrypoints
+# + index.html/js + ui/ + backend/), excluding tests/docs/.git/node_modules
+# cache. The manifest is package.json#pear (Pear's canonical source); pear.json
+# was removed to avoid a second, drift-prone manifest.
 log "preparing staged-file mirror for verification ($STAGE_DIR)"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
@@ -96,10 +145,10 @@ if command -v rsync >/dev/null 2>&1; then
   rsync -a \
     --exclude '.git' --exclude 'test' --exclude 'docs' \
     --exclude 'node_modules/.cache' --exclude "$STAGE_DIR" \
-    index.html index.js pear.json package.json ui backend scripts node_modules \
+    index.html index.js package.json ui backend scripts node_modules \
     "$STAGE_DIR/" 2>/dev/null || true
 else
-  for p in index.html index.js pear.json package.json ui backend scripts; do
+  for p in index.html index.js package.json ui backend scripts; do
     [ -e "$p" ] && cp -R "$p" "$STAGE_DIR/" 2>/dev/null || true
   done
 fi
@@ -120,28 +169,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Release the production Pear link (spec §17). `pear release <channel>`
-#    promotes the staged build to the production-resolvable pear:// link and
-#    preserves the P2P auto-update path so wrappers rarely need a rebuild.
+# 3. Publish the versioned production link (spec §17). `pear release` was
+#    REMOVED in current Pear. The immutable production link is the `verlink`
+#    captured in STEP 1 (pear://<fork>.<length>.<z32-key>); we make it
+#    reachable by SEEDING it (`pear seed <link>`), which keeps the P2P
+#    auto-update path so wrappers rarely need a rebuild. A signed/multisig
+#    production link (cryptographic quorum cosign) is the `pear provision` +
+#    `pear multisig` maintainer flow — see the note below — and requires
+#    quorum keys this repo does not ship.
 # ---------------------------------------------------------------------------
-log "STEP 3/5 — release production link"
-# NOTE: `pear release` is DEPRECATED in current Pear (>= v0.3243): it prints
-# "Use pear provision and pear multisig". The staged pear:// link from STEP 1
-# is already runnable/distributable (`pear run pear://<key>`); promotion to a
-# multisig production link is `pear provision` (maintainer step). For the
-# Windows wrapper specifically, use scripts/build-windows.mjs (npm run
-# build:win / release:win) — see docs/RELEASE.md §3.1.
+log "STEP 3/5 — publish + seed versioned production link"
 if [ "$DRY_RUN" = "1" ]; then
-  log "(dry-run) would run: pear release $CHANNEL  (deprecated; see note above)"
-  RELEASE_LINK="pear://<production-key>"
+  [ "$SKIP_VERIFY" = "1" ] && warn "(dry-run) NOTE: a REAL run would refuse to publish with --skip-verify"
+  log "(dry-run) production verlink: $RELEASE_VERLINK"
+  log "(dry-run) would run: pear seed $RELEASE_LINK"
 else
-  warn "pear release is deprecated; modern flow is pear provision / pear multisig"
-  confirm "Release channel '$CHANNEL' as the production link?" || die "aborted at release"
-  pear release "$CHANNEL"
-  # Best-effort: capture the resolvable link for the release notes.
-  RELEASE_LINK="$(pear info "$CHANNEL" 2>/dev/null | grep -Eo 'pear://[A-Za-z0-9]+' | head -n1 || echo 'pear://<production-key>')"
+  # Never publish unverified: the verifier (STEP 2) must have actually gated us.
+  if [ "$SKIP_VERIFY" = "1" ]; then
+    die "refusing to publish: --skip-verify bypassed the encryption gate (STEP 2)"
+  fi
+  log "production link:    $RELEASE_LINK"
+  log "production verlink: $RELEASE_VERLINK   (pear://<fork>.<length>.<z32-key>)"
+  confirm "Seed channel '$CHANNEL' so the production link stays reachable?" || die "aborted before seed"
+  # `pear seed <link>` seeds/reseeds the project for availability.
+  # (`pear seed --help`: pear seed [flags] <link>.) Run it backgrounded by the
+  # maintainer for a long-lived seeder; here we kick a foreground seed pass.
+  pear seed --no-tty "$RELEASE_LINK" || warn "seed pass returned non-zero — re-run 'pear seed $RELEASE_LINK' on a long-lived host"
 fi
-log "production link: ${RELEASE_LINK:-pear://<production-key>}"
 
 # ---------------------------------------------------------------------------
 # 4. Pin the app package on HiveRelay (spec §17/§11). App files are PUBLIC
@@ -171,12 +225,13 @@ NOTES_FILE="RELEASE_NOTES_${APP_VERSION}.txt"
 cat > "$NOTES_FILE" <<EOF
 Paste ${APP_VERSION} — desktop production release
 Channel: ${CHANNEL}
-Pear link: ${RELEASE_LINK:-pear://<production-key>}
+Pear link:    ${RELEASE_LINK}
+Pear verlink: ${RELEASE_VERLINK}   (versioned, immutable: fork.length.z32-key)
 Pear runtime: ${PEAR_VER}
 Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-Install (user path v1):
-  pear run ${RELEASE_LINK:-pear://<production-key>}
+Install (user path v1 — pin the VERSIONED link for reproducibility):
+  pear run ${RELEASE_VERLINK}
 
 What this release proves:
   - Notes and clipboard bodies are encrypted on-device (XChaCha20-Poly1305)
@@ -197,41 +252,100 @@ EOF
 log "wrote $NOTES_FILE"
 
 # ---------------------------------------------------------------------------
-# Native desktop wrappers — Pear binary-wrapper path (spec §17 v1.5).
-# These are scripted as steps; signing is explicitly TODO (certs out of scope).
+# Native desktop wrappers — current `pear build --<platform>-app` path
+# (spec §17 v1.5). `pear init --wrapper` and `pear release` were REMOVED.
+# Cert-dependent signing FAILS CLOSED when identity/cert env vars are absent.
 # ---------------------------------------------------------------------------
-cat <<'EOF'
+PRODUCT_NAME="Paste"   # package.json productName; pear build enforces basename
+DIST_DIR="${PEARPASTE_DIST_DIR:-dist}"
 
-[release] Native desktop wrapper path (Pear binary distribution, spec §17 v1.5)
-  The production pear:// link above is already the v1 user path. To produce
-  native installers that embed the Pear runtime and resolve this link:
+# macOS: codesign (Developer ID, hardened runtime) -> .dmg -> codesign dmg ->
+# notarytool submit --wait -> stapler staple. Fails closed without the identity
+# and notarytool auth.
+mac_sign_notarize() { # <app-path> e.g. dist/macos/by-arch/darwin-arm64/app/Paste.app
+  local app="$1"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "macOS signing/notarization must run on macOS; skipping on $(uname -s)."
+    return 0
+  fi
+  [ -n "${PEARPASTE_MAC_IDENTITY:-}" ] || \
+    die "macOS release requires PEARPASTE_MAC_IDENTITY (\"Developer ID Application: <Name> (<TEAM>)\") — fail closed (spec §17)."
+  # notarytool auth: a stored keychain profile OR Apple-ID triple. Fail closed.
+  local notary_auth=()
+  if [ -n "${PEARPASTE_NOTARY_PROFILE:-}" ]; then
+    notary_auth=(--keychain-profile "$PEARPASTE_NOTARY_PROFILE")
+  elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APP_SPECIFIC_PASSWORD:-}" ]; then
+    notary_auth=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APP_SPECIFIC_PASSWORD")
+  else
+    die "macOS notarization requires PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD — fail closed (spec §17)."
+  fi
+  local dmg="${DIST_DIR}/${PRODUCT_NAME}-${APP_VERSION}.dmg"
+  log "codesign (hardened runtime) -> $app"
+  log "  codesign --deep --force --options runtime --timestamp --sign \"\$PEARPASTE_MAC_IDENTITY\" \"$app\""
+  log "hdiutil create -> $dmg ; codesign the dmg ; notarytool submit --wait ; stapler staple"
+  if [ "$DRY_RUN" = "1" ]; then ok "(dry-run) macOS sign+notarize plan printed"; return 0; fi
+  codesign --deep --force --options runtime --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "$app"
+  codesign --verify --deep --strict --verbose=2 "$app"
+  rm -f "$dmg"
+  hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$app" -ov -format UDZO "$dmg"
+  codesign --force --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "$dmg"
+  xcrun notarytool submit "$dmg" "${notary_auth[@]}" --wait
+  xcrun stapler staple "$dmg"
+  ok "notarized + stapled $dmg"
+}
 
-  macOS:
-    1. pear init --wrapper macos ./dist/macos        # scaffold the wrapper
-    2. embed RELEASE_LINK into the wrapper config
-    3. build the .app bundle (pear binary wrapper path)
-    # TODO(signing): codesign --deep --options runtime --sign "Developer ID
-    #   Application: <TEAM>" ./dist/macos/PearPaste.app
-    # TODO(signing): notarize via `xcrun notarytool submit` + staple
-       (real Apple Developer cert + notarization are out of scope here)
+# Windows: delegated to scripts/build-windows.mjs (pear build --win32-x64-app +
+# signtool). It fails closed without PEARPASTE_WIN_CERT. Only invoke on win32.
+win_sign() {
+  if [ "$(uname -s | cut -c1-5)" = "MINGW" ] || [ "${OS:-}" = "Windows_NT" ]; then
+    log "Windows wrapper: npm run release:win (pear build --win32-x64-app + signtool)"
+    [ "$DRY_RUN" = "1" ] && { ok "(dry-run) would run: npm run release:win"; return 0; }
+    PEARPASTE_LINK="$RELEASE_VERLINK" npm run release:win
+  else
+    warn "Windows signing must run on a Windows host; use 'npm run release:win' there (see docs/RELEASE.md §3.1)."
+  fi
+}
 
-  Windows:
-    1. pear init --wrapper windows ./dist/windows
-    2. embed RELEASE_LINK; build the .exe wrapper
-    # TODO(signing): signtool sign /fd SHA256 /tr <RFC3161 TSA>
-    #   /td SHA256 /a PearPaste-Setup.exe   (real EV/OV cert out of scope)
+cat <<EOF
 
-  Linux:
+[release] Native desktop wrapper path (current Pear build flow, spec §17 v1.5)
+  The versioned production link above is the v1 user path. Native installers
+  embed the Pear runtime and resolve this link. Build each platform app dir on
+  its own OS, then package + sign:
+
+  macOS (Apple Developer ID; out of scope here — fail closed without identity):
+    1. Build the darwin app dir (basename must be "${PRODUCT_NAME}").
+    2. pear build --darwin-arm64-app <path-to/${PRODUCT_NAME}.app> --target ${DIST_DIR}/macos
+    3. codesign --deep --force --options runtime --timestamp \\
+         --sign "\$PEARPASTE_MAC_IDENTITY" .../${PRODUCT_NAME}.app
+    4. hdiutil create ${DIST_DIR}/${PRODUCT_NAME}-${APP_VERSION}.dmg ; codesign the dmg
+    5. xcrun notarytool submit ... --wait ; xcrun stapler staple
+       -> automated by mac_sign_notarize() in this script.
+
+  Windows (Authenticode; out of scope here — fail closed without cert):
+    1. Build the win32 app dir (basename must be "${PRODUCT_NAME}").
+    2. npm run release:win  (pear build --win32-x64-app + signtool
+         /fd SHA256 /tr <RFC3161 TSA> /td SHA256) — see scripts/build-windows.mjs
+
+  Linux (no mandatory signing; GPG/minisign + optional AppImage):
     1. npm run preflight:linux
-    2. PEARPASTE_LINK="${RELEASE_LINK:-pear://<production-key>}" npm run build:linux
-    3. wrap dist/linux/*.tar.gz into AppImage / .deb / .rpm as
-       distro-appropriate, or ship the tarball for internal Linux testing
-    # Linux packages may remain unsigned or use distro signing (spec §17);
-    # CI release-guard still rejects unsigned artifacts when present.
+    2. PEARPASTE_LINK="$RELEASE_VERLINK" npm run build:linux
+    3. release:linux requires a detached signature sidecar; optionally wraps an
+       AppImage when appimagetool is present (skipped gracefully otherwise).
 
   The Pear P2P auto-update path is preserved by all wrappers, so a wrapper
   rarely needs a rebuild — content updates flow over the pear:// link.
+
+  Signed PRODUCTION link (replaces removed 'pear release'): quorum cosign via
+    pear provision <source-verlink> <target-link> <production-verlink>
+    pear multisig request|sign|verify|commit   (needs quorum keys, not in repo)
 EOF
+
+# Run the signing helpers only when the maintainer points at a built app dir
+# (PEARPASTE_MAC_APP / PEARPASTE_WIN_WRAPPER). Absent those, we only printed the
+# plan above. Each helper fails closed if its cert/identity env is missing.
+if [ -n "${PEARPASTE_MAC_APP:-}" ]; then mac_sign_notarize "$PEARPASTE_MAC_APP"; fi
+if [ -n "${PEARPASTE_WIN_WRAPPER:-}" ]; then win_sign; fi
 
 # Tidy the local mirror unless the caller wants to inspect it.
 [ "$DRY_RUN" = "1" ] || rm -rf "$STAGE_DIR"

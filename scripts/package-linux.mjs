@@ -261,15 +261,81 @@ function assertSignature (artifact) {
   die(`missing detached signature for ${path.relative(ROOT, artifact)}; expected .sig/.asc/.minisig/.p7s`)
 }
 
+// Optional AppImage wrapping. Only attempted on Linux when appimagetool is on
+// PATH; skipped gracefully otherwise (the tarball remains the primary artifact).
+// Builds a minimal AppDir around the same pear:// launcher and emits a
+// <name>.AppImage plus its .sha256. Never fatal — a missing appimagetool or a
+// build hiccup degrades to "tarball only".
+function maybeBuildAppImage (pkg, payloadDir, dryRun) {
+  if (process.platform !== 'linux') return null
+  if (!hasCommand('appimagetool')) {
+    warn('appimagetool unavailable; skipping AppImage (tarball is the primary artifact)')
+    return null
+  }
+  const link = pearLink()
+  const name = packageName(pkg)
+  const appDir = path.join(DIST, `${name}.AppDir`)
+  const appImage = path.join(DIST, `${name}.AppImage`)
+  if (dryRun) {
+    log(`(dry-run) mkdir -p ${path.relative(ROOT, appDir)} (AppDir)`)
+    log(`(dry-run) appimagetool ${path.relative(ROOT, appDir)} ${path.relative(ROOT, appImage)}`)
+    return { appImage, appDir }
+  }
+  try {
+    fs.rmSync(appDir, { recursive: true, force: true })
+    // AppRun launcher -> the pear:// link (same contract as the tarball bin).
+    writeFile(path.join(appDir, 'AppRun'), `#!/usr/bin/env sh
+set -eu
+PEARPASTE_LINK="\${PEARPASTE_LINK:-${link}}"
+exec pear run "$PEARPASTE_LINK" "$@"
+`, 0o755)
+    // Top-level .desktop + icon are required by appimagetool.
+    writeFile(path.join(appDir, 'pearpaste.desktop'), `[Desktop Entry]
+Type=Application
+Name=Paste
+Comment=End-to-end encrypted note and clipboard sync over Pear
+Exec=AppRun
+Icon=pearpaste
+Terminal=false
+Categories=Utility;Office;
+`, 0o644)
+    const icon = path.join(ROOT, 'assets', 'icon-256.png')
+    if (fs.existsSync(icon)) fs.copyFileSync(icon, path.join(appDir, 'pearpaste.png'))
+    // Reuse the staged payload's launcher tree inside the AppDir for parity.
+    if (payloadDir && fs.existsSync(payloadDir)) {
+      fs.cpSync(payloadDir, path.join(appDir, 'usr'), { recursive: true })
+    }
+    execFileSync('appimagetool', [appDir, appImage], { stdio: 'inherit', env: { ...process.env, ARCH: process.arch === 'arm64' ? 'aarch64' : 'x86_64' } })
+    const digest = sha256(appImage)
+    writeFile(`${appImage}.sha256`, `${digest}  ${path.basename(appImage)}\n`, 0o644)
+    ok(`wrote ${path.relative(ROOT, appImage)}`)
+    ok(`wrote ${path.relative(ROOT, `${appImage}.sha256`)}`)
+    return { appImage, appDir }
+  } catch (err) {
+    warn(`AppImage wrapping failed (${err.message}); tarball remains the primary artifact`)
+    return null
+  }
+}
+
 log(`mode=${MODE} platform=${process.platform} arch=${process.arch}`)
 const pkg = preflight()
 
 if (MODE === 'preflight') {
   console.log(`${C.dim}Use: PEARPASTE_LINK=pear://<key> npm run build:linux for the distro-neutral package.${C.x}`)
 } else if (MODE === 'dry-run') {
-  buildPayload(pkg, true)
+  const { payloadDir } = buildPayload(pkg, true)
+  maybeBuildAppImage(pkg, payloadDir, true)
 } else {
   if (process.platform !== 'linux') die('Linux package mode must run on a Linux host')
-  const { artifact } = buildPayload(pkg, false)
-  if (REQUIRE_SIGNATURE) assertSignature(artifact)
+  const { artifact, payloadDir } = buildPayload(pkg, false)
+  // Optional AppImage alongside the tarball (graceful skip without appimagetool).
+  const appImageResult = maybeBuildAppImage(pkg, payloadDir, false)
+  if (REQUIRE_SIGNATURE) {
+    assertSignature(artifact)
+    // If an AppImage was produced, it is also a distributable release artifact
+    // and must carry its own detached signature sidecar (matches CI gate).
+    if (appImageResult && appImageResult.appImage && fs.existsSync(appImageResult.appImage)) {
+      assertSignature(appImageResult.appImage)
+    }
+  }
 }

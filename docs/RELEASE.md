@@ -42,14 +42,23 @@ CI runs these gates plus the React Native app install/lint/Jest lane under
 
 ## 2. Production Pear release
 
-Driven by `scripts/release-prod.sh` (Agent 3). The §17 sequence:
+Driven by `scripts/release-prod.sh` (Agent 3). Reworked for the **current Pear
+CLI** — `pear init` and `pear release` were **removed** (verified against Pear
+v0.3243). The §17 sequence:
 
-1. **Stage** the app (`pear stage`), mirroring staged files to a local dir.
+1. **Stage** the app (`pear stage --json <channel>`), mirroring staged files to
+   a local dir and capturing the `link` (`pear://<z32-key>`) and the
+   **`verlink`** — the versioned, immutable production link
+   `pear://<fork>.<length>.<z32-key>` (Pear keys are z-base-32).
 2. **Run the verifier against the staged files** — `scripts/
    verify-encryption.js` must exit 0 (no sentinel, all values AEAD
    envelopes). A non-zero exit aborts the release. This is the
    **verifier-gated release** requirement (§17, §21).
-3. **Release** the production Pear link (`pear release`) only after (2).
+3. **Publish + seed the versioned link** only after (2): the `verlink` from (1)
+   is the production link; `pear seed <link>` keeps it reachable. (`pear
+   release` no longer exists.) A *signed* production link uses the quorum-cosign
+   flow `pear provision` + `pear multisig` (needs quorum keys, out of repo
+   scope).
 4. **Pin the app package on HiveRelay** — `scripts/pin-on-hiverelay.js`
    (Agent 2), blind / p2p-only, so installs stay reachable.
 5. **Publish release notes** documenting exactly what the proof does and does
@@ -57,8 +66,10 @@ Driven by `scripts/release-prod.sh` (Agent 3). The §17 sequence:
 
 `release-prod.sh` is conservative: every publishing step is gated by an
 explicit confirmation or `--yes`, and `--dry-run` prints the plan without
-staging/releasing. Pear's P2P update path means the production link updates
-without rebuilding native wrappers.
+staging/seeding. A real run **refuses to publish if `--skip-verify` bypassed
+the gate**. Pear's P2P update path means the production link updates without
+rebuilding native wrappers. The full desktop production-readiness checklist
+(accounts, certs, costs, phased rollout) lives in **docs/SHIPPING.md**.
 
 ---
 
@@ -66,18 +77,24 @@ without rebuilding native wrappers.
 
 Per spec §12/§17:
 
-- Build via the Pear binary-wrapper path for macOS, Linux, Windows.
+- Build each platform app dir with **`pear build --<platform>-app <dir>`**
+  (current Pear; `pear init --wrapper` was removed). `pear build` packages an
+  **already-built** platform app directory into the deployment folder and
+  enforces that the app dir basename equals `package.json` `productName ?? name`
+  — we pin `productName: "Paste"`, so the expected basename is `Paste`.
 - **Sign macOS and Windows artifacts.** Linux packages stay unsigned or
   distro-appropriate.
 - Preserve the Pear P2P update path so the wrapper rarely needs a rebuild.
 
 > **Signing TODO (real certificates are out of scope of this repository).**
-> The signing steps are stubbed/TODO in `scripts/release-prod.sh`. Before
-> public beta a maintainer must provide: an Apple Developer ID + notarization
-> credentials (macOS, `codesign` + `notarytool`), an Authenticode certificate
-> (Windows, `signtool`), and the chosen Linux signing convention. Until then,
-> native installers are **internal/dev only** and the CI `release-guard` job
-> blocks any unsigned artifact from being treated as a release (see §6).
+> The signing steps in `scripts/release-prod.sh` are wired but **fail closed**
+> without credentials. Before public beta a maintainer must provide: an Apple
+> Developer ID Application identity + notarization credentials (macOS,
+> `codesign` + `notarytool` + `stapler`), an Authenticode certificate (Windows,
+> `signtool`), and the chosen Linux signing convention (GPG/minisign). Until
+> then, native installers are **internal/dev only** and the CI `release-guard`
+> job blocks any unsigned artifact from being treated as a release (see §6).
+> Accounts, certificate types, and costs are tabulated in **docs/SHIPPING.md**.
 
 ### 3.1 Windows (win32-x64)
 
@@ -103,9 +120,9 @@ The gate fails the build on any win32 incompatibility.
 **Tier 1 — P2P link (recommended v1; produced from any OS):**
 
 ```sh
-# one-time: bootstrap the project link (interactive trust prompt;
-# `pear init` was removed in current Pear, so the link is created by the
-# first stage). Record the printed pear:// key.
+# one-time: generate the project link (`pear init` was removed in current
+# Pear). `pear touch` mints a fresh pear:// link; record it. Then stage to it.
+pear touch                      # prints a new pear:// link
 pear stage <channel>            # e.g. pear stage production
 PEARPASTE_LINK=pear://<key> npm run build:win   # or: build:win:dry
 ```
@@ -123,18 +140,22 @@ Authenticode certificate:
 
 ```powershell
 $env:PEARPASTE_LINK      = "pear://<key>"
-$env:PEARPASTE_WIN_WRAPPER = "<staged win32-x64 app dir>"
+$env:PEARPASTE_WIN_WRAPPER = "<prebuilt win32-x64 app dir; basename must be 'Paste'>"
 $env:PEARPASTE_WIN_CERT  = "C:\path\to\authenticode.pfx"
 $env:PEARPASTE_WIN_CERT_PASS = "<pfx password>"
-npm run release:win        # pear stage --win32-x64-app + signtool
+npm run release:win        # pear build --win32-x64-app + signtool
 ```
 
-`release:win` stages with `--win32-x64-app`, then `signtool sign /fd SHA256
-/tr <RFC3161 timestamp> /td SHA256`. Wrap the signed app dir with your
-installer (NSIS/WiX), then `signtool` the resulting `Setup.exe` too. With no
-`PEARPASTE_WIN_CERT` the script **fails closed**, and the `release-guard` CI
-job blocks any unsigned artifact (§6). Real certs remain out of repo scope
-(spec §17): a maintainer supplies the Authenticode cert before public beta.
+`release:win` runs **`pear build --win32-x64-app <dir> --target dist/win32`**
+(the produced app dir basename must equal the product name `Paste`), then locates
+the binary by globbing `bin\*-app\*.exe` (never a hardcoded name) and runs
+`signtool sign /fd SHA256 /tr <RFC3161 TSA> /td SHA256`. Wrap the signed app dir
+with your installer (NSIS/WiX), then `signtool` the resulting `Setup.exe` too
+with the same flags. With no `PEARPASTE_WIN_CERT` the script **fails closed**,
+and the `release-guard` CI job blocks any unsigned artifact (§6). The TSA URL is
+overridable via `PEARPASTE_WIN_TSA`. Real certs remain out of repo scope (spec
+§17): a maintainer supplies the Authenticode cert before public beta — note all
+code-signing certs now require hardware/HSM storage (see docs/SHIPPING.md).
 
 ### 3.2 Linux
 
@@ -151,9 +172,12 @@ optional distro tooling (`desktop-file-validate`, `dpkg-deb`, `rpmbuild`,
 `appimagetool`). `build:linux` must run on Linux and emits
 `dist/linux/pearpaste-<version>-linux-<arch>.tar.gz` plus a `.sha256` file.
 The tarball is a distro-neutral launcher for the production `pear://` link and
-can be wrapped into AppImage/.deb/.rpm by a maintainer. `release:linux`
-requires a detached signature sidecar (`.sig/.asc/.minisig/.p7s`) to match the
-CI release-artifact gate.
+can be wrapped into .deb/.rpm by a maintainer. When `appimagetool` is on PATH,
+`build:linux`/`release:linux` **additionally** emit a `…​.AppImage` + `.sha256`
+(skipped gracefully if `appimagetool` is absent — the tarball stays primary).
+`release:linux` requires a detached signature sidecar
+(`.sig/.asc/.minisig/.p7s`) for the tarball **and** for any AppImage produced,
+matching the CI release-artifact gate.
 
 ---
 
@@ -210,9 +234,11 @@ Two jobs enforce §21 Agent 5 release acceptance:
   fails a planted leak** (proving the gate has teeth), then enforces that
   every file in the release-artifact dir (`$RELEASE_ARTIFACTS`, default
   `dist/`) has a detached signature sidecar (`.sig/.asc/.minisig/.p7s`);
-  artifacts with no signature **fail the build**. With no artifacts present
-  (normal PR/CI) the gate is documented and passes; it activates on release
-  builds. → *CI fails on unsigned release artifact.*
+  artifacts with no signature **fail the build**. **INERT BY DESIGN on PR CI:**
+  no job in `ci.yml` populates `dist/`, so on a normal push/PR the signature
+  check finds no artifacts and is a no-op. It becomes live only when a release
+  workflow (tag- or `workflow_dispatch`-triggered) builds + signs artifacts
+  into `dist/`. → *CI fails on unsigned release artifact (once one exists).*
 
 `supply-chain` enforces the lockfile + dependency audit. `test` runs lint and
 all desktop/shared test suites on Node 22. `linux-package` runs the Linux
@@ -240,7 +266,7 @@ guarantees that materially reduce supply-chain trust:
 
 - **Pinned dependencies:** `package-lock.json` is committed; every CI/release
   install is `npm ci` (lockfile-exact, no resolution drift).
-- **Pinned runtime:** Node 22 in CI; `engines.node >= 20`.
+- **Pinned runtime:** Node 22 in CI; `engines.node >= 22` (matches CI).
 - **No build-time codegen** of backend logic; the Pear-end is plain ESM.
 - **Independent re-derivation of the security claim:** anyone can clone at a
   tag, `npm ci`, create a vault, and run `scripts/verify-encryption.js` to
