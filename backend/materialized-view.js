@@ -202,6 +202,31 @@ export class MaterializedView {
     return this.openRecord({ objectId: 'setting:' + settingId, envelope: env })
   }
 
+  // ---- vault-level authorization state (reorg-safe) ------------------------
+  // rootPubkey + keyEpoch live here so the reducer can rebuild them purely
+  // from the (truncation-aware) view on every apply pass instead of mutating
+  // in-memory fields incrementally (CRITICAL #1). Sealed under a FIXED
+  // blindId derived from a constant label so any device holding indexKey can
+  // locate + decrypt it — stays inside crypto.seal so relays / at-rest see
+  // only ciphertext (spec §22 "no plaintext at rest").
+  vaultStateKey () { return this.settingsKey(this.blindId('vault-state:v1')) }
+
+  async putVaultState (target, value) {
+    return this.putSealed(target, this.vaultStateKey(), {
+      objectId: 'vault-state:v1',
+      objectBlindId: this.blindId('vault-state:v1'),
+      opType: 'SETTING',
+      schema: this.ops.SCHEMAS.SETTING,
+      plaintext: value
+    })
+  }
+
+  async getVaultState () {
+    const env = await this.getSealedRaw(this.vaultStateKey())
+    if (!env) return null
+    return this.openRecord({ objectId: 'vault-state:v1', envelope: env })
+  }
+
   // ---- scans (sealed rows only) --------------------------------------------
   // Returns sealed list rows: blindId + envelope + cheap non-sensitive header
   // bits the reducer stored OUTSIDE the ciphertext are NOT here — the caller

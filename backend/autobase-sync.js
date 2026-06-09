@@ -192,14 +192,125 @@ class SyncEngine {
     await this.base.append(op)
   }
 
+  // Bounded wait until this device's Autobase writer seat has linearized so
+  // base.append() won't throw "Not writable". A freshly paired device
+  // (post-PAIR_ACCEPT / DEVICE_ADD) gets its writer key authorized by the
+  // admin in a DEVICE_ADD op that must replicate + linearize before the new
+  // device can write its own content ops; until then base.writable is false
+  // and the first NOTE_UPSERT/CLIP_CAPTURE would throw and be silently lost.
+  // We poll base.writable, pump base.update() to pull in the authorizing op,
+  // and sleep cooperatively between tries. The sleep is abortable on teardown
+  // (ctx.scope.sleep) so a closing engine never blocks shutdown; when no scope
+  // is wired (lightweight test ctx) we fall back to a plain unref'd timer.
+  // Reads / local-first behavior are untouched — only content-op appends wait.
+  async _awaitWritable (timeoutMs = 8000) {
+    if (this.base && this.base.writable) return
+    const scope = this.ctx && this.ctx.scope
+    const sleep = (ms) => (scope && typeof scope.sleep === 'function')
+      ? scope.sleep(ms)
+      : new Promise((resolve) => { const t = setTimeout(resolve, ms); if (t.unref) t.unref() })
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0)
+    while (true) {
+      if (!this.base) break
+      if (this.base.writable) return
+      try { await this.base.update() } catch (_) { /* closing / transient */ }
+      if (this.base && this.base.writable) return
+      if (Date.now() >= deadline) break
+      // cooperative backoff; rejects with AbortError on scope teardown, which
+      // we let propagate so a closing engine aborts the append promptly.
+      await sleep(150)
+    }
+    const e = new Error('autobase writer seat not yet linearized — retry once membership converges')
+    e.code = 'NOT_WRITABLE_YET'
+    e.retryable = true
+    throw e
+  }
+
+  // Rebuild the in-memory authorization cache (devices / writerToDevice /
+  // rootPubkey / keyEpoch) as a PURE FUNCTION of the committed materialized
+  // view (CRITICAL #1). Autobase truncates the view core on a fork/reorg and
+  // re-invokes _apply over only the re-linearized TAIL — it does NOT replay
+  // the whole log and gives no reset signal, so any cache mutated incrementally
+  // would retain rolled-back state (union of old+new). By clearing and
+  // repopulating from this.view (which wraps this.base.view, the committed
+  // post-truncation Hyperbee) at the start of every apply pass, the cache
+  // always reflects exactly the committed authz state. Safe on an empty view
+  // (genesis / lock->unlock reopen): no devices, no vault-state -> cache stays
+  // empty and the genesis DEVICE_ADD later in the SAME batch sets rootPubkey
+  // incrementally; the next apply pass reads the flushed vault-state row back.
+  async _rebuildAuthFromView () {
+    if (!this.view) return
+    const prevRoot = this.rootPubkey
+    const prevEpoch = this.keyEpoch
+    let rows = []
+    try { rows = await this.view.listDevicesSealed() } catch (_) { rows = [] }
+
+    this.devices.clear()
+    this.writerToDevice.clear()
+    let derivedRoot = null
+
+    for (const { key, value } of rows) {
+      const deviceBlindId = key.slice('devices!'.length)
+      // The device record is sealed with objectId 'device:'+deviceId, and
+      // crypto.openWithObjectId derives the item key from that objectId — but
+      // the row is keyed by the blinded deviceBlindId, a one-way hash, so we
+      // cannot recover deviceId from the key. The reducer therefore also writes
+      // a self-describing sealed objmeta row (keyed by the public blindId) that
+      // maps deviceBlindId -> { objectId:'device:'+deviceId }. Resolve it, then
+      // open the device record. Any record we can't resolve/open is skipped
+      // (treated as unknown) rather than corrupting the authz set.
+      let objectId = null
+      try {
+        const meta = await this.view.resolveObjMeta(deviceBlindId)
+        if (meta && meta.objectId) objectId = meta.objectId
+      } catch (_) { objectId = null }
+      if (!objectId) continue
+      let plain = null
+      try { plain = this.view.openRecord({ objectId, envelope: value }) } catch (_) { plain = null }
+      if (!plain || !plain.deviceId) continue
+
+      const rec = {
+        deviceId: plain.deviceId,
+        signingPubkey: plain.signingPubkey,
+        writerKey: plain.writerKey,
+        roles: plain.roles || ['writer'],
+        revokedAtLamport: (plain.revokedAtLamport == null ? null : Number(plain.revokedAtLamport)),
+        addedAtLamport: (plain.addedAtLamport == null ? null : Number(plain.addedAtLamport)),
+        isRoot: !!plain.isRoot
+      }
+      this.devices.set(rec.deviceId, rec)
+      if (rec.writerKey) this.writerToDevice.set(rec.writerKey, rec.deviceId)
+      if (rec.isRoot && rec.signingPubkey) derivedRoot = rec.signingPubkey
+    }
+
+    // rootPubkey: prefer persisted vault-state, then the isRoot device record,
+    // then whatever we already had (legacy vaults / pre-flush bootstrap) so we
+    // never clobber a known root to null mid-session.
+    let vs = null
+    try { vs = await this.view.getVaultState() } catch (_) { vs = null }
+    this.rootPubkey = (vs && vs.rootPubkey) || derivedRoot || prevRoot || null
+    // keyEpoch is monotonic and only persisted in vault-state / KEY_ROTATE.
+    const viewEpoch = vs && Number.isFinite(Number(vs.keyEpoch)) ? Number(vs.keyEpoch) : 0
+    this.keyEpoch = Math.max(viewEpoch, prevEpoch || 0)
+  }
+
   // --- reducer (deterministic; spec §9.5) ----------------------------------
-  // IMPORTANT: only mutates `view` (the autobase-managed Hyperbee) + in-memory
-  // device set rebuilt purely from the linearized log, so Autobase reorders
-  // undo/redo cleanly. No external mutable state is touched here.
+  // IMPORTANT: This reducer NEVER mutates external state. It writes only into
+  // `view` (the autobase-managed Hyperbee, via `batch`). The in-memory authz
+  // cache (devices / writerToDevice / rootPubkey / keyEpoch) is a derived
+  // index: _rebuildAuthFromView() rebuilds it from the committed view at the
+  // start of EVERY apply pass so a fork/reorg (which truncates the view and
+  // re-applies only the re-linearized tail) can never leave stale/rolled-back
+  // authorization data behind. The incremental updates inside the node loop
+  // below exist only so ops later in a batch observe device ops earlier in the
+  // SAME batch; the authoritative state is the rebuild from the flushed view.
   async _apply (nodes, view, host) {
     const ctx = this.ctx
     const crypto = ctx.crypto
     const ops = ctx.ops
+    // Reorg-safe: re-derive the authz cache from the committed view before
+    // processing this (possibly post-truncation) tail. See _rebuildAuthFromView.
+    await this._rebuildAuthFromView()
     const batch = view.batch()
     try {
       for (const node of nodes) {
@@ -244,6 +355,10 @@ class SyncEngine {
         if (h.type === ops.OP_TYPES.KEY_ROTATE) {
           if (this._signerAuthorized(op, opLamport, { adminOnly: true })) {
             this.keyEpoch = Math.max(this.keyEpoch, Number(this._body(op).epoch || 0))
+            // Persist the (monotonic) epoch reorg-safely. rootPubkey is carried
+            // forward from the rebuild at the top of this apply pass so the
+            // vault-state row is never clobbered to a missing root.
+            await this.view.putVaultState(batch, { rootPubkey: this.rootPubkey, keyEpoch: this.keyEpoch })
             this._rememberOp(op, true)
           }
           continue
@@ -340,7 +455,12 @@ class SyncEngine {
       } catch (_) { /* already a writer / fork in progress */ }
     }
 
-    // sealed device record into the view + sealed objmeta for resolution
+    // Sealed device record into the view + sealed objmeta for resolution.
+    // The auth-critical fields (writerKey / revokedAtLamport / addedAtLamport
+    // / isRoot) are persisted ALONGSIDE the display fields so _rebuildAuthFromView
+    // can reconstruct the full in-memory `rec` shape purely from the committed
+    // (reorg-safe) view — see CRITICAL #1. They live inside the crypto.seal
+    // envelope so relay-blindness / at-rest secrecy is preserved.
     const deviceBlindId = this.ctx.crypto.blindId(this.indexKey, 'device:' + dev.deviceId)
     await this.view.putDevice(batch, {
       objectId: 'device:' + dev.deviceId,
@@ -352,9 +472,31 @@ class SyncEngine {
         signingPubkey: dev.signingPubkey,
         boxPubkey: dev.boxPubkey,
         roles: rec.roles,
-        createdAt: dev.createdAt || Date.now()
+        createdAt: dev.createdAt || Date.now(),
+        // auth-critical, reorg-safe fields (sealed):
+        writerKey: rec.writerKey,
+        revokedAtLamport: null,
+        addedAtLamport: rec.addedAtLamport,
+        isRoot: rec.isRoot
       }
     })
+    // Self-describing sealed mapping deviceBlindId -> objectId so
+    // _rebuildAuthFromView can resolve+open this device record from the view
+    // alone (the row key is the one-way blindId). Same encoding notes/clips use.
+    await this.view.putObjMeta(batch, {
+      objectId: 'device:' + dev.deviceId,
+      objectBlindId: deviceBlindId,
+      type: 'device'
+    })
+
+    // Persist vault-level authz state on genesis so rootPubkey + keyEpoch are
+    // recoverable from the view after a truncation/reopen even before any
+    // device record is re-read. rootPubkey is ALSO derivable from the isRoot
+    // device record (belt-and-suspenders); keyEpoch only lives here / on
+    // KEY_ROTATE, so persisting it is required.
+    if (isGenesis) {
+      await this.view.putVaultState(batch, { rootPubkey: this.rootPubkey, keyEpoch: 0 })
+    }
   }
 
   async _applyDeviceRevoke (op, host, batch) {
@@ -371,7 +513,9 @@ class SyncEngine {
     if (target.writerKey && host && typeof host.removeWriter === 'function') {
       try { await host.removeWriter(b4a.from(target.writerKey, 'hex')) } catch (_) {}
     }
-    // mark sealed device record revoked
+    // Mark the sealed device record revoked. revokedAtLamport is the
+    // reorg-safe field _rebuildAuthFromView reads back (the wall-clock
+    // revokedAt is kept only as human-facing metadata for DEVICE_LIST).
     const deviceBlindId = this.ctx.crypto.blindId(this.indexKey, 'device:' + body.deviceId)
     const existing = await this.view.getSealedRaw(this.view.devicesKey(deviceBlindId))
     if (existing) {
@@ -379,6 +523,7 @@ class SyncEngine {
       try { plain = this.view.openRecord({ objectId: 'device:' + body.deviceId, envelope: existing }) } catch (_) { plain = null }
       if (plain) {
         plain.revokedAt = Date.now()
+        plain.revokedAtLamport = opLamport
         await this.view.putDevice(batch, {
           objectId: 'device:' + body.deviceId, deviceBlindId, device: plain
         })
@@ -494,6 +639,12 @@ class SyncEngine {
 
   // public op append used by notes-service
   async appendOp (type, schema, objectId, payload) {
+    // Block briefly until our writer seat has linearized so a freshly paired
+    // device's first content op doesn't throw "Not writable" and get lost
+    // (CRITICAL #2). Done BEFORE _makeOp so a not-yet-writable append never
+    // burns a Lamport tick / leaves a clock gap. Throws NOT_WRITABLE_YET
+    // (retryable) if the seat never converges within the bound.
+    await this._awaitWritable()
     const op = this._makeOp({ type, schema, objectId, payload, signer: this._localSigner() })
     await this._append(op)
     await this.base.update()
