@@ -15,6 +15,9 @@ export const OP_TYPES = Object.freeze({
   DEVICE_ADD: 'DEVICE_ADD',
   DEVICE_REVOKE: 'DEVICE_REVOKE',
   KEY_ROTATE: 'KEY_ROTATE',
+  // Per-vault admit policy (REVOCATION_DESIGN §3.8 step 2, RT-FIX B1): sets
+  // the N-of-M admin co-sign requirement the reducer enforces on DEVICE_ADD.
+  ADMIT_POLICY_SET: 'ADMIT_POLICY_SET',
   ACK: 'ACK'
 })
 
@@ -24,7 +27,8 @@ export const SCHEMAS = Object.freeze({
   DEVICE: 'device.v1',
   SETTING: 'setting.v1',
   SEARCH_POINTER: 'search-pointer.v1',
-  PAIR_BOOTSTRAP: 'pair-bootstrap.v1'
+  PAIR_BOOTSTRAP: 'pair-bootstrap.v1',
+  ADMIT_POLICY: 'admit-policy.v1'
 })
 
 export const ENVELOPE_VERSION = 1

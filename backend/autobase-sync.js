@@ -61,6 +61,10 @@ class SyncEngine {
     this.epochKeys = new Map()
     this.activeEpoch = 0
     this.activeEpochTag = ''
+    // Per-vault admit policy (design §3.8 step 2, B1): how many DISTINCT
+    // non-revoked admin signatures a DEVICE_ADD needs. Rebuilt from committed
+    // vault-state each apply pass; 1 = legacy single-approver behavior.
+    this.admitPolicyN = 1
     this._appliedOps = new Map() // opId -> op snapshot for verifier coverage.
     // Per-engine append SERIALIZATION chain (CONCURRENT APPEND DROP fix).
     // Autobase's append layer keeps shared mutable bookkeeping (this._appending
@@ -199,6 +203,7 @@ class SyncEngine {
     this.epochKeys.clear()
     this.activeEpoch = 0
     this.activeEpochTag = ''
+    this.admitPolicyN = 1
   }
 
   // --- op construction -----------------------------------------------------
@@ -217,7 +222,19 @@ class SyncEngine {
     // here; for Phase 1 the active tag == the only tag "", so re-seal is faithful.
     // Phase 5 will thread the pending entry's ORIGINAL epochTag for cross-epoch
     // re-append per §3.9.)
-    const epochTag = this.activeEpochTag || ''
+    // DEVICE LIFECYCLE ops seal under EPOCH 0 (vaultKey, tag ""), NOT the
+    // active epoch (Phase 4, enables design §5.8 selective-chain): membership
+    // and admit-policy state is the AUTHORITY every member's reducer and the
+    // replication firewall consult, so it must be applyable by EVERY member —
+    // including a selectively-chained joiner that was deliberately NOT given
+    // the intermediate epoch keys (a revoke minted under a withheld epoch
+    // would otherwise be invisible to it, leaving the revoked device alive in
+    // its auth view). Bodies carry roster metadata (deviceIds/pubkeys/labels),
+    // never user content; KEY_ROTATE is NOT in this set — its body stays
+    // sealed under the NEW epoch key (B3/B10, the roster-blind requirement).
+    const opsK = ctx.ops.OP_TYPES
+    const lifecycle = type === opsK.DEVICE_ADD || type === opsK.DEVICE_REVOKE || type === opsK.ADMIT_POLICY_SET
+    const epochTag = lifecycle ? '' : (this.activeEpochTag || '')
     const epochKey = this.epochKeys.get(epochTag) || this.vaultKey
     const header = {
       version: 1,
@@ -228,7 +245,9 @@ class SyncEngine {
       objectBlindId,
       lamport: String(lamport),
       createdAtBucket: ops.timeBucket(),
-      epoch: String(this.activeEpoch || 0),
+      // The integer mirrors the tag: lifecycle ops are epoch-0 by construction
+      // (see above), so their header must say so (strict epoch binding, §5.5).
+      epoch: lifecycle ? '0' : String(this.activeEpoch || 0),
       epochTag
     }
     ops.assertHeaderPublicOnly(header) // §22: classify every replicated field
@@ -290,6 +309,173 @@ class SyncEngine {
     if (!d) return 'unknown'
     if (signingPubkey && d.signingPubkey !== signingPubkey) return 'unknown'
     return d.revokedAtLamport == null ? 'allowed' : 'revoked'
+  }
+
+  // ---- admit policy (design §3.8 step 2, RT-FIX B1) ------------------------
+  _nonRevokedAdminCount () {
+    let n = 0
+    for (const d of this.devices.values()) {
+      if (d.revokedAtLamport == null && (d.roles || []).includes('admin')) n++
+    }
+    return n
+  }
+
+  // Effective N clamps the committed policy to the live admin count so a
+  // revocation can never deadlock admission (2 admins at N=2, one revoked →
+  // the survivor admits alone). Residual, stated honestly: a root willing to
+  // LOUDLY revoke the other admins first gets back to N=1 — the policy stops
+  // QUIET re-admission, not a phrase-holder demolishing the vault (L3).
+  _effectiveAdmitN () {
+    return Math.max(1, Math.min(this.admitPolicyN || 1, Math.max(1, this._nonRevokedAdminCount())))
+  }
+
+  // Canonical detached-signature payloads. Cosigs bind the EXACT identity
+  // tuple being admitted (or the exact policy value), so a gathered signature
+  // cannot be replayed onto a different device or a different N.
+  _admitCosigPayload (dev) {
+    return {
+      t: 'pp-admit-v1',
+      vaultId: String(this.ctx.state.vaultId || ''),
+      deviceId: String(dev.deviceId || ''),
+      signingPubkey: String(dev.signingPubkey || ''),
+      boxPubkey: String(dev.boxPubkey || ''),
+      writerKey: String(dev.writerKey || ''),
+      roles: Array.isArray(dev.roles) ? dev.roles.map(String).sort() : []
+    }
+  }
+
+  _policyCosigPayload (n) {
+    return { t: 'pp-admit-policy-v1', vaultId: String(this.ctx.state.vaultId || ''), n: Number(n) }
+  }
+
+  // Distinct admin signers backing an op: the op's own signer plus every valid
+  // detached cosig, keyed by signingPubkey, counted only for COMMITTED,
+  // NON-REVOKED admin devices (or the root pubkey). Pure function of the
+  // reorg-safe auth cache — deterministic across devices.
+  _distinctAdminSigners (op, cosigs, payload) {
+    const out = new Set()
+    const adminFor = (pubkey) => {
+      if (pubkey === this.rootPubkey) return true
+      for (const d of this.devices.values()) {
+        if (d.signingPubkey === pubkey) {
+          return d.revokedAtLamport == null && (d.roles || []).includes('admin')
+        }
+      }
+      return false
+    }
+    if (op && op.signerPubkey && adminFor(op.signerPubkey)) out.add(op.signerPubkey)
+    for (const c of Array.isArray(cosigs) ? cosigs : []) {
+      if (!c || typeof c.signingPubkey !== 'string' || typeof c.sig !== 'string') continue
+      if (out.has(c.signingPubkey)) continue
+      if (!adminFor(c.signingPubkey)) continue
+      let ok = false
+      try { ok = this.ctx.crypto.verifyDetached(c.signingPubkey, payload, c.sig) } catch (_) { ok = false }
+      if (ok) out.add(c.signingPubkey)
+    }
+    return out
+  }
+
+  // Another admin device calls these to produce the out-of-band cosignatures
+  // the approver attaches to DEVICE_ADD / ADMIT_POLICY_SET.
+  cosignDeviceAdd (dev) {
+    const s = this._localSigner()
+    return {
+      signingPubkey: s.signingPubkey,
+      sig: this.ctx.crypto.signDetached(s.signingSecretKey, this._admitCosigPayload(dev))
+    }
+  }
+
+  cosignAdmitPolicy (n) {
+    const s = this._localSigner()
+    return {
+      signingPubkey: s.signingPubkey,
+      sig: this.ctx.crypto.signDetached(s.signingSecretKey, this._policyCosigPayload(n))
+    }
+  }
+
+  // Raise/lower the per-vault admit policy. The CHANGE itself needs the
+  // CURRENT effective N distinct admin signatures (otherwise a lone
+  // phrase-holder would just lower N=2→1 and self-admit).
+  async setAdmitPolicy (n, cosigs = []) {
+    const v = Math.floor(Number(n))
+    if (!Number.isFinite(v) || v < 1 || v > 4) {
+      const e = new Error('admit policy N must be 1..4'); e.code = 'SCHEMA_INVALID'; throw e
+    }
+    const op = this._makeOp({
+      type: this.ctx.ops.OP_TYPES.ADMIT_POLICY_SET,
+      schema: this.ctx.ops.SCHEMAS.ADMIT_POLICY,
+      objectId: 'admit-policy:v1',
+      payload: { n: v, cosigs },
+      signer: this._localSigner()
+    })
+    await this._append(op)
+    await this.refresh()
+    return { ok: true, admitPolicyN: this.admitPolicyN }
+  }
+
+  // "Looks like a previously-revoked device" heuristic (design §3.8 step 3):
+  // a re-imaged revoked laptop presents a FRESH deviceId, but a careless
+  // attacker may reuse key material. Surfaced as a LOUD warning at admit time;
+  // never a cryptographic gate (a careful attacker always presents fresh keys).
+  matchesRevokedDevice ({ signingPubkey, boxPubkey } = {}) {
+    for (const d of this.devices.values()) {
+      if (d.revokedAtLamport == null) continue
+      if (signingPubkey && d.signingPubkey === signingPubkey) return { deviceId: d.deviceId, via: 'signingPubkey' }
+      if (boxPubkey && d.boxPubkey === boxPubkey) return { deviceId: d.deviceId, via: 'boxPubkey' }
+    }
+    return null
+  }
+
+  // The epoch-key chain a pairing bootstrap delivers (design §5.8, B1 —
+  // SELECTIVE-CHAIN BY DEFAULT): only the ACTIVE epoch key unless the approver
+  // explicitly grants history, in which case the full chain rides along.
+  // HONEST DEVIATION from §5.8: vaultKey itself always ships in the bootstrap
+  // — every committed system row (device records, vault-state, objmeta, epoch
+  // wraps) is sealed under it, so a joiner without it cannot even read the
+  // device set; it is the system KEK, not just the epoch-0 content key. The
+  // consequence: epoch-0 content stays readable to any paired device. Against
+  // the actual B1 adversary this costs nothing — a previously-revoked device
+  // already holds vaultKey on disk and it is phrase-derivable anyway (L1/L3).
+  // What selective-chain DOES withhold is every ROTATED epoch key except the
+  // current one — exactly the keys minted during a revoked device's exile.
+  _bootstrapEpochKeys ({ grantHistory = false } = {}) {
+    const out = {}
+    if (grantHistory) {
+      for (const [tag, key] of this.epochKeys) {
+        if (tag) out[tag] = b4a.toString(key, 'hex')
+      }
+    } else if (this.activeEpochTag && this.epochKeys.has(this.activeEpochTag)) {
+      out[this.activeEpochTag] = b4a.toString(this.epochKeys.get(this.activeEpochTag), 'hex')
+    }
+    return out
+  }
+
+  // ADMIT_POLICY_SET reducer branch: admin-signed, and the change itself must
+  // carry the CURRENT effective N distinct admin signatures over the new value.
+  async _applyAdmitPolicySet (op, opLamport, batch) {
+    if (!this._signerAuthorized(op, opLamport, { adminOnly: true })) {
+      this.ctx.log.warn('op-rejected', { reason: 'ADMIT_POLICY_NOT_ADMIN' })
+      return
+    }
+    const body = this._bodyOrNull(op) // { n, cosigs }
+    if (body === null) return
+    const n = Math.floor(Number(body.n))
+    if (!Number.isFinite(n) || n < 1 || n > 4) {
+      this.ctx.log.warn('op-rejected', { reason: 'ADMIT_POLICY_BAD_N' })
+      return
+    }
+    const needed = this._effectiveAdmitN()
+    if (needed > 1) {
+      const signers = this._distinctAdminSigners(op, body.cosigs, this._policyCosigPayload(n))
+      if (signers.size < needed) {
+        this.ctx.log.warn('op-rejected', { reason: 'ADMIT_POLICY_UNDERSIGNED', have: signers.size, need: needed })
+        return
+      }
+    }
+    let vs = null
+    try { vs = await this.view.getVaultState() } catch (_) { vs = null }
+    await this.view.putVaultState(batch, { ...(vs || {}), admitPolicyN: n })
+    this.admitPolicyN = n
   }
 
   // Build a KEY_ROTATE op carrying real content-key rotation (design §3.2/§3.3,
@@ -570,6 +756,9 @@ class SyncEngine {
     this._activeWinnerLamport = Number((vs && vs.activeEpochLamport) || 0)
     this._activeWinnerDevice = (vs && vs.activeEpochDevice) || ''
     this._activeEpochProvisional = !!(vs && vs.activeEpochProvisional)
+    // Admit policy is a pure function of committed vault-state too (B1).
+    const vn = Number(vs && vs.admitPolicyN)
+    this.admitPolicyN = Number.isFinite(vn) && vn >= 1 ? Math.floor(vn) : 1
     // Rebuild epochKeys from scratch so a truncation never leaves a stale key.
     this.epochKeys.clear()
     // Epoch-0 lazy-migration anchor: epochKey_0 == vaultKey (design §6). Always
@@ -590,6 +779,20 @@ class SyncEngine {
           const k = this.ctx.identity.openSealedToDevice(this.myBoxPubkey, this.myBoxSecretKey, sealed)
           this.epochKeys.set(epochTag, k)
         } catch (_) { /* not our wrap / not entitled — pending-gap (§3.10, P5) */ }
+      }
+    }
+    // Layer in the LOCAL epoch chain (design §5.9: blob-persisted keys; design
+    // §5.8/Phase 4: keys DELIVERED IN THE PAIRING BOOTSTRAP). A freshly paired
+    // device has NO committed wraps — its lockboxes were sealed to the
+    // then-survivors at each rotation, before it existed — so the bootstrap
+    // chain in state._epochKeysLocal is its ONLY source for the active key
+    // until the next rotation seals one to it. Local-only material, exactly
+    // like the vaultKey anchor above; committed wraps win on tag collision.
+    const localChain = this.ctx.state && this.ctx.state._epochKeysLocal
+    if (localChain && typeof localChain === 'object') {
+      for (const [tag, hex] of Object.entries(localChain)) {
+        if (!tag || this.epochKeys.has(tag)) continue
+        try { this.epochKeys.set(tag, b4a.from(String(hex), 'hex')) } catch (_) {}
       }
     }
   }
@@ -657,6 +860,11 @@ class SyncEngine {
             await this._applyKeyRotate(op, batch)
             this._rememberOp(op, true)
           }
+          continue
+        }
+        if (h.type === ops.OP_TYPES.ADMIT_POLICY_SET) {
+          await this._applyAdmitPolicySet(op, opLamport, batch)
+          this._rememberOp(op, true)
           continue
         }
 
@@ -792,6 +1000,30 @@ class SyncEngine {
     } else if (!this._signerAuthorized(op, opLamport, { adminOnly: true })) {
       this.ctx.log.warn('op-rejected', { reason: 'DEVICE_ADD_NOT_ADMIN' })
       return
+    }
+
+    // [RT-FIX B1] ADMIT POLICY: under N≥2, a DEVICE_ADD needs N DISTINCT
+    // non-revoked admin signatures — the op signer plus detached cosigs over
+    // the new device's identity tuple. Enforced for ROOT-signed adds too
+    // (_signerAuthorized's root bypass is exactly the lone-phrase-holder
+    // self-admit hole this closes): a lone key-holder cannot quietly re-admit
+    // a device once a second admin exists and the policy is raised. Effective
+    // N is clamped to the live admin count so revocations cannot deadlock
+    // admission — the honest residual being that a root willing to LOUDLY
+    // revoke other admins first can still get back to N=1 (documented L3).
+    if (!isGenesis) {
+      const needed = this._effectiveAdmitN()
+      if (needed > 1) {
+        const signers = this._distinctAdminSigners(op, body.cosigs, this._admitCosigPayload(dev))
+        if (signers.size < needed) {
+          this.ctx.log.warn('op-rejected', {
+            reason: 'DEVICE_ADD_POLICY',
+            have: signers.size,
+            need: needed
+          })
+          return
+        }
+      }
     }
 
     const rec = {
@@ -1168,7 +1400,7 @@ class SyncEngine {
   }
 
   // --- high-level append helpers (used by notes-service via ctx) -----------
-  async _appendDeviceAdd (device, { selfRoot = false, signer } = {}) {
+  async _appendDeviceAdd (device, { selfRoot = false, signer, cosigs = [] } = {}) {
     const s = signer || this._localSigner()
     const rootPub = selfRoot ? s.signingPubkey : (this.rootPubkey || s.signingPubkey)
     const op = this._makeOp({
@@ -1178,6 +1410,10 @@ class SyncEngine {
       payload: {
         selfRoot,
         rootPubkey: rootPub,
+        // N-of-M admit cosignatures (design §3.8 step 2, B1): detached admin
+        // signatures over the new device's identity tuple, verified by the
+        // reducer against the committed admin set when policy N ≥ 2.
+        cosigs,
         device: {
           deviceId: device.deviceId,
           label: device.label,
@@ -1718,11 +1954,22 @@ export async function attach (ctx) {
       ...newDevice,
       signingSecretKey: newDevice.signingSecretKey
     }
+    // Epoch chain delivered by the bootstrap (design §5.8 selective-chain,
+    // Phase 4): a freshly paired device has NO committed wraps (lockboxes were
+    // sealed to the then-survivors before it existed), so this delivered
+    // chain — merged into engine.epochKeys by _rebuildAuthFromView — is its
+    // only source for the active content key. followSeed makes the device
+    // reachable on its follow topic from day one (design §4).
+    ctx.state._unlockSecret = unlockSecret
+    ctx.state._epochKeysLocal = (bs.epochKeys && typeof bs.epochKeys === 'object') ? { ...bs.epochKeys } : {}
+    ctx.state._followSeed = bs.followSeed || null
     ctx.vaultStore.saveLocalDevice(newDevice, unlockSecret, {
       vaultId: ctx.state.vaultId,
       vaultKey: ctx.state.vaultKeys.vaultKey,
       indexKey: ctx.state.vaultKeys.indexKey,
-      deviceAdminSeed: ctx.state.vaultKeys.deviceAdminSeed
+      deviceAdminSeed: ctx.state.vaultKeys.deviceAdminSeed,
+      epochKeys: ctx.state._epochKeysLocal,
+      followSeed: ctx.state._followSeed
     })
     await ctx.vaultStore.putVaultHeader({
       ...(bs.vaultHeader || {}),
@@ -1777,11 +2024,11 @@ export async function attach (ctx) {
     }
   }
 
-  async function approvePairRequest (req) {
+  async function approvePairRequest (req, { grantHistory = false, cosigs = [] } = {}) {
     pairing.assertInviteOpen(req.inv)
     await engine.ready(15000)
     await engine.refresh()
-    await engine._appendDeviceAdd(req.newDev, { signer: engine._localSigner() })
+    await engine._appendDeviceAdd(req.newDev, { signer: engine._localSigner(), cosigs })
     await engine.refresh()
     if (ctx.state._pendingInvite === req.inv) {
       if (typeof req.inv.rendezvousCleanup === 'function') {
@@ -1792,11 +2039,24 @@ export async function attach (ctx) {
     ctx.swarm.leave(req.inv.topic).catch(() => {})
 
     const header = await ctx.vaultStore.getVaultHeader()
+    // SELECTIVE-CHAIN BY DEFAULT (design §5.8, RT-FIX B1): the bootstrap
+    // carries ONLY the active epoch key; the full rotated-key chain rides only
+    // behind an explicit grantHistory. vaultKey/indexKey/deviceAdminSeed still
+    // ship — they are the system KEK / blind-id / admin material every member
+    // needs to operate (see engine._bootstrapEpochKeys for the honest
+    // epoch-0 consequence). followSeed lets the new device be reached on its
+    // follow topic from day one (design §4; today derived, delivered
+    // explicitly for forward-compat with a future random seed).
     const bootstrap = {
       vaultId: ctx.state.vaultId,
       vaultKey: b4a.toString(ctx.state.vaultKeys.vaultKey, 'hex'),
       indexKey: b4a.toString(ctx.state.vaultKeys.indexKey, 'hex'),
       deviceAdminSeed: b4a.toString(ctx.state.vaultKeys.deviceAdminSeed, 'hex'),
+      activeEpoch: engine.activeEpoch,
+      activeEpochTag: engine.activeEpochTag,
+      epochKeys: engine._bootstrapEpochKeys({ grantHistory }),
+      grantHistory: !!grantHistory,
+      followSeed: b4a.toString(ctx.crypto.hkdf(ctx.state.vaultKeys.vaultKey, 'follow-seed-v1', 32), 'hex'),
       vaultHeader: header,
       autobaseKey: header && header.autobaseKey
     }
@@ -1814,7 +2074,7 @@ export async function attach (ctx) {
     return { ok: true, deviceId: req.newDev.deviceId }
   }
 
-  ctx.dispatcher.register(COMMANDS.PAIR_APPROVE, async ({ requestId }) => {
+  ctx.dispatcher.register(COMMANDS.PAIR_APPROVE, async ({ requestId, grantHistory = false, cosigs = [] }) => {
     const req = clearPairRequest(requestId)
     if (!req) {
       const e = new Error('pairing request not found or expired')
@@ -1822,7 +2082,7 @@ export async function attach (ctx) {
       throw e
     }
     try {
-      return await approvePairRequest(req)
+      return await approvePairRequest(req, { grantHistory, cosigs })
     } catch (err) {
       if (err && err.code === ctx.ops.ERROR_CODES.PAIRING_EXPIRED && ctx.state._pendingInvite === req.inv) {
         ctx.state._pendingInvite = null
@@ -1909,14 +2169,29 @@ export async function attach (ctx) {
           }
         }, ttl)
         if (timer.unref) timer.unref()
-        pending.set(requestId, { requestId, inv, conn, msg, newDev, confirmation, timer })
+        // [RT-FIX B1 step 3] LOUD warning when the joiner's key material
+        // matches a previously-revoked device (a re-imaged revoked laptop has
+        // a fresh deviceId, so the revoke gate alone cannot see it). Heuristic
+        // only — surfaced for an explicit human decision, never a silent gate.
+        const previouslyRevokedMatch = engine.matchesRevokedDevice({
+          signingPubkey: newDev.signingPubkey,
+          boxPubkey: newDev.boxPubkey
+        })
+        if (previouslyRevokedMatch) {
+          ctx.log.warn('pair-request-matches-revoked-device', {
+            matchedDeviceId: previouslyRevokedMatch.deviceId,
+            via: previouslyRevokedMatch.via
+          })
+        }
+        pending.set(requestId, { requestId, inv, conn, msg, newDev, confirmation, timer, previouslyRevokedMatch })
         ctx.emit('pair-approval-needed', {
           requestId,
           deviceId: newDev.deviceId,
           label: newDev.label,
           platform: newDev.platform,
           confirmation,
-          expiresAt: inv.expiresAt
+          expiresAt: inv.expiresAt,
+          previouslyRevokedMatch
         })
       } catch (err) {
         if (err && err.code === ctx.ops.ERROR_CODES.PAIRING_EXPIRED && ctx.state._pendingInvite === inv) {
