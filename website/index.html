@@ -112,17 +112,17 @@
         <h2>Don't trust us. <span class="gt">Read the code.</span></h2>
         <p>Every byte of Paste — the encryption envelope, the sync engine, the relay client, the verifier — is open source. Read it, fork it, run your own verifier against it. Security you can't inspect isn't security.</p>
         <div class="open-strip-cta">
-          <a class="btn primary sm" href="https://github.com/bigdestiny2" target="_blank" rel="noopener">View the source</a>
+          <a class="btn primary sm" href="https://github.com/bigdestiny2/pearpaste" target="_blank" rel="noopener">View the source</a>
           <a class="btn ghost sm" href="#security">Run the verifier</a>
         </div>
       </div>
       <div class="open-strip-tree" aria-hidden="true">
         <div class="tree-bar"><span class="dot ok"></span><span class="t">paste / backend</span></div>
         <pre class="tree">
-<span class="dim">$</span> <span class="cmd">git clone</span> github.com/paste-app/paste
-<span class="ok">✓</span> 4,058 lines of backend
-<span class="ok">✓</span> 17 security tests, 65 total — all green
-<span class="ok">✓</span> independent verifier CLI
+<span class="dim">$</span> <span class="cmd">git clone</span> github.com/bigdestiny2/pearpaste
+<span class="ok">✓</span> encryption envelope — local-only keys
+<span class="ok">✓</span> security tests &amp; independent verifier CLI
+<span class="ok">✓</span> relay client — ciphertext only
 <span class="dim">licensed permissively, audit at will.</span></pre>
       </div>
     </div>
@@ -271,9 +271,9 @@ destroying keys (cryptographic erasure).</span>
       <p class="lede" style="margin:16px auto 0;">The same encrypted core runs everywhere. Desktop ships today via the Pear runtime; native installers and mobile builds are in active development.</p>
     </div>
     <div class="platforms reveal" data-d="1" style="margin-top:42px;">
-      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 2c0 1.7-1.4 3-3 3 0-1.7 1.4-3 3-3zM12 6c2 0 3-1.2 5-1.2 1.7 0 3.3 1 4.2 2.5-3.7 2.2-3.1 7.4.7 8.9-.6 1.7-1.5 3.4-2.8 5-1 1.2-2 1.8-3 1.8-1.2 0-1.6-.7-3-.7s-1.9.7-3 .7c-1 0-2-.7-3-1.9C2.7 18.6 2 15 3.4 12c.9-1.9 2.6-3 4.3-3 1.6 0 2.6 1 4.3 1z"/></svg><div class="nm">macOS</div><span class="badge ready">Available</span></div>
-      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="9" r="5"/><path d="M7 14c-2 1.5-3 4-3 7h16c0-3-1-5.5-3-7"/></svg><div class="nm">Linux</div><span class="badge">Pear · native soon</span></div>
-      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5l8-1v8H3zM13 3.7L21 3v9h-8zM3 13h8v8l-8-1zM13 13h8v8l-8-1z"/></svg><div class="nm">Windows</div><span class="badge">Pear · native soon</span></div>
+      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 2c0 1.7-1.4 3-3 3 0-1.7 1.4-3 3-3zM12 6c2 0 3-1.2 5-1.2 1.7 0 3.3 1 4.2 2.5-3.7 2.2-3.1 7.4.7 8.9-.6 1.7-1.5 3.4-2.8 5-1 1.2-2 1.8-3 1.8-1.2 0-1.6-.7-3-.7s-1.9.7-3 .7c-1 0-2-.7-3-1.9C2.7 18.6 2 15 3.4 12c.9-1.9 2.6-3 4.3-3 1.6 0 2.6 1 4.3 1z"/></svg><div class="nm">macOS</div><span class="badge ready">Runs on Pear</span></div>
+      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="9" r="5"/><path d="M7 14c-2 1.5-3 4-3 7h16c0-3-1-5.5-3-7"/></svg><div class="nm">Linux</div><span class="badge ready">Runs on Pear</span></div>
+      <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5l8-1v8H3zM13 3.7L21 3v9h-8zM3 13h8v8l-8-1zM13 13h8v8l-8-1z"/></svg><div class="nm">Windows</div><span class="badge ready">Runs on Pear</span></div>
       <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2" stroke="#07090c" stroke-width="1.5"/></svg><div class="nm">iOS</div><span class="badge">In development</span></div>
       <div class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M10 6h4" stroke="#07090c" stroke-width="1.5"/></svg><div class="nm">Android</div><span class="badge">In development</span></div>
     </div>
@@ -321,18 +321,46 @@ destroying keys (cryptographic erasure).</span>
   </div>
 </section>
 
-<!-- FINAL CTA -->
+<!-- FINAL CTA / GET SECTION -->
 <section id="get">
   <div class="wrap">
     <div class="cta-final reveal">
       <h2>One notepad. <span class="gt">Everywhere you go.</span></h2>
       <p>Stop emailing yourself snippets and pasting secrets into chat. One fully-encrypted notepad, on every device you own — with nothing on anyone else's servers and nothing to sign up for.</p>
-      <div class="hero-cta" style="justify-content:center;">
-        <a class="btn primary" href="#get">Download Paste</a>
-        <a class="btn ghost" href="#security">Run the verifier first</a>
-        <a class="btn ghost" href="https://github.com/bigdestiny2" target="_blank" rel="noopener">Read the source</a>
+
+      <div class="install-steps">
+        <!-- Step 1 -->
+        <div class="install-step">
+          <div class="install-num">01</div>
+          <div class="install-body">
+            <h3>Install the Pear runtime</h3>
+            <p>PearPaste runs on the <a href="https://pears.com" target="_blank" rel="noopener" class="inline-link">Pear runtime</a> (by Holepunch). Install it once and you can run any Pear app.</p>
+            <a class="btn primary sm" href="https://pears.com" target="_blank" rel="noopener">Get the Pear runtime at pears.com</a>
+          </div>
+        </div>
+        <!-- Step 2 -->
+        <div class="install-step">
+          <div class="install-num">02</div>
+          <div class="install-body">
+            <h3>Run PearPaste</h3>
+            <p>PearPaste is in <strong>private beta</strong> right now — the public one-command install link is coming soon.</p>
+            <!-- TODO: when production is staged+seeded, restore the runnable command here:
+                 <div class="cmd-block"><code id="pearCmd" class="peer-cmd">pear run pear://PRODUCTION-VERSIONED-KEY</code>
+                 <button class="btn ghost sm copy-btn" id="copyPearCmd" aria-label="Copy command to clipboard" title="Copy"><span id="copyLabel">Copy</span></button></div> -->
+            <div class="cmd-block" aria-disabled="true" style="opacity:.6">
+              <code class="peer-cmd">pear run pear://&hellip;</code>
+              <span class="btn ghost sm" style="pointer-events:none;cursor:default">Coming soon</span>
+            </div>
+            <a class="btn ghost sm" href="https://github.com/bigdestiny2/pearpaste" target="_blank" rel="noopener" style="margin-top:10px;display:inline-block">Watch the repo for the beta link</a>
+          </div>
+        </div>
       </div>
-      <p style="font-size:13px;color:var(--faint);margin-top:22px;">Free · no account · open source &amp; auditable · open verifier · macOS today, more platforms in development</p>
+
+      <div class="hero-cta" style="justify-content:center;margin-top:32px;">
+        <a class="btn ghost" href="#security">Run the verifier first</a>
+        <a class="btn ghost" href="https://github.com/bigdestiny2/pearpaste" target="_blank" rel="noopener">Read the source</a>
+      </div>
+      <p style="font-size:13px;color:var(--faint);margin-top:22px;">Free · no account · open source &amp; auditable · open verifier · runs on Pear runtime (macOS, Linux, Windows)</p>
     </div>
   </div>
 </section>
@@ -357,7 +385,7 @@ destroying keys (cryptographic erasure).</span>
       </div>
       <div>
         <h5>Trust</h5>
-        <a href="https://github.com/bigdestiny2" target="_blank" rel="noopener">Source on GitHub</a>
+        <a href="https://github.com/bigdestiny2/pearpaste" target="_blank" rel="noopener">Source on GitHub</a>
         <a href="#security">Encryption proof</a>
         <a href="#honesty">What we don't claim</a>
         <a href="#faq">FAQ</a>

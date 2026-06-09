@@ -106,6 +106,32 @@
     runDemo()
   }
 
+  // Copy-to-clipboard for pear run command (local JS only — no network)
+  var copyBtn = document.getElementById('copyPearCmd')
+  var copyLabel = document.getElementById('copyLabel')
+  var pearCmd = document.getElementById('pearCmd')
+  if (copyBtn && pearCmd) {
+    copyBtn.addEventListener('click', function () {
+      var text = pearCmd.textContent || ''
+      if (!text) return
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () {
+          if (copyLabel) { copyLabel.textContent = 'Copied!'; setTimeout(function () { copyLabel.textContent = 'Copy' }, 2000) }
+        }).catch(function () { fallbackCopy(text) })
+      } else {
+        fallbackCopy(text)
+      }
+    })
+  }
+  function fallbackCopy (text) {
+    var ta = document.createElement('textarea')
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select()
+    try { document.execCommand('copy'); if (copyLabel) { copyLabel.textContent = 'Copied!'; setTimeout(function () { copyLabel.textContent = 'Copy' }, 2000) } }
+    catch (e) { /* ignore */ }
+    document.body.removeChild(ta)
+  }
+
   // Smooth-scroll offset for sticky header on hash links
   document.addEventListener('click', function (e) {
     var a = e.target.closest && e.target.closest('a[href^="#"]')
