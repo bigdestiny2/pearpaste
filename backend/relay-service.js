@@ -351,6 +351,11 @@ export async function attach (ctx) {
       revocable: opts.revocable !== false,
       timeout: opts.timeoutMs || DEFAULTS.seedTimeoutMs
     }
+    // Epoch-bound relay discovery key (REVOCATION_DESIGN §5.11): after a
+    // rotation the survivors re-seed under HMAC(topicSeed_{N+1},'log-disco-v1')
+    // — an opaque rendezvous id derived from the new epoch key, which a
+    // revoked device cannot compute. Identifier-only, never key material.
+    if (opts.discoveryKey) seedOpts.discoveryKey = String(opts.discoveryKey)
     const auditPayload = {
       appKey: keyHex,
       privacyTier: DEFAULTS.privacyTier,
@@ -726,8 +731,28 @@ export async function attach (ctx) {
 
   function getConnectedCount () { return rstate.connectedRelays.size }
 
+  // Replication-firewall allowance predicate: is this swarm remotePublicKey
+  // one of OUR relays? Relays never run the device handshake — they replicate
+  // ciphertext only, which is the honestly-documented L2 channel (a relay
+  // serves opaque bytes; decryption stays blocked by content-key rotation).
+  function isRelayPeer (remotePubHex) {
+    if (!remotePubHex) return false
+    const hex = String(remotePubHex)
+    if (rstate.connectedRelays.has(hex)) return true
+    if (rstate.client && typeof rstate.client.getRelays === 'function') {
+      try {
+        for (const r of rstate.client.getRelays() || []) {
+          const pk = r && (r.pubkey || (r.peer && r.peer.pubkey))
+          if (pk && String(pk) === hex) return true
+        }
+      } catch (_) { /* coarser answer only */ }
+    }
+    return false
+  }
+
   ctx.relay = {
     seedVault,
+    isRelayPeer,
     publishTemporaryCustody,
     getCustodyStatus,
     getRelayStatus,
@@ -860,6 +885,46 @@ export async function attach (ctx) {
   ctx.on('key-rotated', (e) => {
     rstate.lastKeyRotation = (e && e.at) || new Date().toISOString()
     if (ctx.state) ctx.state.lastKeyRotation = rstate.lastKeyRotation
+  })
+
+  // ---- Epoch-bound relay re-seed on rotation (design §5.11, RT-FIX B2) -----
+  // [GATE SB2 — read before "improving" this] `unseed`/`revocable` is COSMETIC
+  // against an already-connected peer: Hypercore replication streams persist
+  // through swarm.leave, and p2p-hiverelay-client.unseed() only BROADCASTS a
+  // message — it never closes a stream. The per-connection replication
+  // firewall (replication-firewall.js) is the SOLE real control; this re-seed
+  // only moves the relay-side rendezvous onto a discovery key derived from the
+  // NEW epoch key (which the revoked device cannot compute), so relays that
+  // honor unseed stop announcing the old one. HONEST RESIDUAL (L2): a
+  // third-party / non-honoring relay keeps serving the OPAQUE post-revoke
+  // ciphertext indefinitely — decryption stays blocked by content-key
+  // rotation. Best-effort: degraded/unreachable relays never block the
+  // rotation itself.
+  ctx.on('epoch-rotated', (e) => {
+    if (!rstate.enabled) return
+    const epochTag = e && e.epochTag
+    if (!epochTag) return
+    ctx.scope.spawn(async (scope) => {
+      try {
+        const appKey = (ctx.state && (ctx.state.autobaseKey || ctx.state.vaultLogKey)) || null
+        const engine = ctx.sync
+        const epochKey = engine && engine.epochKeys ? engine.epochKeys.get(epochTag) : null
+        if (!appKey || !epochKey) return // not seeded yet / key not unwrapped — nothing to move
+        const topicSeed = ctx.crypto.topicSeedFromEpochKey(epochKey)
+        const discoveryKey = b4a.toString(ctx.crypto.hmac(topicSeed, 'log-disco-v1'), 'hex')
+        // Unseed the pre-rotation entry FIRST (broadcast-only, see SB2 above),
+        // then re-seed under the epoch-bound discovery key.
+        try {
+          const client = await ensureClient()
+          if (client && typeof client.unseed === 'function') await client.unseed(appKey)
+        } catch (_) { /* best-effort — see SB2: cosmetic against connected peers */ }
+        const res = await seedVault(appKey, { discoveryKey })
+        log.info('relay-epoch-reseed', { epoch: (e && e.epoch) || null, ok: !!(res && res.ok) })
+      } catch (err) {
+        if (scope && scope.cancelled) return
+        log.warn('relay-epoch-reseed-failed', { err: String((err && err.message) || err) })
+      }
+    }, 'relay-epoch-reseed')
   })
 
   log.info('relay-service-attached', { degraded: !!rstate.degradedReason })

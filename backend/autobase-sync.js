@@ -279,6 +279,19 @@ class SyncEngine {
     return out
   }
 
+  // Replication-firewall predicate (design §3.7.2 / GATE SB2): is `deviceId` a
+  // COMMITTED, NON-REVOKED device whose committed signing pubkey matches the
+  // one the peer authenticated with? Read from the reorg-safe auth cache — the
+  // same committed authority the reducer uses for write exclusion, so a reorg
+  // can never leave the firewall trusting a rolled-back device set.
+  // Returns 'allowed' | 'revoked' | 'unknown'.
+  isDeviceAllowed (deviceId, signingPubkey) {
+    const d = this.devices.get(deviceId)
+    if (!d) return 'unknown'
+    if (signingPubkey && d.signingPubkey !== signingPubkey) return 'unknown'
+    return d.revokedAtLamport == null ? 'allowed' : 'revoked'
+  }
+
   // Build a KEY_ROTATE op carrying real content-key rotation (design §3.2/§3.3,
   // RT-FIX B3/B10/B11). Mints epochKey_{N+1}=randomBytes(32) (NEVER derived —
   // an ex-admin re-derives anything deterministic, §1.2), computes
@@ -865,6 +878,14 @@ class SyncEngine {
     const target = this.devices.get(body.deviceId)
     if (!target) return
     target.revokedAtLamport = opLamport
+    // [GATE SB2] Signal the replication firewall on EVERY device that applies
+    // this revoke (the dispatcher's host-side emit only fires on the revoking
+    // admin). The firewall must actively conn.destroy() existing streams
+    // authenticated to the revoked device — refusing new connections alone is
+    // not enough (Hypercore replication streams persist through swarm.leave).
+    // Same signal-only pattern as 'epoch-rotated': handlers do the side
+    // effects; the reducer stays pure. Idempotent on re-apply after a reorg.
+    try { this.ctx.emit('device-revoked', { deviceId: body.deviceId, applied: true }) } catch (_) {}
     // [GATE SB1] removeWriter is DECOUPLED from the reducer. Calling
     // host.removeWriter inside apply on a target that is OFFLINE deterministically
     // FREEZES the base's indexedLength (empirically proven on a real

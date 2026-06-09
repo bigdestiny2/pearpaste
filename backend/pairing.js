@@ -18,9 +18,34 @@ import { ERROR_CODES } from './shared-ops.js'
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000
 
-// vaultDiscoveryTopic = HMAC(vaultKey, "swarm-topic-v1"), 32 bytes (spec §10).
-export function vaultDiscoveryTopic (vaultKey) {
-  return hmac(vaultKey, 'swarm-topic-v1') // Buffer(32)
+// vaultDiscoveryTopic = HMAC(topicSeed, "swarm-topic-v1"), 32 bytes (spec §10).
+//
+// EPOCH-AWARE (REVOCATION_DESIGN §3.7.1): the argument is a topic SEED, not
+// necessarily the vaultKey. Epoch-0 callers pass the raw vaultKey so the
+// legacy topic is byte-identical (no flag-day, design §6). After a rotation,
+// callers pass crypto.topicSeedFromEpochKey(epochKey_e) — derived LOCALLY from
+// the active epoch key and never transmitted (RT-FIX B3) — so a revoked
+// device, which never receives epochKey_{N+1}, cannot compute the new topic.
+// NOTE (GATE SB2): topic rotation is a DISCOVERY CONVENIENCE, not an exclusion
+// barrier — a revoked device can still dial the immutable Autobase core key.
+// The replication firewall (replication-firewall.js) is the real control.
+export function vaultDiscoveryTopic (topicSeed) {
+  return hmac(topicSeed, 'swarm-topic-v1') // Buffer(32)
+}
+
+// Per-device follow/catch-up topic (REVOCATION_DESIGN §4, default-on).
+// followTopic(d) = HMAC(followSeed, "follow:" + deviceId). A survivor that was
+// OFFLINE during a rotation can only derive the OLD epoch topic, which the
+// online survivors leave (grace 0); it would be stranded. So every device
+// always joins its OWN follow topic on unlock, and for a window after each
+// rotation the online survivors ANNOUNCE every other SURVIVING device's follow
+// topic — the returning device finds a survivor there, replicates the
+// KEY_ROTATE, unwraps its lockbox, and walks forward to the new topic. The
+// revoked device's follow topic is simply never announced again. Follow topics
+// are discovery-only: knowing one buys a connection, and the replication
+// firewall still refuses a revoked/unknown peer on that connection.
+export function followTopic (followSeed, deviceId) {
+  return hmac(followSeed, 'follow:' + String(deviceId))
 }
 
 // Temporary, random pairing topic that expires (spec §10/§14).
@@ -219,6 +244,7 @@ export function openBootstrap ({ boxPubkey, boxSecretKey, sealed }) {
 
 export default {
   vaultDiscoveryTopic,
+  followTopic,
   newPairingTopic,
   shortCodeRendezvousTopic,
   normalizeShortCode,

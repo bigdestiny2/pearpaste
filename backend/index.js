@@ -24,6 +24,7 @@ import * as crypto from './crypto-envelope.js'
 import * as ops from './shared-ops.js'
 import * as identity from './identity.js'
 import * as pairing from './pairing.js'
+import { createReplicationFirewall } from './replication-firewall.js'
 
 // Subsystems are STATICALLY imported. The Pear runtime is Bare: dynamic
 // import() of a relative `pear://dev/...` specifier is rejected by Bare's
@@ -73,9 +74,27 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
 
   const disableSwarm = typeof process !== 'undefined' && process.env && process.env.PEARPASTE_DISABLE_SWARM === '1'
   const swarm = injectedSwarm || (disableSwarm ? makeMemorySwarm() : new Hyperswarm())
+
+  // REPLICATION FIREWALL (REVOCATION_DESIGN §3.7.2 / GATE SB2) — the
+  // load-bearing replication control. store.replicate(conn) now runs only for
+  // peers that authenticate as a committed NON-REVOKED device; on DEVICE_REVOKE
+  // every live stream to the revoked device is actively destroyed (refusing
+  // new connections alone is not enough — replication streams survive
+  // swarm.leave and relay unseed is cosmetic). Topic rotation below is a
+  // discovery convenience only. PEARPASTE_REPL_FIREWALL=off is the field
+  // kill-switch: legacy unconditional replication, still authenticating
+  // outbound so enforcing peers accept us.
+  const firewall = createReplicationFirewall({
+    store: vaultStore.store,
+    log,
+    getDevice: () => state.device,
+    getEngine: () => ctx.sync,
+    isRelayPeer: (hex) => !!(ctx.relay && typeof ctx.relay.isRelayPeer === 'function' && ctx.relay.isRelayPeer(hex)),
+    enforce: !(typeof process !== 'undefined' && process.env && process.env.PEARPASTE_REPL_FIREWALL === 'off')
+  })
   swarm.on('connection', (conn, info) => {
-    if (isPairingConnection(info)) return
-    try { vaultStore.store.replicate(conn) } catch (err) { log.warn('replicate-failed', { err: String(err) }) }
+    if (isPairingConnection(info)) return // pairing keeps its dedicated raw-frame path
+    firewall.handleConnection(conn, info)
   })
 
   // In-memory vault state. Keys live here and ONLY here; never cross RPC.
@@ -85,7 +104,13 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     vaultKeys: null, // { vaultKey, indexKey, deviceAdminSeed }
     device: null, // local device identity (has secret material)
     lamport: new ops.Lamport(0),
-    joinedTopic: null,
+    joinedTopic: null, // mirror of the ACTIVE vault topic (legacy observers/tests)
+    // The reconciled topic SET (design §5.10): topicHex -> { topic, kind }.
+    // Kinds: 'vault' (active-epoch discovery topic), 'follow-self' (this
+    // device's own catch-up topic, always joined), 'follow-peer' (a surviving
+    // peer's catch-up topic, announced for a window after a rotation).
+    joinedTopics: new Map(),
+    _followAnnounceUntil: 0,
     openItems: new Map() // itemId -> { plaintext, timer } (tap-to-decrypt cache)
   }
 
@@ -110,20 +135,102 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   const isUnlocked = () => !state.locked && !!state.vaultKeys
   const dispatcher = new RpcDispatcher({ isUnlocked, logger: log })
 
+  // How long survivors announce each other's follow topics after a rotation
+  // (design §4): long enough for a typical offline device to come back, cheap
+  // either way (N-1 extra announced topics for 2-6 devices).
+  const FOLLOW_ANNOUNCE_MS = 24 * 60 * 60 * 1000
+
+  // The follow seed (design §4). Phase 4 delivers a dedicated random
+  // followSeed at pairing (state._followSeed, persisted in the local blob);
+  // until one was delivered, fall back to a vaultKey-derived seed. Metadata
+  // posture of the fallback is identical to the epoch-0 topic (also
+  // vaultKey-derived), and follow topics are DISCOVERY ONLY — knowing one buys
+  // a connection, and the replication firewall still refuses a revoked or
+  // unknown peer on it (GATE SB2: topics never were the exclusion control).
+  function followSeedCurrent () {
+    if (state._followSeed) {
+      return b4a.isBuffer(state._followSeed) ? state._followSeed : b4a.from(String(state._followSeed), 'hex')
+    }
+    if (state.vaultKeys && state.vaultKeys.vaultKey) {
+      return crypto.hkdf(state.vaultKeys.vaultKey, 'follow-seed-v1', 32)
+    }
+    return null
+  }
+
+  // Epoch-aware vault discovery topic (design §3.7.1). Epoch 0 keeps the
+  // legacy vaultKey-derived topic byte-identical (no flag-day, design §6).
+  // After a rotation the topic derives from the ACTIVE epoch key — the seed is
+  // computed locally and never transmitted (B3), so a revoked device cannot
+  // compute it. If the engine knows the active tag but this device has not
+  // unwrapped that key yet (transiently behind), stay on the newest topic we
+  // CAN derive — the follow-topic channel carries us forward.
+  function activeVaultTopic () {
+    if (!state.vaultKeys) return null
+    const engine = ctx.sync
+    if (engine && engine.activeEpochTag && engine.epochKeys) {
+      const ek = engine.epochKeys.get(engine.activeEpochTag)
+      if (ek) return pairing.vaultDiscoveryTopic(crypto.topicSeedFromEpochKey(ek))
+    }
+    return pairing.vaultDiscoveryTopic(state.vaultKeys.vaultKey)
+  }
+
+  // Reconcile the joined topic SET from committed state (design §5.10):
+  // join what should be joined, leave what should not. Grace on the old epoch
+  // topic is ZERO (stolen-device default, design §4/B13): the follow-topic
+  // channel carries offline survivors, and lingering on topic_N only leaks
+  // metadata — the revoked device never needed the topic to replicate (SB2).
+  function reconcileTopics () {
+    if (!state.vaultKeys || state.locked) return
+    const desired = new Map()
+    const vt = activeVaultTopic()
+    if (vt) desired.set(b4a.toString(vt, 'hex'), { topic: vt, kind: 'vault', opts: { server: true, client: true } })
+    const fseed = followSeedCurrent()
+    if (fseed && state.device) {
+      const own = pairing.followTopic(fseed, state.device.deviceId)
+      desired.set(b4a.toString(own, 'hex'), { topic: own, kind: 'follow-self', opts: { server: true, client: true } })
+    }
+    if (fseed && state._followAnnounceUntil > Date.now()) {
+      const engine = ctx.sync
+      if (engine && engine.devices) {
+        for (const d of engine.devices.values()) {
+          if (d.revokedAtLamport != null) continue // NEVER announce a revoked device's follow topic
+          if (state.device && d.deviceId === state.device.deviceId) continue
+          const ft = pairing.followTopic(fseed, d.deviceId)
+          desired.set(b4a.toString(ft, 'hex'), { topic: ft, kind: 'follow-peer', opts: { server: true, client: false } })
+        }
+      }
+    }
+    for (const [hex, want] of desired) {
+      if (state.joinedTopics.has(hex)) continue
+      try {
+        const discovery = swarm.join(want.topic, want.opts)
+        state.joinedTopics.set(hex, { topic: want.topic, kind: want.kind })
+        scope.spawn(async () => { await discovery.flushed() }, 'swarm-announce-' + want.kind)
+      } catch (err) {
+        log.warn('topic-join-failed', { kind: want.kind, err: String((err && err.message) || err) })
+      }
+    }
+    for (const [hex, have] of state.joinedTopics) {
+      if (desired.has(hex)) continue
+      swarm.leave(have.topic).catch(() => {})
+      state.joinedTopics.delete(hex)
+    }
+    const v = [...state.joinedTopics.values()].find((t) => t.kind === 'vault')
+    state.joinedTopic = v ? v.topic : null
+  }
+
   async function joinVault () {
     if (!state.vaultKeys) return
-    const topic = pairing.vaultDiscoveryTopic(state.vaultKeys.vaultKey)
-    if (state.joinedTopic) return
-    const discovery = swarm.join(topic, { server: true, client: true })
-    state.joinedTopic = topic
-    scope.spawn(async () => { await discovery.flushed() }, 'swarm-announce')
+    reconcileTopics()
   }
 
   function leaveVault () {
-    if (state.joinedTopic) {
-      swarm.leave(state.joinedTopic).catch(() => {})
-      state.joinedTopic = null
+    for (const [, { topic }] of state.joinedTopics) {
+      swarm.leave(topic).catch(() => {})
     }
+    state.joinedTopics.clear()
+    state.joinedTopic = null
+    state._followAnnounceUntil = 0
   }
 
   // Project the epoch chain a loaded local-device blob carries into a hex map
@@ -184,6 +291,30 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     on (ev, fn) { (listeners.get(ev) || listeners.set(ev, []).get(ev)).push(fn) },
     emit (ev, payload) { for (const fn of listeners.get(ev) || []) { try { fn(payload) } catch (_) {} } }
   }
+  ctx.replicationFirewall = firewall // observability for tests/status panels
+
+  // Topic-set + firewall reactions to committed sync state (design §3.4 step 6:
+  // the reducer only SIGNALS; the host reconciles from committed state here).
+  // 'sync-ready' re-reconciles after the engine rebuilt activeEpochTag from the
+  // committed view (a reopen of an already-rotated vault emits no
+  // 'epoch-rotated', so this is what moves a returning device onto its newest
+  // derivable topic).
+  ctx.on('sync-ready', () => reconcileTopics())
+  ctx.on('epoch-rotated', () => {
+    state._followAnnounceUntil = Date.now() + FOLLOW_ANNOUNCE_MS
+    reconcileTopics()
+    // Drop the follow-peer announcements once the window lapses.
+    const t = setTimeout(() => reconcileTopics(), FOLLOW_ANNOUNCE_MS + 1000)
+    if (t.unref) t.unref()
+  })
+  ctx.on('device-revoked', (e) => {
+    // [GATE SB2 part b] Actively destroy every live replication stream
+    // authenticated to the revoked device — on EVERY device that applies the
+    // revoke, not just the revoking admin. Then re-reconcile topics so the
+    // revoked device's follow topic is no longer announced.
+    if (e && e.deviceId) firewall.destroyPeer(e.deviceId)
+    reconcileTopics()
+  })
 
   // ---- Foundation handlers (vault lifecycle + pairing spine) --------------
   dispatcher.register(COMMANDS.CREATE_VAULT, async ({ label, platform, passphrase = '' }) => {
