@@ -1,4 +1,4 @@
-# https://paste.global/robots.txt
+# https://www.paste.global/robots.txt
 # Paste — open to all search and AI crawlers (we want to be found and cited).
 User-agent: *
 Allow: /
@@ -21,4 +21,4 @@ Allow: /
 User-agent: Applebot-Extended
 Allow: /
 
-Sitemap: https://paste.global/sitemap.xml
+Sitemap: https://www.paste.global/sitemap.xml
