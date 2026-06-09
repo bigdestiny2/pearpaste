@@ -291,9 +291,16 @@ function pearBuild (dry) {
   } else {
     // No prebuilt wrapper supplied. Build one by copying the pear-electron
     // runtime shell ("Pear Runtime.app") to <target-parent>/macos-wrapper/
-    // Paste.app, rebranding Info.plist + icon, and ad-hoc re-signing — the
-    // exact steps are in docs/RELEASE.md §3. Until that is automated here,
-    // require the path so we never package the wrong bundle.
+    // Paste.app, then rebrand ONLY CFBundleDisplayName + the icon, and
+    // ad-hoc re-sign (`codesign --force --deep --sign -`). EMPIRICAL
+    // (2026-06-10): do NOT change CFBundleName or CFBundleIdentifier —
+    // Electron derives the helper-app paths from them, so the app dies
+    // instantly with "FATAL: Unable to find helper app" (it looks for
+    // "Paste Helper.app" while Frameworks/ ships "Pear Runtime Helper*.app").
+    // A full product rename requires rebranding all four helper bundles +
+    // their plists/executables, electron-packager-style — signed-release
+    // work, not dev-tier. Until automated here, require the path so we
+    // never package the wrong bundle.
     if (!dry) die('set PEARPASTE_MAC_APP to the prebuilt darwin app dir (basename "Paste"); pear build requires the platform app-dir path argument')
     buildArgs.push(`${BUILD_FLAG}=${path.join('<path-to>', `${PRODUCT_NAME}.app`)}`)
   }

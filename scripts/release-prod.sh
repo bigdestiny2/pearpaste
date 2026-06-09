@@ -94,10 +94,17 @@ log "pear runtime: $PEAR_VER"
 # Extract a single string field from Pear's newline-delimited --json output.
 # Prefers jq when present; falls back to a conservative grep/sed.
 json_field() { # <field> ; reads NDJSON on stdin
+  # EMPIRICAL (Pear v0.3243, 2026-06-10): `pear stage --json` nests link/verlink
+  # under `.data` ({"cmd":"stage","tag":"staging","data":{...,"link","verlink"}}),
+  # NOT at the top level — the old top-level lookup matched nothing, so the
+  # redaction placeholder leaked into the actual `pear seed` command and the
+  # seed step failed with INVALID_URL. Constrain to objects carrying BOTH
+  # link+verlink (only the staging/addendum events) so the pear-electron UI
+  # asset link inside the staged package.json can never be picked up.
   local field="$1" input; input="$(cat)"
   if command -v jq >/dev/null 2>&1; then
     printf '%s\n' "$input" \
-      | jq -rs --arg f "$field" 'map(select(type=="object" and has($f)))[-1][$f] // empty' 2>/dev/null
+      | jq -rs --arg f "$field" '[.[] | objects | (.data? // .) | objects | select(has("verlink") and has($f)) | .[$f]] | last // empty' 2>/dev/null
   else
     printf '%s\n' "$input" \
       | grep -Eo "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" \
@@ -227,6 +234,12 @@ if [ "$SKIP_PIN" = "1" ]; then
 elif [ "$DRY_RUN" = "1" ]; then
   log "(dry-run) would run: node scripts/pin-on-hiverelay.js --app \"$STAGE_DIR\" --replicas $REPLICAS --json"
 else
+  # EMPIRICAL (2026-06-10): nothing earlier creates $STAGE_DIR — the verifier
+  # builds a fresh vault instead of a mirror — so the pin step always failed
+  # with "app dir not found". Dump the just-staged app files first.
+  rm -rf "$STAGE_DIR"
+  pear dump --force "$RELEASE_LINK" "$STAGE_DIR" >/dev/null 2>&1 \
+    || warn "pear dump of $RELEASE_LINK failed — pinning from the working tree is NOT equivalent; skipping would leave relay availability stale"
   if node scripts/pin-on-hiverelay.js --app "$STAGE_DIR" --replicas "$REPLICAS" --json; then
     log "pin request submitted (replicas target: $REPLICAS)"
   else

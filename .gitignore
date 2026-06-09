@@ -38,3 +38,7 @@ mobile/pearpaste-expo/web-build/
 mobile/backend/app.bundle.js
 mobile/backend/app.android.bundle.js
 mobile/backend/app.ios.bundle.js
+
+# release flow artifacts (local mirror + notes regenerated each release)
+.pear-stage/
+RELEASE_NOTES_*.txt
