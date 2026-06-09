@@ -126,6 +126,20 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     }
   }
 
+  // Project the epoch chain a loaded local-device blob carries into a hex map
+  // keyed by epochTag (design §5.9). loadLocalDevice already parsed it to Buffers
+  // under dev.vault.epochKeys; re-encode to hex for state._epochKeysLocal (the
+  // shape the sync engine re-wraps at rotation). Absent for epoch-0-only blobs.
+  function epochKeysHexFrom (dev) {
+    const ek = dev && dev.vault && dev.vault.epochKeys
+    if (!ek || typeof ek !== 'object') return {}
+    const out = {}
+    for (const [tag, key] of Object.entries(ek)) {
+      out[tag] = b4a.isBuffer(key) ? b4a.toString(key, 'hex') : String(key)
+    }
+    return out
+  }
+
   function lock () {
     leaveVault()
     for (const [, v] of state.openItems) if (v.timer) clearTimeout(v.timer)
@@ -137,6 +151,11 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     }
     state.vaultKeys = null
     state.device = null
+    // Drop the epoch-chain working state so no key material / unlock secret
+    // survives lock (the engine wipes engine.epochKeys separately on close).
+    state._unlockSecret = null
+    state._epochKeysLocal = null
+    state._followSeed = null
     state.locked = true
     ctx.emit('locked')
   }
@@ -173,6 +192,12 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     state.vaultKeys = crypto.deriveVaultKeys(rootSeed)
     state.vaultId = identity.vaultIdFromRootSeed(rootSeed)
     state.device = identity.createDeviceIdentity({ label, platform })
+    // Remember the unlock secret + epoch chain so the sync engine can re-wrap a
+    // newly-unwrapped epoch key into the local blob at rotation (design §5.9).
+    // Best-effort: a fresh vault is epoch 0 only, so the map starts empty.
+    state._unlockSecret = passphrase || mnemonic
+    state._epochKeysLocal = {}
+    state._followSeed = null
     vaultStore.saveLocalDevice(state.device, passphrase || mnemonic, {
       vaultId: state.vaultId,
       vaultKey: state.vaultKeys.vaultKey,
@@ -222,13 +247,22 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     state.device = restoredDev
       ? { ...restoredDev, signingSecretKey: crypto.deviceKeyPairFromSeed(restoredDev.signSeed).secretKey }
       : identity.createDeviceIdentity({ platform: 'unknown' })
+    // Carry forward any epoch chain + follow seed the local blob already held so
+    // a restored device keeps its post-rotation keys (design §5.9).
+    state._unlockSecret = passphrase || mnemonic
+    state._epochKeysLocal = epochKeysHexFrom(restoredDev)
+    state._followSeed = restoredDev && restoredDev.vault && restoredDev.vault.followSeed
+      ? restoredDev.vault.followSeed
+      : null
     // Always (re)persist wrapped vault secrets so routine passphrase/keychain
     // unlock works without re-entering the recovery phrase (spec §14/§23).
     vaultStore.saveLocalDevice(state.device, passphrase || mnemonic, {
       vaultId: state.vaultId,
       vaultKey: state.vaultKeys.vaultKey,
       indexKey: state.vaultKeys.indexKey,
-      deviceAdminSeed: state.vaultKeys.deviceAdminSeed
+      deviceAdminSeed: state.vaultKeys.deviceAdminSeed,
+      epochKeys: state._epochKeysLocal,
+      followSeed: state._followSeed
     })
     crypto.wipe(rootSeed)
     state.locked = false
@@ -256,6 +290,11 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       indexKey: dev.vault.indexKey,
       deviceAdminSeed: dev.vault.deviceAdminSeed
     }
+    // Restore the epoch chain + follow seed the blob carried (design §5.9) so a
+    // password unlock recovers post-rotation keys without re-reading wrap rows.
+    state._unlockSecret = secret
+    state._epochKeysLocal = epochKeysHexFrom(dev)
+    state._followSeed = dev.vault.followSeed || null
     ctx.emit('device-unlocked', { deviceId: dev.deviceId })
     state.locked = false
     await joinVault()

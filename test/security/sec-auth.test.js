@@ -238,16 +238,19 @@ test('§16 replayed old op rejected after key rotation', async (t) => {
   //       ORIGINAL (now-stale) Lamport, so max(lamport, deviceId) keeps
   //       current state and discards the replay. (Asserted via the REAL RPC
   //       path + the Lamport.beats predicate the reducer uses.)
-  //   (C) Forward secrecy by KEY_ROTATE (spec §23 "always rotate content keys
-  //       for future writes"): DEVICE_REVOKE bumps engine.keyEpoch. (Asserted.)
-  // VERSION NOTE (not faked): autobase-sync.js ALSO calls
-  // host.removeWriter(revoked writer core) guarded by
-  // `typeof host.removeWriter === 'function'`. The Autobase version pinned in
-  // package.json does not expose addWriter/removeWriter on the apply host, so
-  // that guard is a documented no-op here and writer-core eviction is NOT a
-  // layer we can assert in this environment. We therefore do NOT assert it
-  // (asserting a dormant mechanism would be a fake pass); the property still
-  // holds via (A)+(B)+(C). The signer gate (A) is the load-bearing control.
+  //   (C) Forward secrecy by REAL KEY_ROTATE (Phase 2, design §3): DEVICE_REVOKE
+  //       now rotates the content key to a FRESH epoch sealed ONLY to survivors
+  //       (epochKey_{N+1}=randomBytes(32)), activating a non-empty activeEpochTag
+  //       so post-revoke writes seal under a key the revoked device never holds.
+  //       (Asserted below: a new tag activates + the admin obtains the new key.)
+  // EVICTION NOTE (Phase 2 / GATE SB1): autobase-sync.js performs removeWriter
+  // HOST-SIDE in the DEVICE_REVOKE dispatcher (NOT inside the pure reducer),
+  // gated on the target being currently live/connected and SKIPPED+DEFERRED when
+  // offline — because removeWriter on an OFFLINE indexer deterministically
+  // freezes the base's indexedLength. Eviction is therefore best-effort defense-
+  // in-depth; the load-bearing write-exclusion is now the reducer's
+  // reject-committed-revoked-signer gate (B12, layer A), which also closes the
+  // backdated-lamport window. The property holds via (A)+(B)+(C).
   // engine._signerAuthorized() intentionally still authorizes an op whose
   // lamport is BEFORE the revoke epoch — those were legitimately authored
   // while trusted; retroactively rejecting them would corrupt history. Replay
@@ -292,11 +295,19 @@ test('§16 replayed old op rejected after key rotation', async (t) => {
   t.absent(Lamport.beats(incomingStale, currentLww),
     'a replayed op with a stale Lamport does NOT beat current state (reducer discards it)')
 
-  // Layers (C) + (A) — DEVICE_REVOKE triggers KEY_ROTATE and marks revoked.
-  const epochBefore = engine.keyEpoch
+  // Layers (C) + (A) — DEVICE_REVOKE triggers a REAL KEY_ROTATE and marks
+  // revoked. Updated for Phase 2: the old assertion checked only the cosmetic
+  // counter (engine.keyEpoch === before+1); now we assert a REAL rotation —
+  // activeEpoch advances to a fresh integer, a non-empty activeEpochTag
+  // activates, and the surviving admin obtains the fresh epoch key (so future
+  // writes seal under a key the revoked device never receives).
+  const activeEpochBefore = engine.activeEpoch
   const rev = await call(pe, COMMANDS.DEVICE_REVOKE, { deviceId: dev.deviceId })
   t.ok(rev.ok, 'revoke + key rotation performed')
-  t.is(engine.keyEpoch, epochBefore + 1, '(C) KEY_ROTATE bumped the key epoch on revoke (forward secrecy for future writes)')
+  t.is(engine.activeEpoch, activeEpochBefore + 1, '(C) KEY_ROTATE advanced the ACTIVE epoch on revoke (real rotation)')
+  t.ok(rev.epochTag && rev.epochTag.length > 0, '(C) revoke activated a non-empty epochTag (fresh content key, not a counter)')
+  t.is(engine.activeEpochTag, rev.epochTag, '(C) engine active tag == the rotation tag')
+  t.ok(engine.epochKeys.has(rev.epochTag), '(C) surviving admin obtained the fresh epoch key (forward secrecy for future writes)')
   const drec = engine.devices.get(dev.deviceId)
   t.ok(drec && drec.revokedAtLamport != null, 'signer revoked at a lamport')
 

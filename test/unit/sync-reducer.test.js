@@ -85,7 +85,12 @@ test('note reducer is deterministic LWW (higher lamport wins, stable across repl
   t.is(b.note.createdAt, a.note.createdAt, 'createdAt preserved across upserts (whole-note LWW)')
 })
 
-test('DEVICE_REVOKE bumps key-rotation epoch (monotonic) and revokes the device', async (t) => {
+test('DEVICE_REVOKE performs a REAL key rotation (activates a fresh epoch sealed to survivors)', async (t) => {
+  // UPDATED for Phase 2 (was: "DEVICE_REVOKE bumps key-rotation epoch" — the
+  // cosmetic counter). Revocation now ROTATES the content key to a fresh epoch
+  // sealed ONLY to survivors: a new non-empty activeEpochTag activates, the
+  // surviving admin obtains epochKey_1, activeEpoch advances to 1, and the
+  // revoked device is excluded from both the wraps and the write set (B12).
   const dir = tmp()
   const pe = await createPearEnd({ storagePath: dir })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
@@ -93,25 +98,43 @@ test('DEVICE_REVOKE bumps key-rotation epoch (monotonic) and revokes the device'
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'admin', platform: 'test', passphrase: 'pw' })
   await pe.ctx.sync.ready(15000)
 
-  const startEpoch = pe.ctx.sync.keyEpoch
-  const victim = 'deadbeef'.repeat(4)
-  // seed a revocable device row directly via a signed DEVICE_ADD
+  const startActiveEpoch = pe.ctx.sync.activeEpoch
+  t.is(startActiveEpoch, 0, 'vault starts at epoch 0 (tag "")')
+  t.is(pe.ctx.sync.activeEpochTag, '', 'active tag starts empty (legacy/epoch-0)')
+
+  // A real revocable device with a REAL box keypair (so a survivor-style wrap
+  // could target it) — here it is the REVOKED target, so it must get NO wrap.
+  const victim = identity.createDeviceIdentity({ label: 'old', platform: 'x', seed: b4a.alloc(32, 0x5c) })
   await pe.ctx.sync._appendDeviceAdd(
-    { deviceId: victim, label: 'old', platform: 'x', signingPubkey: 'V'.repeat(64), boxPubkey: 'b', roles: ['writer'], writerKey: b4a.toString(b4a.alloc(32, 4), 'hex') },
+    { deviceId: victim.deviceId, label: 'old', platform: 'x', signingPubkey: victim.signingPubkey, boxPubkey: victim.boxPubkey, roles: ['writer'], writerKey: b4a.toString(b4a.alloc(32, 4), 'hex') },
     { signer: pe.ctx.sync._localSigner() }
   )
   await pe.ctx.sync.refresh()
-  t.ok(pe.ctx.sync.devices.has(victim), 'victim device added to set')
+  t.ok(pe.ctx.sync.devices.has(victim.deviceId), 'victim device added to set')
 
-  const res = await pe.call(COMMANDS.DEVICE_REVOKE, { deviceId: victim })
+  const res = await pe.call(COMMANDS.DEVICE_REVOKE, { deviceId: victim.deviceId })
   t.ok(res.ok, 'revoke succeeded')
-  t.is(res.epoch, startEpoch + 1, 'key epoch incremented by exactly 1')
-  t.ok(pe.ctx.sync.keyEpoch > startEpoch, 'engine keyEpoch advanced (monotonic)')
+  // The returned epoch is the NEW integer epoch (no longer the cosmetic keyEpoch).
+  t.is(res.epoch, 1, 'revoke activated integer epoch 1')
+  t.ok(res.epochTag && res.epochTag.length > 0, 'revoke returned a non-empty epochTag (real rotation, not a counter)')
 
-  const v = pe.ctx.sync.devices.get(victim)
+  // REAL rotation took effect on the revoking admin: a fresh non-empty tag is
+  // active, the admin (a survivor) holds epochKey_1, and activeEpoch advanced.
+  t.is(pe.ctx.sync.activeEpoch, 1, 'engine activeEpoch advanced to 1')
+  t.is(pe.ctx.sync.activeEpochTag, res.epochTag, 'engine active tag == the rotation tag')
+  t.ok(pe.ctx.sync.epochKeys.has(res.epochTag), 'surviving admin obtained the epoch-1 key')
+  t.is(b4a.isBuffer(pe.ctx.sync.epochKeys.get(res.epochTag)) && pe.ctx.sync.epochKeys.get(res.epochTag).byteLength, 32,
+    'epoch-1 key is 32 fresh bytes')
+  // epoch-0 anchor remains so legacy content still opens (no past-erasure).
+  t.ok(pe.ctx.sync.epochKeys.has(''), 'epoch-0 vaultKey anchor still present (old content stays readable)')
+
+  const v = pe.ctx.sync.devices.get(victim.deviceId)
   t.ok(v && v.revokedAtLamport != null, 'victim marked revoked at a lamport')
-  t.absent(pe.ctx.sync._signerAuthorized({ signerPubkey: 'V'.repeat(64) }, v.revokedAtLamport + 1),
-    'a post-revoke op signed by the revoked device is rejected by the reducer')
+  // B12: a committed-revoked signer is rejected for ANY new op (not just >= revoke lamport).
+  t.absent(pe.ctx.sync._signerAuthorized({ signerPubkey: victim.signingPubkey }, v.revokedAtLamport + 1),
+    'a post-revoke op signed by the revoked device is rejected by the reducer (B12)')
+  t.absent(pe.ctx.sync._signerAuthorized({ signerPubkey: victim.signingPubkey }, 1),
+    'a BACKDATED-lamport op from the committed-revoked device is ALSO rejected (B12)')
 })
 
 // ---- Phase 1: epoch plumbing + lazy migration (epoch 0 only) ---------------

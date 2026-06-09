@@ -159,6 +159,19 @@ export class MaterializedView {
     return this.getSealedRaw(this.notesKey(objectBlindId))
   }
 
+  // Store the op's OWN sealed body envelope (epochKey-sealed, keyed by
+  // 'opbody:'+objectBlindId) verbatim under the note key, WITHOUT decrypting it.
+  // Used by the reducer when THIS device lacks the op's epoch key (a revoked
+  // device permanently, a transiently-behind device until it unwraps the key):
+  // the op must still linearize + replicate + persist sealed so a key-holding
+  // device reads it later. Readers open with objectId 'note:'+noteId and so get
+  // nothing from this row (correct forward-secrecy outcome). Stored row presence
+  // also satisfies the durability reconciler's _rowPresentFor check.
+  async putNoteSealedRaw (target, { objectBlindId, envelope }) {
+    await target.put(this.notesKey(objectBlindId), envelope)
+    return envelope
+  }
+
   // ---- clips ----------------------------------------------------------------
   clipsKey (bucket, objectBlindId) { return beeKey(PREFIX.CLIPS, bucket, objectBlindId) }
 
@@ -170,6 +183,15 @@ export class MaterializedView {
       schema: this.ops.SCHEMAS.CLIP,
       plaintext: clip
     })
+  }
+
+  // Op-envelope-verbatim clip store for the lacks-epoch-key reducer path (mirror
+  // of putNoteSealedRaw). Persists the sealed op body keyed by (bucket, blindId)
+  // so the op linearizes + replicates; this device cannot read it (the open path
+  // keys by 'clip:'+clipId) until/unless it gains the epoch key.
+  async putClipSealedRaw (target, { bucket, objectBlindId, envelope }) {
+    await target.put(this.clipsKey(bucket, objectBlindId), envelope)
+    return envelope
   }
 
   // ---- devices --------------------------------------------------------------
@@ -295,6 +317,37 @@ export class MaterializedView {
       const want = this.blindId('epochwrap:' + String(plain.epochTag) + ':' + String(deviceId))
       if (plain.blindId !== want) continue
       out.push({ epochTag: String(plain.epochTag), epoch: Number(plain.epoch) || 0, sealed: String(plain.sealed) })
+    }
+    return out
+  }
+
+  // Return the set of wrap `blindId`s committed for one `epochTag` (design
+  // §3.5.1, RT-FIX B6). The reducer uses this to re-validate a winning
+  // rotation's wrap set against EVERY committed-revoked device: for each
+  // revoked deviceId it recomputes blindId("epochwrap:"+epochTag+":"+deviceId)
+  // and checks membership here; a hit means the winner sealed the active key to
+  // a now-revoked device (forward secrecy defeated against it) and a fresh
+  // rotation must be chained. Reads ONLY the public row keys via the recorded
+  // blindId inside each sealed row — no box material, no roster enumeration.
+  async listEpochKeyWrapBlindIds (epochTag) {
+    const out = new Set()
+    for await (const { key } of this.bee.createReadStream({
+      gte: PREFIX.EPOCHKEYS, lt: PREFIX.EPOCHKEYS + '~'
+    })) {
+      const rowBlindId = key.slice(PREFIX.EPOCHKEYS.length)
+      const env = await this.getSealedRaw(key)
+      if (!env) continue
+      let plain = null
+      try {
+        plain = this.crypto.openWithObjectId({
+          vaultKey: this._getVaultKey(),
+          objectId: 'epochkey:' + rowBlindId,
+          envelope: env
+        })
+      } catch (_) { plain = null }
+      if (!plain || plain.blindId == null) continue
+      if (String(plain.epochTag) !== String(epochTag)) continue
+      out.add(String(plain.blindId))
     }
     return out
   }

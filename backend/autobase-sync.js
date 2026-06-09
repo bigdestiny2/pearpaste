@@ -263,6 +263,110 @@ class SyncEngine {
     return 'opbody:' + String(objectBlindId || '')
   }
 
+  // The surviving entitled set for a rotation that revokes `revokedDeviceId`
+  // (design §3.1 step 3): every committed device that is NOT revoked and is NOT
+  // the target, read STRAIGHT from the reorg-safe auth cache (which Phase 1
+  // taught to carry boxPubkey, §5.1). The local device is included implicitly
+  // (it is in the committed device set). Returns [{ deviceId, boxPubkey }].
+  _survivingDevices (revokedDeviceId) {
+    const out = []
+    for (const d of this.devices.values()) {
+      if (d.deviceId === revokedDeviceId) continue
+      if (d.revokedAtLamport != null) continue
+      if (!d.boxPubkey) continue
+      out.push({ deviceId: d.deviceId, boxPubkey: d.boxPubkey })
+    }
+    return out
+  }
+
+  // Build a KEY_ROTATE op carrying real content-key rotation (design §3.2/§3.3,
+  // RT-FIX B3/B10/B11). Mints epochKey_{N+1}=randomBytes(32) (NEVER derived —
+  // an ex-admin re-derives anything deterministic, §1.2), computes
+  // epochTag_{N+1}=hash(opId || prevEpochTag), seals the key INDIVIDUALLY to each
+  // surviving boxPubkey via crypto_box_seal (omitting the revoked device), and
+  // seals the body under the NEW key (B3 — so the revoked device, which holds
+  // only epochKey_N, cannot read the roster/prev-chain). Returns { op,
+  // epochKey, epochTag } so the caller can persist the new key locally. The
+  // topicSeed is NEVER transmitted (B3): survivors derive it locally from the key.
+  _makeKeyRotateOp ({ revokedDeviceId, survivors, signer }) {
+    const ctx = this.ctx
+    const crypto = ctx.crypto
+    const ops = ctx.ops
+    const prevEpochTag = this.activeEpochTag || ''
+    const newEpochInt = (Number(this.activeEpoch) || 0) + 1
+    const epochKey = crypto.randomBytes(crypto.KEY_BYTES)
+    const opId = b4a.toString(crypto.randomBytes(16), 'hex')
+    // Collision-safe identity (design §2.1/§3.5): two concurrent rotations are
+    // both integer N+1 but carry distinct opIds -> distinct tags, so addressing
+    // by the tag never collides (B5).
+    const epochTag = b4a.toString(crypto.hash('epochtag:' + opId + ':' + prevEpochTag, 16), 'hex')
+
+    // (B10) per-survivor PUBLIC wraps keyed by a BLINDED id (not the plaintext
+    // deviceId) so even a reader of the op cannot enumerate the roster. Each
+    // `sealed` is an opaque crypto_box_seal only the target's box secret opens.
+    const wraps = []
+    for (const d of survivors) {
+      if (!d.boxPubkey) continue
+      wraps.push({
+        blindId: crypto.blindId(this.indexKey, 'epochwrap:' + epochTag + ':' + d.deviceId),
+        sealed: ctx.identity.sealToDevice(d.boxPubkey, epochKey)
+      })
+    }
+
+    const objectBlindId = crypto.blindId(this.indexKey, 'key-rotate:' + epochTag)
+    const lamport = ctx.state.lamport.tick()
+    const header = {
+      version: 1,
+      opId,
+      vaultId: String(ctx.state.vaultId),
+      deviceId: String(signer.deviceId),
+      type: ops.OP_TYPES.KEY_ROTATE,
+      objectBlindId,
+      lamport: String(lamport),
+      createdAtBucket: ops.timeBucket(),
+      epoch: String(newEpochInt), // ◄── the NEW epoch (ordering hint)
+      epochTag // ◄── the NEW content-addressing tag
+    }
+    ops.assertHeaderPublicOnly(header)
+
+    // (B3) body sealed under the NEW key, openable ONLY by a survivor that first
+    // unwrapped its lockbox above. No topicSeed (survivors derive it locally).
+    const envelope = crypto.seal({
+      epochKey,
+      epochTag,
+      objectId: this._opBodyObjectId(objectBlindId),
+      objectBlindId,
+      opType: ops.OP_TYPES.KEY_ROTATE,
+      schema: ops.SCHEMAS.SETTING,
+      vaultId: ctx.state.vaultId,
+      plaintext: {
+        epoch: newEpochInt,
+        epochTag,
+        prevEpoch: Number(this.activeEpoch) || 0,
+        prevEpochTag,
+        revokedDeviceId: String(revokedDeviceId || ''),
+        reason: 'device-revoke'
+      }
+    })
+    const aadHash = crypto.aadHashOf(envelope.aad)
+    const signature = crypto.signOp(signer.signingSecretKey, {
+      header,
+      ciphertext: envelope.ciphertext,
+      nonce: envelope.nonce,
+      aadHash
+    })
+    // `wraps` rides as a PUBLIC top-level op field (B11): self-contained, opened
+    // from the op alone with only the box secret key, robust to reorg/batch
+    // splits. Not in the signed preimage (see _applyKeyRotate note); integrity
+    // rests on the crypto_box_seal construction + the durable epochkeys! rows.
+    return {
+      op: { header, envelope, wraps, aadHash, signerPubkey: signer.signingPubkey, signature },
+      epochKey,
+      epochTag,
+      epochInt: newEpochInt
+    }
+  }
+
   _rememberOp (op, accepted = false) {
     const opId = op && op.header && op.header.opId
     if (!opId) return
@@ -291,6 +395,29 @@ class SyncEngine {
       const e = new Error('sync engine closing'); e.code = 'ENGINE_CLOSING'; throw e
     }
     await this.base.append(op)
+  }
+
+  // [GATE SB1] Is the writer core `writerKeyHex` currently LIVE (connected)?
+  // The determining factor for whether removeWriter is safe is whether the
+  // REMOVED device is online to ack the indexer-set migration: with it OFFLINE,
+  // removeWriter deterministically FREEZES the base's indexedLength (proven on a
+  // real @hyperswarm/testnet, Autobase 7.28.1) and REVOKE+ROTATE never commit
+  // vault-wide. We therefore gate host-side eviction on this and skip+defer when
+  // it returns false. Conservative by construction: we look up the writer in the
+  // base's activeWriters and require ≥1 connected peer on its underlying core; a
+  // writer we cannot resolve, or one with no peers, is treated as OFFLINE so we
+  // NEVER attempt an eviction that could freeze the base. Forward secrecy does
+  // not depend on this — the reducer B12 gate excludes the writes regardless.
+  _isWriterLive (writerKeyHex) {
+    try {
+      const base = this.base
+      if (!base || !base.activeWriters) return false
+      const key = b4a.from(writerKeyHex, 'hex')
+      const w = base.activeWriters.get(key)
+      if (!w || !w.core) return false
+      const peers = w.core.peers
+      return Array.isArray(peers) && peers.length > 0
+    } catch (_) { return false }
   }
 
   // Bounded wait until this device's Autobase writer seat has linearized so
@@ -382,7 +509,16 @@ class SyncEngine {
         roles: plain.roles || ['writer'],
         revokedAtLamport: (plain.revokedAtLamport == null ? null : Number(plain.revokedAtLamport)),
         addedAtLamport: (plain.addedAtLamport == null ? null : Number(plain.addedAtLamport)),
-        isRoot: !!plain.isRoot
+        isRoot: !!plain.isRoot,
+        // [RT-FIX B12] `committedRevoked` is true when this device's revocation
+        // is ALREADY DURABLE in the committed view at the start of this apply
+        // pass. It distinguishes "newly-arriving op from a committed-revoked
+        // signer" (reject outright — closes the backdated-lamport window) from a
+        // genuine pre-revoke op replayed in the SAME first-linearization batch
+        // where the revoke is set incrementally below (judged by the lamport
+        // rule, so legitimately-authored history is not corrupted). Because it
+        // is read from the truncation-aware view, it is reorg-deterministic.
+        committedRevoked: plain.revokedAtLamport != null
       }
       this.devices.set(rec.deviceId, rec)
       if (rec.writerKey) this.writerToDevice.set(rec.writerKey, rec.deviceId)
@@ -412,6 +548,15 @@ class SyncEngine {
     // the committed view recorded (defaults to "" when no rotation has landed).
     this.activeEpoch = Math.max(Number((vs && vs.activeEpoch) || 0), prevActiveEpoch)
     this.activeEpochTag = (vs && vs.activeEpochTag) || ''
+    // Winner-selection state (design §3.5) is ALSO a pure function of the
+    // committed view: persisting the winning rotation's lamport+deviceId in
+    // vault-state lets a SECOND concurrent rotation arriving in a later pass be
+    // compared deterministically by Lamport.beats, regardless of stream order —
+    // a clean reopen (volatile fields 0) recovers the recorded winner here so
+    // the comparison never silently flips the active tag (B5).
+    this._activeWinnerLamport = Number((vs && vs.activeEpochLamport) || 0)
+    this._activeWinnerDevice = (vs && vs.activeEpochDevice) || ''
+    this._activeEpochProvisional = !!(vs && vs.activeEpochProvisional)
     // Rebuild epochKeys from scratch so a truncation never leaves a stale key.
     this.epochKeys.clear()
     // Epoch-0 lazy-migration anchor: epochKey_0 == vaultKey (design §6). Always
@@ -496,11 +641,7 @@ class SyncEngine {
         }
         if (h.type === ops.OP_TYPES.KEY_ROTATE) {
           if (this._signerAuthorized(op, opLamport, { adminOnly: true })) {
-            this.keyEpoch = Math.max(this.keyEpoch, Number(this._body(op).epoch || 0))
-            // Persist the (monotonic) epoch reorg-safely. rootPubkey is carried
-            // forward from the rebuild at the top of this apply pass so the
-            // vault-state row is never clobbered to a missing root.
-            await this.view.putVaultState(batch, { rootPubkey: this.rootPubkey, keyEpoch: this.keyEpoch })
+            await this._applyKeyRotate(op, batch)
             this._rememberOp(op, true)
           }
           continue
@@ -553,8 +694,50 @@ class SyncEngine {
     })
   }
 
+  // Reducer-safe body decrypt. _body THROWS AEAD_FAIL when this device lacks the
+  // op's epoch key — which is LEGITIMATE after a rotation (the revoked device
+  // permanently; a non-revoked device transiently, until it unwraps the new
+  // epoch key). Because the content _apply* handlers run INSIDE the Autobase
+  // reducer (_apply), an uncaught throw there crashes the whole drain/process.
+  // So every reducer caller decrypts through THIS wrapper: it returns null on a
+  // decrypt failure (the caller then stores the sealed op verbatim and skips the
+  // local plaintext index) and never throws out of _apply. The READ path
+  // (NOTE_OPEN / explicit user reads) keeps calling crypto.openWithObjectId /
+  // view.openRecord directly so AEAD_FAIL still surfaces to its own caller.
+  _bodyOrNull (op) {
+    try {
+      return this._body(op)
+    } catch (err) {
+      if (err && (err.code === 'AEAD_FAIL' || err.code === 'BAD_KEY' || err.code === 'BAD_ENVELOPE')) {
+        this.ctx.log.debug('content-op-undecryptable', {
+          type: op.header && op.header.type,
+          epochTag: String((op.header && op.header.epochTag) || ''),
+          reason: 'content op undecryptable under current epoch keys — stored sealed, skipped local index'
+        })
+        return null
+      }
+      throw err // a non-decrypt error is a real bug — let the reducer surface it
+    }
+  }
+
   // signer is authorized iff: known device, not revoked at/before this op's
   // lamport, OR the root identity. Root may always sign lifecycle ops.
+  //
+  // [RT-FIX B12] reject-committed-revoked-signer (LOAD-BEARING — primary
+  // write-exclusion now that removeWriter is decoupled per GATE SB1). The legacy
+  // gate was `opLamport >= revokedAtLamport`; because lamport is the device's
+  // OWN monotonic counter, a malicious revoked device can BACKDATE a content op
+  // to `revokedAtLamport - 1` to slip under that threshold (its signature is
+  // valid — its key still works). The fix (design §3.11): once a DEVICE_REVOKE
+  // for a signer is committed in the view, reject EVERY content/rotation op from
+  // it for NEWLY-ARRIVING ops — gate on "revoked at all," not the lamport
+  // inequality. `committed=true` (the live reducer path) takes the strict gate;
+  // `committed=false` (verifier / historical re-check of already-linearized
+  // ops) keeps the `>=` lamport rule so genuine pre-revoke ops that were already
+  // accepted stay valid (retroactively rejecting them would corrupt history).
+  // Because _rebuildAuthFromView makes `revokedAtLamport` a pure function of the
+  // committed (truncation-aware) view, this is reorg-safe: a device revoked in
+  // the committed view has ALL its new ops dropped regardless of claimed lamport.
   _signerAuthorized (op, opLamport, { adminOnly = false } = {}) {
     const pub = op.signerPubkey
     if (pub === this.rootPubkey) return true
@@ -562,14 +745,29 @@ class SyncEngine {
     for (const d of this.devices.values()) if (d.signingPubkey === pub) { dev = d; break }
     if (!dev) return false
     if (adminOnly && !(dev.roles || []).includes('admin')) return false
-    if (dev.revokedAtLamport != null && opLamport >= dev.revokedAtLamport) return false
+    if (dev.revokedAtLamport != null) {
+      // B12 strict gate: a signer whose revocation is already DURABLE in the
+      // committed view is rejected for EVERY newly-arriving op, regardless of its
+      // claimed lamport — this is what closes the backdated-lamport window and is
+      // the primary write-exclusion now that removeWriter is decoupled (GATE SB1,
+      // design §3.11). A device revoked only incrementally within THIS apply pass
+      // (committedRevoked still false) falls through to the legacy lamport floor
+      // so a genuine pre-revoke op re-linearized alongside the revoke is kept.
+      if (dev.committedRevoked) return false
+      if (opLamport >= dev.revokedAtLamport) return false
+    }
     return true
   }
 
   async _applyDeviceAdd (op, host, batch) {
     const h = op.header
     const opLamport = Number(h.lamport)
-    const body = this._body(op) // { device:{...}, selfRoot? , rootPubkey? }
+    // Lifecycle ops normally seal under epoch 0 (vaultKey), readable by every
+    // device. Guard anyway: if a DEVICE_ADD was minted under a later epoch this
+    // device has not unwrapped, _body would AEAD_FAIL and crash the reducer.
+    // Skip cleanly — the membership change re-materializes once the key arrives.
+    const body = this._bodyOrNull(op) // { device:{...}, selfRoot? , rootPubkey? }
+    if (body === null || !body.device) return
     const dev = body.device
 
     // First DEVICE_ADD establishes the root pubkey (self-root bootstrap) and
@@ -662,13 +860,22 @@ class SyncEngine {
       this.ctx.log.warn('op-rejected', { reason: 'REVOKE_NOT_ADMIN' })
       return
     }
-    const body = this._body(op) // { deviceId }
+    const body = this._bodyOrNull(op) // { deviceId }
+    if (body === null) return // lacks the epoch key to read the revoke target — skip, never throw
     const target = this.devices.get(body.deviceId)
     if (!target) return
     target.revokedAtLamport = opLamport
-    if (target.writerKey && host && typeof host.removeWriter === 'function') {
-      try { await host.removeWriter(b4a.from(target.writerKey, 'hex')) } catch (_) {}
-    }
+    // [GATE SB1] removeWriter is DECOUPLED from the reducer. Calling
+    // host.removeWriter inside apply on a target that is OFFLINE deterministically
+    // FREEZES the base's indexedLength (empirically proven on a real
+    // @hyperswarm/testnet, Autobase 7.28.1): the indexer-set migration is itself
+    // an indexed op needing the REMOVED device's ack, so with it offline the
+    // committed checkpoint never advances — REVOKE+ROTATE never commit vault-wide.
+    // The reducer must stay pure and MUST NOT evict here. Forward secrecy does not
+    // depend on it: the B12 reject-committed-revoked-signer gate (above) is the
+    // primary, load-bearing write-exclusion. Best-effort writer-seat eviction is
+    // performed HOST-SIDE in the DEVICE_REVOKE dispatcher, gated on the target
+    // being currently live/connected, and skipped+deferred when it is offline.
     // Mark the sealed device record revoked. revokedAtLamport is the
     // reorg-safe field _rebuildAuthFromView reads back (the wall-clock
     // revokedAt is kept only as human-facing metadata for DEVICE_LIST).
@@ -687,12 +894,184 @@ class SyncEngine {
     }
   }
 
+  // KEY_ROTATE reducer (design §3.4/§3.5/§3.5.1, RT-FIX B3/B5/B6/B10/B11). The
+  // caller already checked the signer is an authorized admin. Self-contained per
+  // op: this device opens ITS OWN lockbox from the PUBLIC `wraps` using only its
+  // box secret key (no dependency on any prior epoch key — B11), then decrypts
+  // the body sealed under the NEW key (B3/B10). Every wrap is persisted as an
+  // `epochkeys!` row keyed by `epochTag` (B5) so offline survivors and reboots
+  // reconstruct the chain and concurrent rotations never collide. The active
+  // epoch advances monotonically (max); the active TAG follows the Lamport
+  // winner, re-validated against committed revocations (B6).
+  async _applyKeyRotate (op, batch) {
+    const ctx = this.ctx
+    const h = op.header
+    const epochTag = String(h.epochTag || '')
+    const epochInt = Number(h.epoch || 0)
+    // A legacy/cosmetic KEY_ROTATE (no epochTag/wraps) is a Phase-1-shaped op:
+    // keep the monotone keyEpoch bump + vault-state persist so a mixed-version
+    // log still linearizes, but it activates no real epoch (no key to unwrap).
+    //
+    // `wraps` is a PUBLIC, top-level op field (NOT in the encrypted body — B11):
+    // an array of { blindId, sealed } where each `sealed` is a crypto_box_seal of
+    // epochKey_{N+1} to one survivor's box pubkey. Public is safe: an attacker
+    // cannot forge a wrap that hands the revoked device the key (that needs
+    // epochKey_{N+1}, which only survivors+admin hold), and the revoked device's
+    // box pubkey simply has no wrap. Carried outside the signed preimage by
+    // design — the durable `epochkeys!` rows the reducer writes from it are the
+    // reorg-safe channel; integrity rests on the sealed-box construction itself.
+    const wraps = Array.isArray(op.wraps) ? op.wraps : []
+    this.keyEpoch = Math.max(this.keyEpoch, epochInt)
+
+    if (epochTag && wraps.length && this.myDeviceId && this.indexKey) {
+      // (B11) Find + open THIS device's lockbox from the public wraps using ONLY
+      // the box secret key. The wrap is addressed by a blinded id so the roster
+      // is not enumerable from the op (B10).
+      const wantBlind = ctx.crypto.blindId(this.indexKey, 'epochwrap:' + epochTag + ':' + this.myDeviceId)
+      const mine = wraps.find((w) => w && w.blindId === wantBlind)
+      if (mine && this.myBoxPubkey && this.myBoxSecretKey && ctx.identity) {
+        try {
+          const key = ctx.identity.openSealedToDevice(this.myBoxPubkey, this.myBoxSecretKey, mine.sealed)
+          // In-batch incremental set so a later op in THIS batch can seal/open
+          // under the new tag; the authoritative map is rebuilt from the view.
+          this.epochKeys.set(epochTag, key)
+          // Persist the freshly-unwrapped key to the local-only blob (design
+          // §5.9) so a fresh unlock recovers it even before re-reading the wrap
+          // rows. Best-effort: a lightweight test ctx has no vaultStore.
+          this._persistEpochKeyLocal(epochTag, key, epochInt)
+        } catch (_) { /* not our wrap / not entitled — pending-gap (§3.10) */ }
+      }
+      // else: this device is the revoked target or not entitled — record nothing
+      // (no key written), so it never obtains epochKey_{N+1} (forward secrecy).
+
+      // (B5) Persist EVERY wrap as an `epochkeys!` row keyed by epochTag so the
+      // committed view is the reorg-safe source of truth: offline survivors get
+      // their lockbox on return, reboots rebuild the chain, and two concurrent
+      // rotations coexist without one overwriting the other.
+      for (const w of wraps) {
+        if (!w || !w.blindId || !w.sealed) continue
+        await this.view.putEpochKeyWrap(batch, {
+          epochTag, epoch: epochInt, blindId: String(w.blindId), sealed: String(w.sealed)
+        })
+      }
+    }
+
+    // ---- winner selection by epochTag (design §3.5) -----------------------
+    // The integer is a monotone ordering hint only; the ACTIVE TAG content-
+    // addresses the key new writes seal under. Pick the winner deterministically
+    // by Lamport.beats (lamport, then deviceId), comparing this rotation against
+    // the currently-recorded winner so the choice is order-insensitive across
+    // concurrent rotations applied in either order.
+    const prevActiveEpoch = this.activeEpoch || 0
+    const prevActiveTag = this.activeEpochTag || ''
+    let winnerTag = prevActiveTag
+    let winnerLamport = this._activeWinnerLamport || 0
+    let winnerDevice = this._activeWinnerDevice || ''
+    const incoming = { lamport: Number(h.lamport), deviceId: String(h.deviceId || '') }
+    // A real (tagged) rotation can win the active tag; a cosmetic one never does.
+    if (epochTag && epochInt >= prevActiveEpoch) {
+      if (epochInt > prevActiveEpoch ||
+          ctx.ops.Lamport.beats(incoming, { lamport: winnerLamport, deviceId: winnerDevice })) {
+        winnerTag = epochTag
+        winnerLamport = incoming.lamport
+        winnerDevice = incoming.deviceId
+      }
+    }
+    this.activeEpoch = Math.max(prevActiveEpoch, epochInt)
+    this.activeEpochTag = winnerTag
+    this._activeWinnerLamport = winnerLamport
+    this._activeWinnerDevice = winnerDevice
+
+    // (B6) Re-validate the WINNING rotation's wrap set against EVERY device
+    // revoked in the committed view. If the winner sealed the active key to a
+    // now-committed-revoked device (e.g. a concurrent revoke of a different
+    // device the winner's admin had not yet seen), forward secrecy against that
+    // device is defeated: mark the active tag PROVISIONAL and flag that a fresh
+    // rotation must be chained (consumed host-side, §3.5.1). New content still
+    // seals under the provisional winner until the chained rotation lands.
+    let provisional = false
+    if (winnerTag) {
+      try {
+        const wrapBlinds = await this.view.listEpochKeyWrapBlindIds(winnerTag)
+        for (const d of this.devices.values()) {
+          if (d.revokedAtLamport == null) continue
+          const b = ctx.crypto.blindId(this.indexKey, 'epochwrap:' + winnerTag + ':' + d.deviceId)
+          if (wrapBlinds.has(b)) { provisional = true; break }
+        }
+      } catch (_) { provisional = false }
+    }
+    this._activeEpochProvisional = provisional
+
+    // Persist reorg-safely. rootPubkey is carried from the rebuild so the
+    // vault-state row is never clobbered to a missing root. keyEpoch stays the
+    // legacy monotone counter; activeEpoch/activeEpochTag are the real winner.
+    // The winner's lamport/deviceId + the provisional flag persist too so the
+    // selection is recomputed deterministically from the committed view (B5/B6).
+    await this.view.putVaultState(batch, {
+      rootPubkey: this.rootPubkey,
+      keyEpoch: this.keyEpoch,
+      activeEpoch: this.activeEpoch,
+      activeEpochTag: this.activeEpochTag,
+      activeEpochLamport: winnerLamport,
+      activeEpochDevice: winnerDevice,
+      activeEpochProvisional: provisional
+    })
+
+    // Signal the topic-swap / relay-reseed / chained-rotation schedulers
+    // (reconciled from committed state, NEVER fired imperatively from inside the
+    // pure reducer — design §3.4 step 6 / §3.5.1).
+    try {
+      ctx.emit('epoch-rotated', {
+        epoch: this.activeEpoch,
+        epochTag: this.activeEpochTag,
+        provisional
+      })
+    } catch (_) {}
+  }
+
+  // Persist a newly-unwrapped epoch key into the local-only device blob so a
+  // fresh unlock recovers it without re-reading the committed wrap rows (design
+  // §5.9). Keyed by epochTag (never the integer — B5). Best-effort and additive:
+  // a lightweight test ctx (no vaultStore.saveVaultSecrets / no unlock secret)
+  // simply skips — the engine still rebuilds epochKeys from the committed view.
+  _persistEpochKeyLocal (epochTag, key, epochInt) {
+    const ctx = this.ctx
+    const vs = ctx.vaultStore
+    const dev = ctx.state && ctx.state.device
+    const unlock = ctx.state && ctx.state._unlockSecret
+    if (!vs || typeof vs.saveVaultSecrets !== 'function' || !dev || !unlock) return
+    if (!ctx.state.vaultKeys || !ctx.state.vaultKeys.vaultKey) return
+    try {
+      const existing = (ctx.state._epochKeysLocal && typeof ctx.state._epochKeysLocal === 'object')
+        ? ctx.state._epochKeysLocal
+        : {}
+      existing[epochTag] = b4a.toString(key, 'hex')
+      ctx.state._epochKeysLocal = existing
+      vs.saveVaultSecrets(dev, unlock, {
+        vaultId: ctx.state.vaultId,
+        vaultKey: ctx.state.vaultKeys.vaultKey,
+        indexKey: ctx.state.vaultKeys.indexKey,
+        deviceAdminSeed: ctx.state.vaultKeys.deviceAdminSeed,
+        epochKeys: existing,
+        followSeed: ctx.state._followSeed
+      })
+    } catch (_) { /* best-effort; view rebuild is the durable source */ }
+  }
+
   async _applyNoteUpsert (op, batch) {
     const ops = this.ctx.ops
     const h = op.header
-    const body = this._body(op) // NotePlaintext (full note, whole-note LWW)
-    const objectId = 'note:' + body.noteId
     const obid = h.objectBlindId
+    const body = this._bodyOrNull(op) // NotePlaintext (full note, whole-note LWW)
+    if (body === null) {
+      // This device lacks the op's epoch key (revoked, or transiently behind).
+      // Store the op's OWN sealed envelope verbatim so the op linearizes,
+      // replicates, and persists sealed (a key-holder reads it later); we cannot
+      // build the plaintext row or local search entry, so skip both. Never throw.
+      await this.view.putNoteSealedRaw(batch, { objectBlindId: obid, envelope: op.envelope })
+      return
+    }
+    const objectId = 'note:' + body.noteId
     const incoming = { lamport: Number(h.lamport), deviceId: h.deviceId }
 
     const existingEnv = await this.view.getNoteSealed(obid)
@@ -719,7 +1098,8 @@ class SyncEngine {
   async _applyNoteDelete (op, batch) {
     const h = op.header
     const obid = h.objectBlindId
-    const body = this._body(op) // { noteId, hard?:bool }
+    const body = this._bodyOrNull(op) // { noteId, hard?:bool }
+    if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
     const objectId = 'note:' + body.noteId
     const existingEnv = await this.view.getNoteSealed(obid)
     if (!existingEnv) return
@@ -739,9 +1119,16 @@ class SyncEngine {
 
   async _applyClipAdd (op, batch) {
     const h = op.header
-    const body = this._body(op) // ClipPlaintext
-    const objectId = 'clip:' + body.clipId
     const obid = h.objectBlindId
+    const body = this._bodyOrNull(op) // ClipPlaintext
+    if (body === null) {
+      // No epoch key for this clip: persist the op's sealed envelope verbatim
+      // keyed by (createdAtBucket, blindId) so it linearizes + replicates, and
+      // skip the unreadable plaintext row / objmeta. Never throw out of _apply.
+      await this.view.putClipSealedRaw(batch, { bucket: h.createdAtBucket, objectBlindId: obid, envelope: op.envelope })
+      return
+    }
+    const objectId = 'clip:' + body.clipId
     await this.view.putClip(batch, {
       objectId,
       objectBlindId: obid,
@@ -753,7 +1140,8 @@ class SyncEngine {
 
   async _applyClipDelete (op, batch) {
     const h = op.header
-    const body = this._body(op) // { clipId, bucket }
+    const body = this._bodyOrNull(op) // { clipId, bucket }
+    if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
     const obid = h.objectBlindId
     if (body && body.bucket) await batch.del(this.view.clipsKey(body.bucket, obid))
   }
@@ -1570,14 +1958,22 @@ export async function attach (ctx) {
     return { devices }
   })
 
-  // ---- DEVICE_REVOKE (signed by root/admin; triggers KEY_ROTATE) ---------
+  // ---- DEVICE_REVOKE (signed by root/admin; triggers REAL KEY_ROTATE) -----
+  // Phase 2 makes revocation REAL (design §3.1–§3.3): a DEVICE_REVOKE rotates the
+  // content key to a fresh epoch sealed ONLY to surviving devices, so the revoked
+  // device provably cannot decrypt content created after revoke (forward
+  // secrecy). Eviction is DECOUPLED from rotation per GATE SB1 — rotation/forward
+  // secrecy is the deliverable and does NOT depend on removeWriter.
   ctx.dispatcher.register(COMMANDS.DEVICE_REVOKE, async ({ deviceId }) => {
     await engine.ready(15000) // await open instead of hard NOT_READY on the race
     const signer = engine._localSigner()
+    await engine.refresh() // freshest committed device/epoch state before minting
     const me = engine.devices.get(ctx.state.device.deviceId)
     const amAdmin = (signer.signingPubkey === engine.rootPubkey) || (me && (me.roles || []).includes('admin'))
     if (!amAdmin) { const e = new Error('not authorized to revoke'); e.code = ctx.ops.ERROR_CODES.NOT_AUTHORIZED; throw e }
 
+    // 1. DEVICE_REVOKE marks the target revoked (reducer sets revokedAtLamport +
+    //    the B12 committed-revoked gate; removeWriter is NOT called in apply).
     const revOp = engine._makeOp({
       type: ctx.ops.OP_TYPES.DEVICE_REVOKE,
       schema: ctx.ops.SCHEMAS.DEVICE,
@@ -1585,21 +1981,60 @@ export async function attach (ctx) {
       payload: { deviceId },
       signer
     })
-    await engine._append(revOp)
 
-    // trigger key rotation for future writes (spec §9.5, §23 recommendation)
-    const newEpoch = engine.keyEpoch + 1
-    const rotOp = engine._makeOp({
-      type: ctx.ops.OP_TYPES.KEY_ROTATE,
-      schema: ctx.ops.SCHEMAS.SETTING,
-      objectId: 'key-rotate:' + newEpoch,
-      payload: { epoch: newEpoch, reason: 'device-revoke' },
-      signer
-    })
-    await engine._append(rotOp)
+    // 2. Mint epochKey_{N+1}, seal INDIVIDUALLY to each SURVIVING boxPubkey from
+    //    the reorg-safe cache (omitting the revoked device), body under the NEW
+    //    key, wraps blinded (design §3.2/§3.3, B3/B10/B11). topicSeed is NEVER
+    //    transmitted — survivors derive it locally from epochKey_{N+1} (B3).
+    const survivors = engine._survivingDevices(deviceId)
+    const rot = engine._makeKeyRotateOp({ revokedDeviceId: deviceId, survivors, signer })
+
+    // 3. Append REVOKE then ROTATE through the serialized chain so the pair never
+    //    interleaves with another append (design §3.3). The revoking admin also
+    //    holds the new key locally immediately (it is in `survivors` via its own
+    //    committed device record, but persist it directly so a same-session write
+    //    can seal under the new tag before the reducer pass re-reads the rows).
+    await engine._append(revOp)
+    await engine._append(rot.op)
+    engine.epochKeys.set(rot.epochTag, rot.epochKey)
+    engine._persistEpochKeyLocal(rot.epochTag, rot.epochKey, rot.epochInt)
     await engine.refresh()
-    ctx.emit('device-revoked', { deviceId, epoch: newEpoch })
-    return { ok: true, revoked: deviceId, epoch: newEpoch }
+
+    // 4. [GATE SB1] Best-effort, HOST-SIDE writer-seat eviction — gated on the
+    //    target being currently LIVE/connected; skipped + DEFERRED when offline.
+    //    Calling removeWriter on an OFFLINE indexer deterministically FREEZES the
+    //    base's indexedLength (the indexer-set migration needs the removed
+    //    device's ack), so we MUST NOT attempt it for an offline target. Write
+    //    exclusion is already guaranteed by the reducer's reject-committed-revoked
+    //    gate (B12); eviction is pure defense-in-depth here.
+    let evicted = false
+    let evictionDeferred = false
+    try {
+      const target = engine.devices.get(deviceId)
+      const host = engine.base // base exposes removeWriter on this Autobase
+      if (target && target.writerKey && host && typeof host.removeWriter === 'function') {
+        if (engine._isWriterLive(target.writerKey)) {
+          try {
+            await host.removeWriter(b4a.from(target.writerKey, 'hex'))
+            evicted = true
+          } catch (_) { evictionDeferred = true }
+        } else {
+          // OFFLINE target — defer; the B12 gate keeps it write-excluded.
+          evictionDeferred = true
+        }
+      }
+    } catch (_) { evictionDeferred = true }
+
+    ctx.emit('device-revoked', {
+      deviceId,
+      epoch: rot.epochInt,
+      epochTag: rot.epochTag,
+      evicted,
+      evictionDeferred
+    })
+    // `epoch` is the NEW integer epoch (was the cosmetic keyEpoch+1 before);
+    // include epochTag so callers see the real activated content key.
+    return { ok: true, revoked: deviceId, epoch: rot.epochInt, epochTag: rot.epochTag, evicted, evictionDeferred }
   })
 
   ctx.log.info('autobase-sync attached')
