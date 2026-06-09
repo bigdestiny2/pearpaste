@@ -209,7 +209,7 @@ class SyncEngine {
   // --- op construction -----------------------------------------------------
   // Build a signed ReplicatedOp (spec §7.5). Header is PUBLIC-only; body is a
   // CryptoEnvelope. Signature = Ed25519(canonical(header||ct||nonce||aadHash)).
-  _makeOp ({ type, schema, objectId, payload, signer }) {
+  _makeOp ({ type, schema, objectId, payload, signer, epochTag: forcedEpochTag = null, epoch: forcedEpoch = null }) {
     const ctx = this.ctx
     const crypto = ctx.crypto
     const ops = ctx.ops
@@ -234,7 +234,22 @@ class SyncEngine {
     // sealed under the NEW epoch key (B3/B10, the roster-blind requirement).
     const opsK = ctx.ops.OP_TYPES
     const lifecycle = type === opsK.DEVICE_ADD || type === opsK.DEVICE_REVOKE || type === opsK.ADMIT_POLICY_SET
-    const epochTag = lifecycle ? '' : (this.activeEpochTag || '')
+    // EPOCH-FAITHFUL override (design §3.9, RT-FIX B4 — Phase 5): the
+    // durability reconciler re-appends a rolled-back row under the row's
+    // ORIGINAL epochTag, never the active one — re-sealing pre-rotation
+    // content under the new key would pull it forward into the new epoch
+    // (survivors gain nothing: they hold every key) and, combined with any
+    // keyId linkage, manufacture a known-plaintext correlate for a revoked
+    // device still replicating via the L2 channel. Lifecycle ops remain
+    // pinned to epoch 0 regardless (Phase 4 — membership must be universally
+    // applyable). A forced tag whose key this device does not hold is a hard
+    // error, not a silent fallback to the wrong key.
+    const epochTag = lifecycle ? '' : (forcedEpochTag != null ? String(forcedEpochTag) : (this.activeEpochTag || ''))
+    if (!lifecycle && forcedEpochTag != null && forcedEpochTag !== '' && !this.epochKeys.has(epochTag)) {
+      const e = new Error('cannot seal under epoch ' + epochTag + ': key not held')
+      e.code = 'NO_EPOCH_KEY'
+      throw e
+    }
     const epochKey = this.epochKeys.get(epochTag) || this.vaultKey
     const header = {
       version: 1,
@@ -246,8 +261,11 @@ class SyncEngine {
       lamport: String(lamport),
       createdAtBucket: ops.timeBucket(),
       // The integer mirrors the tag: lifecycle ops are epoch-0 by construction
-      // (see above), so their header must say so (strict epoch binding, §5.5).
-      epoch: lifecycle ? '0' : String(this.activeEpoch || 0),
+      // (see above), a forced (re-append) tag carries its original integer,
+      // and everything else stamps the active epoch (strict binding, §5.5).
+      epoch: lifecycle
+        ? '0'
+        : (forcedEpochTag != null ? String(Number(forcedEpoch) || 0) : String(this.activeEpoch || 0)),
       epochTag
     }
     ops.assertHeaderPublicOnly(header) // §22: classify every replicated field
@@ -1327,6 +1345,18 @@ class SyncEngine {
     const objectId = 'note:' + body.noteId
     const incoming = { lamport: Number(h.lamport), deviceId: h.deviceId }
 
+    // [RT-FIX B9] Durable tombstone gate: an upsert that does not BEAT the
+    // committed delete marker by Lamport is a stale replay (or a remote
+    // reconciler's re-append of a row another device deleted) — drop it. A
+    // genuinely NEWER upsert (the user re-created the object) wins and
+    // SUPERSEDES the tombstone, which is removed so the object lives again.
+    const tomb = await this.view.getTombstone(obid)
+    if (tomb) {
+      const tombLww = { lamport: Number(tomb.lamport) || 0, deviceId: tomb.deviceId || '' }
+      if (!ops.Lamport.beats(incoming, tombLww)) return
+      await batch.del(this.view.tombstoneKey(obid))
+    }
+
     const existingEnv = await this.view.getNoteSealed(obid)
     if (existingEnv) {
       let cur
@@ -1354,6 +1384,12 @@ class SyncEngine {
     const body = this._bodyOrNull(op) // { noteId, hard?:bool }
     if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
     const objectId = 'note:' + body.noteId
+    // [RT-FIX B9] Durable tombstone — written UNCONDITIONALLY (even when this
+    // device holds no row yet, so an out-of-order upsert arriving later still
+    // meets the marker). Carries the delete's Lamport identity for the
+    // supersede comparison in _applyNoteUpsert; consulted by _rowPresentFor so
+    // no reconciler ever re-appends a deleted row.
+    await this.view.putTombstone(batch, { objectBlindId: obid, lamport: Number(h.lamport), deviceId: h.deviceId })
     const existingEnv = await this.view.getNoteSealed(obid)
     if (!existingEnv) return
     if (body.hard) {
@@ -1382,11 +1418,20 @@ class SyncEngine {
       return
     }
     const objectId = 'clip:' + body.clipId
+    const incoming = { lamport: Number(h.lamport), deviceId: h.deviceId }
+    // [RT-FIX B9] Same durable-tombstone gate as notes: a clip add that does
+    // not beat a committed delete marker is dropped; a newer one supersedes.
+    const tomb = await this.view.getTombstone(obid)
+    if (tomb) {
+      const tombLww = { lamport: Number(tomb.lamport) || 0, deviceId: tomb.deviceId || '' }
+      if (!this.ctx.ops.Lamport.beats(incoming, tombLww)) return
+      await batch.del(this.view.tombstoneKey(obid))
+    }
     await this.view.putClip(batch, {
       objectId,
       objectBlindId: obid,
       bucket: h.createdAtBucket,
-      clip: { ...body, __lww: { lamport: Number(h.lamport), deviceId: h.deviceId } }
+      clip: { ...body, __lww: incoming }
     })
     await this.view.putObjMeta(batch, { objectId, objectBlindId: obid, type: 'clip' })
   }
@@ -1396,6 +1441,8 @@ class SyncEngine {
     const body = this._bodyOrNull(op) // { clipId, bucket }
     if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
     const obid = h.objectBlindId
+    // [RT-FIX B9] Durable tombstone, mirroring _applyNoteDelete.
+    await this.view.putTombstone(batch, { objectBlindId: obid, lamport: Number(h.lamport), deviceId: h.deviceId })
     if (body && body.bucket) await batch.del(this.view.clipsKey(body.bucket, obid))
   }
 
@@ -1453,7 +1500,16 @@ class SyncEngine {
     // re-upsert just refreshes the pending payload (no duplicate tracking).
     if (this._isAdditiveContentOp(type)) {
       this._pendingDurable.set(op.header.objectBlindId, {
-        type, schema, objectId, payload, bucket: op.header.createdAtBucket, tries: 0
+        type,
+        schema,
+        objectId,
+        payload,
+        bucket: op.header.createdAtBucket,
+        // The op's ORIGINAL epoch identity (design §3.9, B4): a later
+        // durability re-append re-seals under THIS tag, not the active one.
+        epochTag: op.header.epochTag || '',
+        epoch: op.header.epoch || '0',
+        tries: 0
       })
     } else if (this._isDeleteContentOp(type)) {
       // A delete supersedes any pending durability re-append for this object —
@@ -1498,6 +1554,12 @@ class SyncEngine {
     if (!this.view) return false
     const T = this.ctx.ops.OP_TYPES
     try {
+      // [RT-FIX B9] A TOMBSTONED object counts as present/settled: its absence
+      // from the live rows is the result of a durable cross-device DELETE, not
+      // a migration rollback. Without this check a remote device's reconciler
+      // would re-append (with a fresh, winning Lamport) a row some other
+      // device deleted — resurrecting it vault-wide.
+      if (await this.view.isTombstoned(objectBlindId)) return true
       if (type === T.NOTE_UPSERT) {
         return !!(await this.view.getNoteSealed(objectBlindId))
       }
@@ -1557,10 +1619,25 @@ class SyncEngine {
       rec.presentStreak = 0
       if (!this.base.writable) continue
       if ((rec.tries || 0) >= 12) continue
+      // [design §3.9 step 4] Belt-and-suspenders: while a fresh-writer
+      // migration may still be in flight, do NOT re-append rows from an epoch
+      // OLDER than the active one — the rotation that superseded their epoch
+      // may itself still be settling, and pulling old-epoch rows through the
+      // churn is exactly the B4-shaped surface. Once the window passes they
+      // re-append normally (epoch-faithfully, below).
+      if (!stable && (rec.epochTag || '') !== (this.activeEpochTag || '')) continue
       rec.tries = (rec.tries || 0) + 1
       try {
         const reop = this._makeOp({
-          type: rec.type, schema: rec.schema, objectId: rec.objectId, payload: rec.payload, signer: this._localSigner()
+          type: rec.type,
+          schema: rec.schema,
+          objectId: rec.objectId,
+          payload: rec.payload,
+          signer: this._localSigner(),
+          // EPOCH-FAITHFUL re-append (B4): re-seal under the row's ORIGINAL
+          // epoch, never the active one (see _makeOp).
+          epochTag: rec.epochTag != null ? rec.epochTag : '',
+          epoch: rec.epoch != null ? rec.epoch : '0'
         })
         // Re-append through the serialized chain but do NOT await base.update()
         // here: update() can block for the full duration of an in-flight

@@ -352,35 +352,43 @@ export class MaterializedView {
     return out
   }
 
-  // ---- tombstones (SKELETON — design §3.9/§5.6, RT-FIX B9) -----------------
-  // Durable cross-device delete marker. Phase 1 ships ONLY the writer + reader;
-  // the reducer and durability reconciler do NOT consult it yet (Phase 5 wires
-  // it into delete-supersede / re-append suppression). The value is sealed so
+  // ---- tombstones (design §3.9/§5.6, RT-FIX B9 — WIRED in Phase 5) ---------
+  // Durable cross-device delete marker, written by the *_DELETE reducer
+  // branches and consulted by (a) the durability reconciler's _rowPresentFor —
+  // a tombstoned object counts as "present/settled" so a remote reconciler can
+  // never RESURRECT a row another device deleted — and (b) the *_UPSERT /
+  // CLIP_ADD reducer branches, which drop any incoming op that does not BEAT
+  // the tombstone by Lamport (stale replays die; a genuinely newer user
+  // re-create supersedes the tombstone and deletes it). Carries the deleting
+  // op's { lamport, deviceId } for that comparison. The value is sealed so
   // relays / at-rest see only ciphertext. Sealed under a self-describing
   // objectId derived from the public objectBlindId, like OBJMETA.
   tombstoneKey (objectBlindId) { return beeKey(PREFIX.TOMBSTONE, objectBlindId) }
 
-  async putTombstone (target, { objectBlindId, lamport }) {
+  async putTombstone (target, { objectBlindId, lamport, deviceId }) {
     return this.putSealed(target, this.tombstoneKey(objectBlindId), {
       objectId: 'tombstone:' + String(objectBlindId),
       objectBlindId,
       opType: 'TOMBSTONE',
       schema: this.ops.SCHEMAS.SETTING,
-      plaintext: { objectBlindId: String(objectBlindId), lamport: Number(lamport) || 0 }
+      plaintext: {
+        objectBlindId: String(objectBlindId),
+        lamport: Number(lamport) || 0,
+        deviceId: String(deviceId || '')
+      }
     })
   }
 
-  async isTombstoned (objectBlindId) {
+  async getTombstone (objectBlindId) {
     const env = await this.getSealedRaw(this.tombstoneKey(objectBlindId))
-    if (!env) return false
+    if (!env) return null
     try {
-      this.crypto.openWithObjectId({
-        vaultKey: this._getVaultKey(),
-        objectId: 'tombstone:' + String(objectBlindId),
-        envelope: env
-      })
-      return true
-    } catch (_) { return false }
+      return this.openRecord({ objectId: 'tombstone:' + String(objectBlindId), envelope: env })
+    } catch (_) { return null }
+  }
+
+  async isTombstoned (objectBlindId) {
+    return (await this.getTombstone(objectBlindId)) !== null
   }
 
   // ---- scans (sealed rows only) --------------------------------------------
