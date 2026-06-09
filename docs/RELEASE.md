@@ -181,6 +181,8 @@ code-signing certs now require hardware/HSM storage (see docs/SHIPPING.md).
 
 ### 3.2 Linux
 
+**System requirements:** the Pear runtime binary (and therefore the `.deb`/AppImage wrappers) requires **glibc 2.32 or newer** — roughly Ubuntu 22.04+, Debian 12+, Fedora 35+, RHEL/Rocky/Alma 9+. It will not launch on Ubuntu 20.04 LTS or other glibc 2.31 systems.
+
 Linux now has a concrete preflight/package helper:
 
 ```sh
