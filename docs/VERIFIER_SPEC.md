@@ -124,19 +124,41 @@ Proof line: `Log scan: no plaintext found.` / `... FAILED ...`.
 
 For each replicated op record visible to the verifier: the header must carry
 **only** public fields (`version, opId, vaultId, deviceId, type,
-objectBlindId, lamport, createdAtBucket`); the body must be a valid AEAD
-envelope; the op must be signed; the signer must be in the active device set;
-the Ed25519 signature over `canonical(header || ciphertext || nonce ||
-aadHash)` must verify. **FAIL** counts any bad/unsigned/unknown-signer op. If
-no op list is exposed, report `0 checked` — **never fabricate a pass**.
+objectBlindId, lamport, createdAtBucket`, and the optional epoch ride-along
+`epoch, epochTag`); the body must be a valid AEAD envelope; the op must be
+signed; the signer must be in the active device set; the Ed25519 signature over
+`canonical(header || ciphertext || nonce || aadHash)` must verify. **FAIL**
+counts any bad/unsigned/unknown-signer op. If no op list is exposed, report
+`0 checked` — **never fabricate a pass**.
 Proof line: `Operation signatures: N checked, all valid ...`.
 
-### C6 — Revoked-device rejection
+`epoch` (a small monotone ordering counter) and `epochTag` (an opaque
+content-addressing hash) are **public-only** ride-along fields on `KEY_ROTATE`
+and on post-rotation content ops (design §5.5). They leak only that a rotation
+count exists — never content, identity, or roster — and are validated exactly
+like the other public fields by the shared classifier. Legacy / epoch-0 ops
+omit both (epoch 0 ≡ `epochTag === ""`), so a pre-change envelope's keyId and
+AEAD AAD are byte-identical to before this change and verify unchanged.
+
+### C6 — Revoked-device rejection (STRICT epoch-binding)
 
 A signature from a device revoked at or before an op's epoch
 (`lamport >= revokedEpoch`) that was nonetheless **accepted** is a leak.
 **FAIL** if any such accepted op exists.
 Proof line: `Revoked-device check: revoked signatures rejected ...`.
+
+Epoch-binding is **strict**: there is no "tolerate a `header.epoch` newer than
+the row's creation epoch" relaxation (an earlier draft contemplated one; the
+locked design drops it because re-append is epoch-faithful — design §3.9). The
+content key itself enforces the binding cryptographically: an op's `epochTag`
+selects the item key, and `epochTag` is folded into both the epoch-bound `keyId`
+(`hash("keyid:" + epochTag + ":" + objectId)`, with the `epochTag === ""`
+legacy special case) and the AEAD AAD. A ciphertext authored under one epoch
+therefore **cannot** be opened under a different epoch's key — a wrong-epoch
+decrypt fails closed (AEAD failure), and the same object under two epochs
+carries two distinct `keyId`s, so it is unlinkable to a party lacking the epoch
+key. The verifier need not hold any epoch key to rely on this: it is a property
+of the seal, asserted by the Phase-0 crypto unit tests.
 
 ### C7 — Relay custody binding (when relay receipts exist)
 
@@ -178,9 +200,11 @@ order; object keys sorted ascending by code unit; strings/numbers/booleans/
 null encoded as standard JSON; no insignificant whitespace. (This matches
 `backend/crypto-envelope.js canonicalize()`.) AEAD is
 XChaCha20-Poly1305-IETF; the per-item key is
-`HKDF(vaultKey, "item:"+objectId)` with keyed-BLAKE2b as the HKDF PRF — but
-note an independent verifier does **not** need keys for C1–C4, which are the
-load-bearing privacy checks.
+`HKDF(epochKey, "item:"+objectId)` with keyed-BLAKE2b as the HKDF PRF, where
+`epochKey` is the selected epoch's content key (epoch 0 ≡ the per-vault
+`vaultKey`, `epochTag === ""`; higher epochs use a fresh-random key sealed only
+to surviving devices) — but note an independent verifier does **not** need keys
+for C1–C4, which are the load-bearing privacy checks.
 
 A reference independent verifier exists in-tree: `scripts/verify-encryption.js`
 deliberately performs C1/C3/C4 with a self-contained byte scan and only

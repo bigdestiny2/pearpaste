@@ -147,9 +147,38 @@ export function deriveVaultKeys (rootSeed) {
   }
 }
 
-// Per-item content key. itemKey = HKDF(vaultKey, "item:" + itemId)
-export function itemKey (vaultKey, itemId) {
-  return hkdf(vaultKey, 'item:' + itemId, KEY_BYTES)
+// Per-item content key. itemKey = HKDF(epochKey, "item:" + itemId).
+// The first argument is the selected *epoch key*: for epoch 0 (legacy /
+// existing vaults) it is the per-vault `vaultKey`, so every pre-existing
+// object's item key is byte-identical (lazy-migration anchor, design §2.2/§6).
+// Higher epochs pass a fresh-random `epochKey_e`. The parameter name is kept as
+// `epochKey` to make that generalization explicit; callers may still pass the
+// vaultKey for epoch 0.
+export function itemKey (epochKey, itemId) {
+  return hkdf(epochKey, 'item:' + itemId, KEY_BYTES)
+}
+
+// Epoch-bound content-key id (design §2.2, RT-FIX B4).
+//   keyId(epochTag, objectId) = hash("keyid:" + epochTag + ":" + objectId)
+// LEGACY SPECIAL CASE: epochTag === "" (epoch 0 / existing vaults) MUST reduce
+// to the historical `hash("keyid:" + objectId)` byte-for-byte so previously
+// stored rows still resolve to the same keyId. A non-empty epochTag binds the
+// epoch into the keyId, so the same object sealed under two different epochs
+// carries DIFFERENT keyIds and is unlinkable to a party lacking the epoch key.
+export function keyIdFor (epochTag, objectId) {
+  const preimage = (epochTag === '' || epochTag == null)
+    ? 'keyid:' + objectId
+    : 'keyid:' + epochTag + ':' + objectId
+  return b4a.toString(hash(preimage, 16), 'hex')
+}
+
+// Local-only swarm topic seed derived from an epoch key (design §3.3/§5.7,
+// RT-FIX B3). NEVER serialized or transmitted: each survivor recomputes it
+// after it unwraps its own epoch-key lockbox, so a party that never received
+// epochKey_e cannot compute topic_e. Epoch 0 callers derive the legacy topic
+// directly from `vaultKey` (design §3.7.1/§6), not via this helper.
+export function topicSeedFromEpochKey (epochKey) {
+  return hkdf(epochKey, 'swarm-topic-seed-v1', 32)
 }
 
 // Blind identifier: HMAC(indexKey, id) hex. Used for objectBlindId/tokenBlindId
@@ -187,19 +216,43 @@ function aadBytes (aad) {
   return canonicalize(aad)
 }
 
-// Seal plaintext into a CryptoEnvelope (spec §8.2). plaintext is any
-// JSON-serializable value. Returns the envelope plus the derived item key id.
-export function seal ({ vaultKey, objectId, objectBlindId, opType, schema, vaultId, plaintext }) {
-  if (!vaultKey || vaultKey.byteLength !== KEY_BYTES) throw new CryptoError('bad vaultKey', 'BAD_KEY')
-  const keyId = b4a.toString(hash('keyid:' + objectId, 16), 'hex')
-  const k = itemKey(vaultKey, objectId)
-  const nonce = randomBytes(NONCE_BYTES)
+// The selected epoch key. Canonically `epochKey`; `vaultKey` remains accepted
+// as the epoch-0 alias so existing callers (which still pass `vaultKey`) keep
+// working byte-for-byte (design §5.7, lazy-migration anchor).
+function resolveEpochKey (args) {
+  return args.epochKey != null ? args.epochKey : args.vaultKey
+}
+
+// Build the AEAD additional-data. LEGACY INVARIANT (design §5.5/§6): when
+// `epochTag === ""` the AAD MUST be byte-identical to the historical
+// { vaultId, objectBlindId, opType, schema } — the epoch field is OMITTED so
+// legacy envelopes canonicalize to the exact pre-change bytes and still open.
+// A NON-empty epochTag adds `epochTag` to the AAD so a cross-epoch ciphertext
+// splice / wrong-epoch decrypt fails closed under XChaCha20-Poly1305.
+function buildAad ({ vaultId, objectBlindId, opType, schema, epochTag }) {
   const aad = {
     vaultId: String(vaultId),
     objectBlindId: String(objectBlindId),
     opType: String(opType),
     schema: String(schema)
   }
+  if (epochTag != null && epochTag !== '') aad.epochTag = String(epochTag)
+  return aad
+}
+
+// Seal plaintext into a CryptoEnvelope (spec §8.2). plaintext is any
+// JSON-serializable value. Returns the envelope plus the derived item key id.
+// `epochKey` is the selected epoch's 32-byte content-key root (epoch 0 == the
+// per-vault vaultKey; `vaultKey` is accepted as a legacy alias). `epochTag`
+// content-addresses the epoch and defaults to "" (epoch 0 / existing vaults),
+// which preserves the legacy keyId + AAD bytes (design §2.2/§5.5/§6).
+export function seal ({ epochKey, vaultKey, epochTag = '', objectId, objectBlindId, opType, schema, vaultId, plaintext }) {
+  const ek = resolveEpochKey({ epochKey, vaultKey })
+  if (!ek || ek.byteLength !== KEY_BYTES) throw new CryptoError('bad epochKey', 'BAD_KEY')
+  const keyId = keyIdFor(epochTag, objectId)
+  const k = itemKey(ek, objectId)
+  const nonce = randomBytes(NONCE_BYTES)
+  const aad = buildAad({ vaultId, objectBlindId, opType, schema, epochTag })
   const message = canonicalize(plaintext)
   const cipher = b4a.allocUnsafe(message.byteLength + MAC_BYTES)
   sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(cipher, message, aadBytes(aad), null, nonce, k)
@@ -216,8 +269,10 @@ export function seal ({ vaultKey, objectId, objectBlindId, opType, schema, vault
 }
 
 // Open a CryptoEnvelope. Throws CryptoError('AEAD_FAIL') on any tamper.
-export function open ({ vaultKey, envelope }) {
-  if (!vaultKey || vaultKey.byteLength !== KEY_BYTES) throw new CryptoError('bad vaultKey', 'BAD_KEY')
+// `epochKey` (canonical) / `vaultKey` (legacy alias) is the selected epoch key.
+export function open ({ epochKey, vaultKey, envelope }) {
+  const ek = resolveEpochKey({ epochKey, vaultKey })
+  if (!ek || ek.byteLength !== KEY_BYTES) throw new CryptoError('bad epochKey', 'BAD_KEY')
   if (!envelope || envelope.v !== ENVELOPE_VERSION || envelope.alg !== ALG) {
     throw new CryptoError('unsupported envelope', 'BAD_ENVELOPE')
   }
@@ -229,12 +284,19 @@ export function open ({ vaultKey, envelope }) {
 
 // Open when the caller knows the plaintext objectId (it always does locally,
 // because the local index maps objectBlindId -> objectId under indexKey).
-export function openWithObjectId ({ vaultKey, objectId, envelope }) {
-  if (!vaultKey || vaultKey.byteLength !== KEY_BYTES) throw new CryptoError('bad vaultKey', 'BAD_KEY')
+// `epochKey` (canonical) / `vaultKey` (legacy alias) is the selected epoch key.
+// The AAD that authenticates the ciphertext is taken verbatim from the stored
+// `envelope.aad`, so a legacy envelope (no epochTag in its stored AAD) opens
+// unchanged, and a new-epoch envelope only opens when decrypted under the epoch
+// key that produced its epochTag-bound AAD (cross-epoch splice fails closed,
+// design §5.5).
+export function openWithObjectId ({ epochKey, vaultKey, objectId, envelope }) {
+  const ek = resolveEpochKey({ epochKey, vaultKey })
+  if (!ek || ek.byteLength !== KEY_BYTES) throw new CryptoError('bad epochKey', 'BAD_KEY')
   if (!envelope || envelope.v !== ENVELOPE_VERSION || envelope.alg !== ALG) {
     throw new CryptoError('unsupported envelope', 'BAD_ENVELOPE')
   }
-  const k = itemKey(vaultKey, objectId)
+  const k = itemKey(ek, objectId)
   const cipher = b4a.from(envelope.ciphertext, 'hex')
   const nonce = b4a.from(envelope.nonce, 'hex')
   if (cipher.byteLength < MAC_BYTES) {
@@ -326,6 +388,8 @@ export default {
   pwhashWithSalt,
   deriveVaultKeys,
   itemKey,
+  keyIdFor,
+  topicSeedFromEpochKey,
   blindId,
   canonicalize,
   aadHashOf,

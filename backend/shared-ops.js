@@ -40,7 +40,13 @@ export const FIELD_CLASS = Object.freeze({
 
 const HEADER_PUBLIC_FIELDS = new Set([
   'version', 'opId', 'vaultId', 'deviceId', 'type',
-  'objectBlindId', 'lamport', 'createdAtBucket'
+  'objectBlindId', 'lamport', 'createdAtBucket',
+  // Epoch ride-along (design §5.5, RT-FIX B5): `epoch` is a small monotone
+  // ordering counter and `epochTag` an opaque content-addressing hash. Both are
+  // public-only — they leak that a rotation count exists, never content,
+  // identity, or roster — so KEY_ROTATE / post-rotation content ops carrying
+  // them pass assertHeaderPublicOnly. Legacy/epoch-0 ops omit them entirely.
+  'epoch', 'epochTag'
 ])
 
 const FORBIDDEN_FIELDS = new Set([
