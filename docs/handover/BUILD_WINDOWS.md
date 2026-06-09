@@ -43,10 +43,11 @@ set PEARPASTE_LINK=pear://<fork>.<length>.<key>
 ## 4. Build the `.exe`
 
 **Unsigned (no cert — recommended first build)**
-> ⏳ **PENDING** — the no-cert build path is being finalized by the packaging
-> pipeline. Expected: `npm run build:win` (with `PEARPASTE_LINK` set, no cert
-> env) → an unsigned `dist\win32\...\Paste.exe`. The maintainer will confirm
-> this exact command when the pipeline lands.
+```bat
+npm run build:win:unsigned
+```
+Packages the win32-x64 app via `pear build --win32-x64-app` and skips signing →
+an unsigned `dist\win32\...\Paste.exe`. (SmartScreen warns until it's signed.)
 
 **Signed (Authenticode)**
 ```bat
@@ -59,10 +60,13 @@ npm run release:win
 then `signtool sign /fd SHA256 /tr <TSA> /td SHA256` over the produced
 `bin\*-app\*.exe`. It **fails closed** without `PEARPASTE_WIN_CERT`.
 
-> ⏳ **PENDING** — `release:win` currently expects `PEARPASTE_WIN_WRAPPER` (the
-> win32-x64 app dir, basename must be exactly `Paste`). The packaging pipeline
-> is streamlining how that app dir is produced; the maintainer will confirm the
-> final invocation on commit.
+> ⚠️ **First-build check:** `pear build --win32-x64-app` needs the win32-x64 app
+> dir (basename `Paste`). On the first real build, confirm whether `pear build`
+> synthesizes it from the staged project or needs a pre-built dir passed via
+> `PEARPASTE_WIN_WRAPPER` (a `TODO(verify pear)` is flagged in
+> `scripts/build-windows.mjs`). If it asks for one, point `PEARPASTE_WIN_WRAPPER`
+> at the produced app dir and re-run. Report what you see — the maintainer will
+> lock this down after the first run.
 
 ## 5. (Optional) Installer
 Wrap the signed app dir with NSIS or WiX → `PearPaste-Setup.exe`, then

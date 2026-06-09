@@ -7,18 +7,18 @@ Windows and Linux boxes (macOS `.dmg` is built on the Mac). Pair these with
 - [`BUILD_WINDOWS.md`](BUILD_WINDOWS.md) — produce `Paste.exe` (+ optional `Setup.exe`)
 - [`BUILD_LINUX.md`](BUILD_LINUX.md) — produce `paste_<ver>_amd64.deb` (+ AppImage, tarball)
 
-> ⚠️ The exact **build command** in each runbook is being finalized by the
-> packaging pipeline (it adds the `.deb` builder, an unsigned/no-cert build
-> path, and a macOS build script). Those lines are marked **⏳ PENDING** and
-> will be locked when the pipeline lands. Everything else below is stable —
-> provision the boxes now.
+> ✅ The packaging pipeline has landed, so the build commands are final:
+> Windows `npm run build:win:unsigned`, Linux `npm run build:linux` (emits the
+> `.deb`), macOS `npm run build:mac` (built on the Mac). One **first-build
+> check** remains — whether `pear build --<platform>-app` needs a pre-built app
+> dir — flagged in the Windows runbook.
 
 ## The handover chain (who does what)
 
 | # | Step | Owner | Status |
 |---|------|-------|--------|
 | 1 | Land the multiwriter durability fix | maintainer (in progress) | ⏳ agent running |
-| 2 | Land the packaging pipeline (`.deb`, unsigned mode, `build-macos`, `release.yml`) | maintainer (in progress) | ⏳ agent running |
+| 2 | Land the packaging pipeline (`.deb`, unsigned mode, `build-macos`, `release.yml`) | maintainer | ✅ landed (`5ce9ae5`) |
 | 3 | Push the build branch to GitHub so the boxes can `git clone`/checkout it | maintainer | ⏳ after 1–2 (will confirm repo visibility / whether to exclude internal `REVIEW.md`) |
 | 4 | Stage production on the Mac → versioned `pear://` link | maintainer | ⏳ after 1 (so the shipped app includes the fix) |
 | 5 | Hand off the build branch + the `pear://` link + the runbooks | maintainer | ⏳ |

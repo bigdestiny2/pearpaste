@@ -47,11 +47,10 @@ npm run build:linux
 Produces `dist/linux/pearpaste-<version>-linux-x64.tar.gz` (+ `.sha256`), and —
 when `appimagetool` is present — an `.AppImage` (+ `.sha256`).
 
-> ⏳ **PENDING** — the `.deb` builder is being added by the packaging pipeline
-> (the current script emits the tarball + AppImage only). Once it lands,
-> `npm run build:linux` will also emit `dist/linux/paste_<version>_amd64.deb`
-> (gated on `dpkg-deb`). The maintainer will confirm the exact command/output
-> name when the pipeline commits.
+`npm run build:linux` also emits `dist/linux/paste_<version>_amd64.deb` (gated
+on `dpkg-deb`; skips gracefully if it's missing), alongside the tarball and the
+optional AppImage. Use `npm run build:linux:unsigned` to force the unsigned path
+explicitly. (The `.deb`'s arch follows the box: `amd64` on an x64 runner.)
 
 **Release (signed + checksummed)**
 ```sh
