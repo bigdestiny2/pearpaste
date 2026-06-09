@@ -34,7 +34,20 @@ export const PREFIX = Object.freeze({
   // local-only meta written by the reducer into the *replicated* view so a
   // freshly-synced device can recover blindId -> {objectId,type} mappings it
   // needs to decrypt. The value is itself a sealed envelope (no plaintext).
-  OBJMETA: 'objmeta!'
+  OBJMETA: 'objmeta!',
+  // Epoch-key wrap family (design §2.4/§5.6, RT-FIX B5). One sealed row per
+  // (epochTag, entitled device): the value carries `crypto_box_seal(epochKey,
+  // device.boxPubkey)` so only the target device's box secret key opens it.
+  // CRITICAL: keyed by `epochTag` (a collision-safe content hash), NEVER the
+  // integer epoch — two concurrent rotations are both integer N+1 but carry
+  // distinct tags, so an integer key would silently overwrite one (B5). Phase 1
+  // only defines the family + reader; no rows are written until rotation (P2).
+  EPOCHKEYS: 'epochkeys!',
+  // Durable cross-device tombstone family (design §3.9/§5.6, RT-FIX B9). A
+  // delete writes a persistent sealed row so the durability reconciler cannot
+  // resurrect the object under a new epoch. Phase 1 is a SKELETON: writer +
+  // reader only, NOT consulted by the reducer or reconciler yet (that is P5).
+  TOMBSTONE: 'tombstone!'
 })
 
 // Tombstone sentinel kept inside the sealed value (never a raw key delete) so
@@ -225,6 +238,96 @@ export class MaterializedView {
     const env = await this.getSealedRaw(this.vaultStateKey())
     if (!env) return null
     return this.openRecord({ objectId: 'vault-state:v1', envelope: env })
+  }
+
+  // ---- epoch-key wraps (design §2.4/§5.6, RT-FIX B5) -----------------------
+  // Per-(epochTag, device) sealed lockbox rows so an offline / rebooted / late
+  // device recovers its epoch keys DETERMINISTICALLY from the committed view
+  // after any truncation, and two concurrent rotations coexist without
+  // colliding. The row VALUE is at-rest-sealed under the view key; the `sealed`
+  // field inside it is itself a `crypto_box_seal` only the target device's box
+  // secret key opens. The ROW KEY blinds (epochTag, wrapBlindId) so the family
+  // does not reveal the roster (B10). The row is sealed under a self-describing
+  // objectId derived from the row's own blindId (same chicken/egg dodge as
+  // OBJMETA) so any device holding indexKey can open it with no external state.
+  // Phase 1 ships this family + reader only; rows are written at rotation (P2).
+  epochKeysRowBlindId (epochTag, wrapBlindId) {
+    return this.blindId('epochkey:' + String(epochTag) + ':' + String(wrapBlindId))
+  }
+
+  epochKeysKey (epochTag, wrapBlindId) {
+    return beeKey(PREFIX.EPOCHKEYS, this.epochKeysRowBlindId(epochTag, wrapBlindId))
+  }
+
+  async putEpochKeyWrap (target, { epochTag, epoch, blindId, sealed }) {
+    const rowBlindId = this.epochKeysRowBlindId(epochTag, blindId)
+    return this.putSealed(target, this.epochKeysKey(epochTag, blindId), {
+      objectId: 'epochkey:' + rowBlindId,
+      objectBlindId: rowBlindId,
+      opType: 'EPOCH_KEY_WRAP',
+      schema: this.ops.SCHEMAS.SETTING,
+      plaintext: { epochTag: String(epochTag), epoch: Number(epoch) || 0, blindId: String(blindId), sealed: String(sealed) }
+    })
+  }
+
+  // Return the wrap rows addressed to `deviceId`: filter the family to rows
+  // whose stored wrap `blindId` equals blindId(indexKey,
+  // "epochwrap:"+epochTag+":"+deviceId). The caller (the engine rebuild)
+  // unwraps each `sealed` with its own box secret key. Rows we cannot open
+  // (different device / not entitled) are skipped, never throw.
+  async listEpochKeyWrapsFor (deviceId) {
+    const out = []
+    for await (const { key } of this.bee.createReadStream({
+      gte: PREFIX.EPOCHKEYS, lt: PREFIX.EPOCHKEYS + '~'
+    })) {
+      const rowBlindId = key.slice(PREFIX.EPOCHKEYS.length)
+      const env = await this.getSealedRaw(key)
+      if (!env) continue
+      let plain = null
+      try {
+        plain = this.crypto.openWithObjectId({
+          vaultKey: this._getVaultKey(),
+          objectId: 'epochkey:' + rowBlindId,
+          envelope: env
+        })
+      } catch (_) { plain = null }
+      if (!plain || plain.blindId == null) continue
+      const want = this.blindId('epochwrap:' + String(plain.epochTag) + ':' + String(deviceId))
+      if (plain.blindId !== want) continue
+      out.push({ epochTag: String(plain.epochTag), epoch: Number(plain.epoch) || 0, sealed: String(plain.sealed) })
+    }
+    return out
+  }
+
+  // ---- tombstones (SKELETON — design §3.9/§5.6, RT-FIX B9) -----------------
+  // Durable cross-device delete marker. Phase 1 ships ONLY the writer + reader;
+  // the reducer and durability reconciler do NOT consult it yet (Phase 5 wires
+  // it into delete-supersede / re-append suppression). The value is sealed so
+  // relays / at-rest see only ciphertext. Sealed under a self-describing
+  // objectId derived from the public objectBlindId, like OBJMETA.
+  tombstoneKey (objectBlindId) { return beeKey(PREFIX.TOMBSTONE, objectBlindId) }
+
+  async putTombstone (target, { objectBlindId, lamport }) {
+    return this.putSealed(target, this.tombstoneKey(objectBlindId), {
+      objectId: 'tombstone:' + String(objectBlindId),
+      objectBlindId,
+      opType: 'TOMBSTONE',
+      schema: this.ops.SCHEMAS.SETTING,
+      plaintext: { objectBlindId: String(objectBlindId), lamport: Number(lamport) || 0 }
+    })
+  }
+
+  async isTombstoned (objectBlindId) {
+    const env = await this.getSealedRaw(this.tombstoneKey(objectBlindId))
+    if (!env) return false
+    try {
+      this.crypto.openWithObjectId({
+        vaultKey: this._getVaultKey(),
+        objectId: 'tombstone:' + String(objectBlindId),
+        envelope: env
+      })
+      return true
+    } catch (_) { return false }
   }
 
   // ---- scans (sealed rows only) --------------------------------------------

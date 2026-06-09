@@ -45,6 +45,22 @@ class SyncEngine {
     this.rootPubkey = null
     this.keyEpoch = 0 // bumped by KEY_ROTATE; ops below current epoch from a
     // revoked signer are rejected (spec §8.4 "replayed old op rejected").
+    // ---- epoch content-key machinery (design §5.2, RT-FIX B5) -------------
+    // epochKeys maps epochTag -> 32-byte content key. The reserved entry
+    // "" -> vaultKey is the EPOCH-0 LAZY-MIGRATION ANCHOR (design §6): every
+    // existing vault is epoch 0 / epochTag "" / epochKey == vaultKey, so
+    // sealing+opening under it is byte-identical to the pre-epoch code. Higher
+    // epochTags hold fresh-random keys unwrapped from this device's committed
+    // `epochkeys!` lockboxes (added in Phase 2). activeEpoch is the monotone
+    // integer (ordering hint); activeEpochTag is the content-addressing winner
+    // new writes seal under. Phase 1 ships ONLY epoch 0: there is no rotation,
+    // so these stay 0 / "" for every vault and new content seals under vaultKey.
+    // ALL THREE are a PURE FUNCTION of the committed view — rebuilt in
+    // _rebuildAuthFromView each apply pass (reorg-safe), exactly like the device
+    // cache — never held only in volatile memory.
+    this.epochKeys = new Map()
+    this.activeEpoch = 0
+    this.activeEpochTag = ''
     this._appliedOps = new Map() // opId -> op snapshot for verifier coverage.
     // Per-engine append SERIALIZATION chain (CONCURRENT APPEND DROP fix).
     // Autobase's append layer keeps shared mutable bookkeeping (this._appending
@@ -79,6 +95,14 @@ class SyncEngine {
 
   get vaultKey () { return this.ctx.state.vaultKeys && this.ctx.state.vaultKeys.vaultKey }
   get indexKey () { return this.ctx.state.vaultKeys && this.ctx.state.vaultKeys.indexKey }
+  // This device's identity material, used to unwrap its own committed
+  // `epochkeys!` lockboxes during the reorg-safe rebuild (Phase 2 writes the
+  // wraps; Phase 1 only reads — for epoch 0 there are none, so these are unused
+  // until a real rotation). boxSecretKey is local-only secret material that
+  // lives in state.device, never replicated.
+  get myDeviceId () { return this.ctx.state.device && this.ctx.state.device.deviceId }
+  get myBoxPubkey () { return this.ctx.state.device && this.ctx.state.device.boxPubkey }
+  get myBoxSecretKey () { return this.ctx.state.device && this.ctx.state.device.boxSecretKey }
 
   // --- open / close --------------------------------------------------------
   async open () {
@@ -166,6 +190,15 @@ class SyncEngine {
     this.writerToDevice.clear()
     this._appliedOps.clear()
     this._pendingDurable.clear()
+    // Drop epoch content-key state so no buffer reference survives teardown.
+    // index.js wipes state.vaultKeys.vaultKey IN PLACE on lock; the epoch-0
+    // anchor (epochKeys.set("", vaultKey)) aliases that very buffer, so a stale
+    // entry kept across lock would point at zeroed bytes and fail AEAD on the
+    // next unlock. Cleared here; _rebuildAuthFromView re-establishes the
+    // "" -> vaultKey anchor from the fresh state.vaultKeys on reopen.
+    this.epochKeys.clear()
+    this.activeEpoch = 0
+    this.activeEpochTag = ''
   }
 
   // --- op construction -----------------------------------------------------
@@ -177,6 +210,15 @@ class SyncEngine {
     const ops = ctx.ops
     const objectBlindId = crypto.blindId(this.indexKey, objectId)
     const lamport = ctx.state.lamport.tick()
+    // Active epoch stamping (design §5.4). Phase 1: activeEpoch is 0 and
+    // activeEpochTag is "" for every vault, so `epoch:"0"`/`epochTag:""` and the
+    // seal below resolve to vaultKey + the legacy keyId/AAD bytes — byte-identical
+    // to the pre-epoch op. (Re-append by _reconcileDurability also flows through
+    // here; for Phase 1 the active tag == the only tag "", so re-seal is faithful.
+    // Phase 5 will thread the pending entry's ORIGINAL epochTag for cross-epoch
+    // re-append per §3.9.)
+    const epochTag = this.activeEpochTag || ''
+    const epochKey = this.epochKeys.get(epochTag) || this.vaultKey
     const header = {
       version: 1,
       opId: b4a.toString(crypto.randomBytes(16), 'hex'),
@@ -185,12 +227,15 @@ class SyncEngine {
       type,
       objectBlindId,
       lamport: String(lamport),
-      createdAtBucket: ops.timeBucket()
+      createdAtBucket: ops.timeBucket(),
+      epoch: String(this.activeEpoch || 0),
+      epochTag
     }
     ops.assertHeaderPublicOnly(header) // §22: classify every replicated field
 
     const envelope = crypto.seal({
-      vaultKey: this.vaultKey,
+      epochKey,
+      epochTag,
       objectId: this._opBodyObjectId(objectBlindId),
       objectBlindId,
       opType: type,
@@ -328,6 +373,11 @@ class SyncEngine {
       const rec = {
         deviceId: plain.deviceId,
         signingPubkey: plain.signingPubkey,
+        // boxPubkey is ALREADY sealed in the device record at putDevice — only
+        // the in-memory projection dropped it. Carry it through so a later
+        // rotation (Phase 2) can seal epoch keys to each surviving device's box
+        // pubkey straight from the reorg-safe cache (design §5.1, gap fix).
+        boxPubkey: plain.boxPubkey,
         writerKey: plain.writerKey,
         roles: plain.roles || ['writer'],
         revokedAtLamport: (plain.revokedAtLamport == null ? null : Number(plain.revokedAtLamport)),
@@ -348,6 +398,42 @@ class SyncEngine {
     // keyEpoch is monotonic and only persisted in vault-state / KEY_ROTATE.
     const viewEpoch = vs && Number.isFinite(Number(vs.keyEpoch)) ? Number(vs.keyEpoch) : 0
     this.keyEpoch = Math.max(viewEpoch, prevEpoch || 0)
+
+    // ---- epoch content-key state, a PURE FUNCTION of the committed view ----
+    // (design §5.2, RT-FIX B5). Rebuilt here alongside the device cache so a
+    // fork/reorg that truncates+replays a rotation recomputes IDENTICAL epoch
+    // state from the post-truncation `vault-state` + `epochkeys!` rows, never
+    // retaining rolled-back keys. Phase 1: the view holds no non-zero epoch and
+    // no wrap rows, so this deterministically yields activeEpoch 0 /
+    // activeEpochTag "" / epochKeys{ "" -> vaultKey } for every existing vault.
+    const prevActiveEpoch = this.activeEpoch || 0
+    // activeEpoch is monotone (a max-merge, like keyEpoch) so a transient reorg
+    // cannot move it backwards mid-session; activeEpochTag follows the winner
+    // the committed view recorded (defaults to "" when no rotation has landed).
+    this.activeEpoch = Math.max(Number((vs && vs.activeEpoch) || 0), prevActiveEpoch)
+    this.activeEpochTag = (vs && vs.activeEpochTag) || ''
+    // Rebuild epochKeys from scratch so a truncation never leaves a stale key.
+    this.epochKeys.clear()
+    // Epoch-0 lazy-migration anchor: epochKey_0 == vaultKey (design §6). Always
+    // present (even on an empty/genesis view) so epoch-0 seal/open is the
+    // byte-identical pre-epoch path.
+    if (this.vaultKey) this.epochKeys.set('', this.vaultKey)
+    // Layer in every committed epoch-key lockbox addressed to THIS device,
+    // keyed by epochTag (NEVER the integer — B5). For epoch 0 there are none.
+    // A wrap we cannot open (not entitled / different device) is skipped, not
+    // fatal — Phase 5/§3.10 turns that into a pending-gap; here it is simply
+    // absent. Box material may be missing in a lightweight test ctx; guard it.
+    if (this.view && this.myDeviceId && this.myBoxPubkey && this.myBoxSecretKey && this.ctx.identity) {
+      let wraps = []
+      try { wraps = await this.view.listEpochKeyWrapsFor(this.myDeviceId) } catch (_) { wraps = [] }
+      for (const { epochTag, sealed } of wraps) {
+        if (!epochTag) continue // tag "" is the vaultKey anchor, set above
+        try {
+          const k = this.ctx.identity.openSealedToDevice(this.myBoxPubkey, this.myBoxSecretKey, sealed)
+          this.epochKeys.set(epochTag, k)
+        } catch (_) { /* not our wrap / not entitled — pending-gap (§3.10, P5) */ }
+      }
+    }
   }
 
   // --- reducer (deterministic; spec §9.5) ----------------------------------
@@ -452,8 +538,16 @@ class SyncEngine {
 
   _body (op) {
     // decrypt op body in memory (spec §9.2). Caller must already trust signer.
+    // Select the content key by the op's own header.epochTag (design §5.4): a
+    // missing/empty tag (every pre-epoch row, and all of Phase 1) falls back to
+    // vaultKey == epochKey_0, so legacy ops open byte-identically. A later-epoch
+    // row opens only on a device that holds that tag's key in epochKeys; the AAD
+    // is taken verbatim from the stored envelope, so cross-epoch decrypt fails
+    // closed under XChaCha20-Poly1305.
+    const tag = String((op.header && op.header.epochTag) || '')
     return this.ctx.crypto.openWithObjectId({
-      vaultKey: this.vaultKey,
+      epochKey: this.epochKeys.get(tag) || this.vaultKey,
+      epochTag: tag,
       objectId: this._opBodyObjectId(op.header && op.header.objectBlindId),
       envelope: op.envelope
     })

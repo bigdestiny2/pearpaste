@@ -118,6 +118,25 @@ export class VaultStore {
         indexKey: b4a.toString(vaultSecrets.indexKey, 'hex'),
         deviceAdminSeed: b4a.toString(vaultSecrets.deviceAdminSeed, 'hex')
       }
+      // Optional epoch chain + follow seed (design §2.3/§5.9). Additive:
+      // omitted for epoch-0-only vaults (the existing case), where epoch 0 is
+      // the already-stored `vaultKey` (tag "") — no schema bump. `epochKeys` is
+      // a hex map keyed by EPOCHTAG (never the integer — B5); Phase 2 persists a
+      // newly-unwrapped key here at rotation, Phase 4 the pairing-delivered key.
+      // `followSeed` (§4) is delivered at pairing and never rotated. Buffers are
+      // hex-encoded; pre-encoded hex strings are accepted as-is.
+      if (vaultSecrets.epochKeys && typeof vaultSecrets.epochKeys === 'object') {
+        const ek = {}
+        for (const [tag, key] of Object.entries(vaultSecrets.epochKeys)) {
+          ek[tag] = b4a.isBuffer(key) ? b4a.toString(key, 'hex') : String(key)
+        }
+        plaintext.vault.epochKeys = ek
+      }
+      if (vaultSecrets.followSeed != null) {
+        plaintext.vault.followSeed = b4a.isBuffer(vaultSecrets.followSeed)
+          ? b4a.toString(vaultSecrets.followSeed, 'hex')
+          : String(vaultSecrets.followSeed)
+      }
     }
     const envelope = seal({
       vaultKey: wrapKey,
@@ -166,6 +185,20 @@ export class VaultStore {
         vaultKey: b4a.from(pt.vault.vaultKey, 'hex'),
         indexKey: b4a.from(pt.vault.indexKey, 'hex'),
         deviceAdminSeed: b4a.from(pt.vault.deviceAdminSeed, 'hex')
+      }
+      // Parse the optional epoch chain + follow seed back to Buffers (design
+      // §5.9). Absent for epoch-0-only vaults — epoch 0 (tag "") is the already
+      // present `vaultKey`, so the engine rebuilds the "" -> vaultKey anchor on
+      // its own. Keyed by epochTag, never the integer (B5).
+      if (pt.vault.epochKeys && typeof pt.vault.epochKeys === 'object') {
+        const ek = {}
+        for (const [tag, hex] of Object.entries(pt.vault.epochKeys)) {
+          try { ek[tag] = b4a.from(String(hex), 'hex') } catch (_) {}
+        }
+        out.vault.epochKeys = ek
+      }
+      if (pt.vault.followSeed != null) {
+        try { out.vault.followSeed = b4a.from(String(pt.vault.followSeed), 'hex') } catch (_) {}
       }
     }
     if (legacyWrap) {
