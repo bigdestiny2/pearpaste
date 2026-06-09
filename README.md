@@ -75,7 +75,7 @@ is real and tested from day one.
 
 | Target | Stack | Location | Status |
 |---|---|---|---|
-| **Pear desktop** | `pear-electron` shell + Bare Pear-end | repo root (`index.js`, `index.html`, `ui/`, `backend/`) | macOS / Windows / Linux. Runs via `pear run --dev .`; Win/Linux packaging scripts present. |
+| **Pear desktop** | `pear-electron` shell + Bare Pear-end | repo root (`index.js`, `index.html`, `ui/`, `backend/`) | macOS / Windows / Linux (Linux requires glibc 2.32+, i.e. Ubuntu 22.04+). Runs via `pear run --dev .`; Win/Linux packaging scripts present. |
 | **Mobile — RN-CLI** | React Native 0.81 + `react-native-bare-kit` | `mobile/PearPasteMobile/` | Build-verified shell (Android debug APK builds; iOS Simulator launch documented). |
 | **Mobile — Expo** | Expo + `react-native-bare-kit` | `mobile/pearpaste-expo/` | Renders the shared `mobile/app/` UI; not release-verified as committed. |
 | **Shared mobile worklet** | Bare worklet re-exporting the desktop backend | `mobile/app/`, `mobile/backend/` | One UI + one Pear-end shared by both shells — no crypto/sync divergence. |
