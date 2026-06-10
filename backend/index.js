@@ -65,6 +65,26 @@ function makeLogger () {
   }
 }
 
+async function flushSwarmBestEffort (swarm, log, label, timeoutMs = 2500) {
+  if (!swarm || typeof swarm.flush !== 'function') return { ok: false, timedOut: false }
+  let timer = null
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ ok: false, timedOut: true }), timeoutMs)
+    if (timer.unref) timer.unref()
+  })
+  const flush = Promise.resolve()
+    .then(() => swarm.flush())
+    .then(
+      () => ({ ok: true, timedOut: false }),
+      (err) => ({ ok: false, timedOut: false, err })
+    )
+  const result = await Promise.race([flush, timeout])
+  if (timer) clearTimeout(timer)
+  if (result.timedOut) log.warn(label + '-timeout', { timeoutMs })
+  else if (result.err) log.warn(label + '-failed', { err: String((result.err && result.err.message) || result.err) })
+  return result
+}
+
 export async function createPearEnd ({ storagePath, log = makeLogger(), relayClientFactory, swarm: injectedSwarm = null } = {}) {
   if (!storagePath) throw new Error('createPearEnd requires storagePath')
 
@@ -514,8 +534,11 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     // contributing to the 30 s pairing timeout we used to see on slow links.
     await discovery.flushed()
     log.info('pair-create-discovery-flushed')
-    try { await swarm.flush() } catch (_) {}
-    log.info('pair-create-swarm-flushed', { swarmConnCount: (swarm.connections && swarm.connections.size) || 0 })
+    const flushed = await flushSwarmBestEffort(swarm, log, 'pair-create-swarm-flush')
+    log.info('pair-create-swarm-flushed', {
+      swarmConnCount: (swarm.connections && swarm.connections.size) || 0,
+      timedOut: flushed.timedOut
+    })
 
     // Short-code rendezvous: announce on a SECOND DHT topic derived from the
     // displayed short code. Any peer that joins gets the full invite payload
