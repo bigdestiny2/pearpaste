@@ -9,12 +9,14 @@
 //
 // Wire protocol (both directions, newline-delimited JSON):
 //   renderer -> worker : { id, command, params }
+//   renderer -> worker : { type:'visibility', visible:boolean }
 //   worker  -> renderer: { id, ok, result } | { id, ok:false, error }
 //   worker  -> renderer: { type:'event', event, payload }   (backend events)
 
 import pearPipe from 'pear-pipe'
 import { createPearEnd } from './index.js'
 import { createBridge } from './desktop-bridge.js'
+import { attachDesktopWorkerPipe } from './desktop-worker-protocol.js'
 
 function log (level, msg, extra) {
   // stdout/stderr of a pear-run child surfaces in the parent `pear run` output.
@@ -51,32 +53,8 @@ if (!wire) {
     try { wire.write(JSON.stringify(m) + '\n') } catch (_) {}
   })
 
-  // renderer -> worker: newline-delimited JSON requests
-  let buf = ''
-  wire.on('data', async (chunk) => {
-    buf += chunk.toString()
-    let nl
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).trim()
-      buf = buf.slice(nl + 1)
-      if (!line) continue
-      let msg
-      try { msg = JSON.parse(line) } catch (_) { continue }
-      let res
-      try {
-        res = await bridge.request(msg)
-        if (res && res.result && res.result._promise) res.result = await res.result._promise
-      } catch (err) {
-        res = { id: msg && msg.id, ok: false, error: { message: String((err && err.message) || err), code: err && err.code } }
-      }
-      const out = JSON.stringify(res) + '\n'
-      log('debug', 'rpc-res', { id: res && res.id, cmd: msg && msg.command, ok: res && res.ok, code: res && res.error && res.error.code, bytes: out.length })
-      try { wire.write(out) } catch (e) { log('warn', 'rpc-res-write-failed', { err: String((e && e.message) || e) }) }
-    }
-  })
-
-  wire.on('end', () => { try { wire.end() } catch (_) {} })
-  wire.on('error', (err) => log('warn', 'desktop-worker-pipe-error', { err: String((err && err.message) || err) }))
+  // renderer -> worker: newline-delimited JSON requests + lifecycle messages
+  attachDesktopWorkerPipe({ wire, bridge, log })
 
   if (globalThis.Pear && typeof globalThis.Pear.teardown === 'function') {
     globalThis.Pear.teardown(async () => { try { await pearEnd.close() } catch (_) {} })

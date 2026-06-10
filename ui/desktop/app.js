@@ -172,14 +172,29 @@ bridge.onEvent((event, payload) => {
   render()
 })
 
-// Backgrounding clears the open item (spec §9.4/§15). The shell signals this
-// to the backend; here we also clear UI state defensively.
+// Backgrounding clears the open item (spec §9.4/§15). Signal the backend over
+// the desktop bridge; here we also clear UI state defensively.
+let _lastBackendVisible = null
+function setBackendVisibility (visible) {
+  const v = !!visible
+  if (_lastBackendVisible === v) return
+  _lastBackendVisible = v
+  if (bridge && typeof bridge.setVisibility === 'function') {
+    try { bridge.setVisibility(v) } catch (_) {}
+  }
+}
+
 window.addEventListener('blur', () => {
+  setBackendVisibility(false)
   if (S.open) { setBanner('warn', 'Window backgrounded — opened item closed.', false) }
   clearOpen(true)
   render()
 })
+window.addEventListener('focus', () => {
+  setBackendVisibility(true)
+})
 document.addEventListener('visibilitychange', () => {
+  setBackendVisibility(!document.hidden)
   if (document.hidden && S.open) { clearOpen(true); render() }
 })
 

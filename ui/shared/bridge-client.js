@@ -68,6 +68,7 @@ export function createBridgeClient () {
   }
 
   let request
+  let setVisibility = () => {}
 
   if (inproc && typeof inproc.request === 'function') {
     // In-process bridge (dev/e2e and the default pear-electron same-proc UI).
@@ -82,6 +83,11 @@ export function createBridgeClient () {
       if (res.result && res.result._promise) res.result = await res.result._promise
       if (!res.ok) { const e = new Error(res.error?.message || 'rpc error'); e.code = res.error?.code; throw e }
       return res.result
+    }
+    if (typeof inproc.setVisibility === 'function') {
+      setVisibility = (visible) => {
+        try { inproc.setVisibility(!!visible) } catch (_) {}
+      }
     }
   } else if (pipe && typeof pipe.write === 'function') {
     // Newline-JSON pipe transport.
@@ -125,12 +131,21 @@ export function createBridgeClient () {
         if (p) { pending.delete(msg.id); p(msg) }
       }
     })
+    const sendPipeMessage = (msg) => pipe.write(JSON.stringify(msg) + '\n')
+    setVisibility = (visible) => {
+      try { sendPipeMessage({ type: 'visibility', visible: !!visible }) } catch (_) {}
+    }
     request = (command, params) => new Promise((resolve, reject) => {
       const id = ++_seq
       pending.set(id, (res) => {
         if (!res.ok) { const e = new Error(res.error?.message || 'rpc error'); e.code = res.error?.code; reject(e) } else resolve(res.result)
       })
-      pipe.write(JSON.stringify({ id, command, params }) + '\n')
+      try {
+        sendPipeMessage({ id, command, params })
+      } catch (err) {
+        pending.delete(id)
+        reject(err)
+      }
     })
   } else {
     // No transport yet — fail loudly but recoverably so the UI can show a
@@ -141,6 +156,7 @@ export function createBridgeClient () {
   const api = {
     onEvent,
     call: request,
+    setVisibility,
     // typed helpers (thin — the contract is the backend's)
     createVault: (p) => request('CREATE_VAULT', p),
     restoreVault: (p) => request('RESTORE_VAULT', p),

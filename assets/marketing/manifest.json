@@ -1,0 +1,192 @@
+{
+  "brand": {
+    "name": "Paste",
+    "tagline": "One notepad. Every device you own.",
+    "subtagline": "Private clipboard / encrypted on-device",
+    "description": "Copy on your laptop, paste on your phone. No account. No cloud. No plaintext on relays."
+  },
+  "generatedWith": "assets/marketing/generate.mjs",
+  "source": {
+    "palette": "source/palette.css",
+    "mark": "source/paste-mark.svg",
+    "backdrop": "source/campaign-backdrop.png",
+    "backdropPrompt": "source/campaign-backdrop-prompt.md"
+  },
+  "assets": [
+    {
+      "usage": "Open Graph / website preview",
+      "editable": "editable/og-image.svg",
+      "png": "png/headers/og-image-1200x630.png",
+      "width": 1200,
+      "height": 630
+    },
+    {
+      "usage": "GitHub repository social preview",
+      "editable": "editable/github-social-preview.svg",
+      "png": "png/headers/github-social-preview-1280x640.png",
+      "width": 1280,
+      "height": 640
+    },
+    {
+      "usage": "X / Twitter profile header",
+      "editable": "editable/x-header.svg",
+      "png": "png/banners/x-header-1500x500.png",
+      "width": 1500,
+      "height": 500
+    },
+    {
+      "usage": "LinkedIn company page banner",
+      "editable": "editable/linkedin-banner.svg",
+      "png": "png/banners/linkedin-banner-1584x396.png",
+      "width": 1584,
+      "height": 396
+    },
+    {
+      "usage": "Facebook page cover",
+      "editable": "editable/facebook-cover.svg",
+      "png": "png/banners/facebook-cover-1640x624.png",
+      "width": 1640,
+      "height": 624
+    },
+    {
+      "usage": "YouTube channel art, centered for the safe area",
+      "editable": "editable/youtube-header.svg",
+      "png": "png/banners/youtube-header-2560x1440.png",
+      "width": 2560,
+      "height": 1440
+    },
+    {
+      "usage": "Wide website hero or press-kit banner",
+      "editable": "editable/website-hero.svg",
+      "png": "png/headers/website-hero-2400x900.png",
+      "width": 2400,
+      "height": 900
+    },
+    {
+      "usage": "Square launch post",
+      "editable": "editable/launch-post.svg",
+      "png": "png/posts/launch-post-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Square security post",
+      "editable": "editable/security-post.svg",
+      "png": "png/posts/security-post-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Feature card: product overview",
+      "editable": "editable/feature-product-overview.svg",
+      "png": "png/features/feature-product-overview-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Feature card: cross-device sync",
+      "editable": "editable/feature-cross-device-sync.svg",
+      "png": "png/features/feature-cross-device-sync-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Feature card: security model",
+      "editable": "editable/feature-security-model.svg",
+      "png": "png/features/feature-security-model-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Feature card: notes and search",
+      "editable": "editable/feature-notes-search.svg",
+      "png": "png/features/feature-notes-search-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Feature card: pairing and recovery",
+      "editable": "editable/feature-pairing-recovery.svg",
+      "png": "png/features/feature-pairing-recovery-1080x1080.png",
+      "width": 1080,
+      "height": 1080
+    },
+    {
+      "usage": "Wide feature overview image",
+      "editable": "editable/feature-overview-wide.svg",
+      "png": "png/features/feature-overview-wide-1600x900.png",
+      "width": 1600,
+      "height": 900
+    },
+    {
+      "usage": "Instagram / TikTok / YouTube Shorts story",
+      "editable": "editable/story.svg",
+      "png": "png/posts/story-1080x1920.png",
+      "width": 1080,
+      "height": 1920
+    },
+    {
+      "usage": "Social account profile picture",
+      "editable": "editable/profile-picture.svg",
+      "png": "png/profiles/profile-picture-800x800.png",
+      "width": 800,
+      "height": 800
+    },
+    {
+      "usage": "Social account profile picture",
+      "editable": "editable/profile-picture.svg",
+      "png": "png/profiles/profile-picture-400x400.png",
+      "width": 400,
+      "height": 400
+    },
+    {
+      "usage": "Marketing social icon",
+      "editable": "editable/social-icon.svg",
+      "png": "icons/social-icon-512x512.png",
+      "width": 512,
+      "height": 512
+    },
+    {
+      "usage": "Marketing social icon",
+      "editable": "editable/social-icon.svg",
+      "png": "icons/social-icon-256x256.png",
+      "width": 256,
+      "height": 256
+    },
+    {
+      "usage": "Marketing social icon",
+      "editable": "editable/social-icon.svg",
+      "png": "icons/social-icon-1024x1024.png",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "usage": "Transparent Paste mark",
+      "editable": "editable/paste-mark.svg",
+      "png": "icons/paste-mark-512x512.png",
+      "width": 512,
+      "height": 512
+    },
+    {
+      "usage": "Transparent Paste mark",
+      "editable": "editable/paste-mark.svg",
+      "png": "icons/paste-mark-64x64.png",
+      "width": 64,
+      "height": 64
+    },
+    {
+      "usage": "Transparent Paste mark",
+      "editable": "editable/paste-mark.svg",
+      "png": "icons/paste-mark-128x128.png",
+      "width": 128,
+      "height": 128
+    },
+    {
+      "usage": "Transparent Paste mark",
+      "editable": "editable/paste-mark.svg",
+      "png": "icons/paste-mark-256x256.png",
+      "width": 256,
+      "height": 256
+    }
+  ]
+}

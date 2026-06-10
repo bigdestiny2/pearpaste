@@ -59,7 +59,7 @@ test('_signerAuthorized: revoked device rejected at/after its revoke lamport', (
 
 test('note reducer is deterministic LWW (higher lamport wins, stable across replays)', async (t) => {
   const dir = tmp()
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'r', platform: 'test', passphrase: 'pw' })
@@ -92,7 +92,7 @@ test('DEVICE_REVOKE performs a REAL key rotation (activates a fresh epoch sealed
   // surviving admin obtains epochKey_1, activeEpoch advances to 1, and the
   // revoked device is excluded from both the wraps and the write set (B12).
   const dir = tmp()
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'admin', platform: 'test', passphrase: 'pw' })
@@ -145,7 +145,7 @@ test('DEVICE_REVOKE performs a REAL key rotation (activates a fresh epoch sealed
 
 test('Phase 1: after open, engine carries the epoch-0 lazy-migration anchor', async (t) => {
   const dir = tmp()
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'a', platform: 'test', passphrase: 'pw' })
@@ -182,7 +182,7 @@ test('Phase 1: after open, engine carries the epoch-0 lazy-migration anchor', as
 
 test('Phase 1: _rebuildAuthFromView projects boxPubkey per device (design §5.1)', async (t) => {
   const dir = tmp()
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'a', platform: 'test', passphrase: 'pw' })
@@ -201,7 +201,7 @@ test('Phase 1: _rebuildAuthFromView projects boxPubkey per device (design §5.1)
 
 test('Phase 1: truncate/replay rebuilds epoch-0 state deterministically from the view', async (t) => {
   const dir = tmp()
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 'a', platform: 'test', passphrase: 'pw' })

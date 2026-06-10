@@ -4,6 +4,10 @@
   "description": "PearPaste mobile — Expo host embedding the Bare Pear-end (validated path: bare-expo).",
   "main": "expo-router/entry",
   "scripts": {
+    "bundle:bare": "node ../scripts/bundle-bare.mjs",
+    "bundle:bare:check": "node ../scripts/bundle-bare.mjs --check",
+    "preandroid": "npm run bundle:bare",
+    "preios": "npm run bundle:bare",
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios"
@@ -36,7 +40,9 @@
     "react-native-svg": "15.15.3"
   },
   "devDependencies": {
+    "@expo/config-plugins": "~55.0.10",
     "@types/react": "~19.2.10",
+    "bare-pack": "^2.0.1",
     "typescript": "^5.3.3"
   }
 }

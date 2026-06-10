@@ -24,7 +24,8 @@ export function createBridge (pearEnd) {
     'pair-approval-needed', 'pair-approval-cleared', 'pair-rejected',
     'pair-admitted', 'paired',
     'clip-captured', 'clip-written', 'verifier-ran', 'device-revoked',
-    'relay-enabled-changed', 'clipboard-mode-changed', 'clipboard-pause-changed'
+    'relay-enabled-changed', 'clipboard-mode-changed', 'clipboard-pause-changed',
+    'backgrounded', 'foregrounded'
   ]
   for (const ev of RELAY_EVENTS) {
     pearEnd.ctx.on(ev, (payload) => {

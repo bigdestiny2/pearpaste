@@ -89,6 +89,13 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     log,
     getDevice: () => state.device,
     getEngine: () => ctx.sync,
+    // Event-driven pending-peer recheck: the engine emits 'auth-cache-rebuilt'
+    // after every apply pass rebuilds the committed device set — the only time
+    // an 'unknown' verdict can change. Returns an unsubscribe.
+    subscribeAuthChanges: (fn) => {
+      ctx.on('auth-cache-rebuilt', fn)
+      return () => ctx.off('auth-cache-rebuilt', fn)
+    },
     isRelayPeer: (hex) => !!(ctx.relay && typeof ctx.relay.isRelayPeer === 'function' && ctx.relay.isRelayPeer(hex)),
     enforce: !(typeof process !== 'undefined' && process.env && process.env.PEARPASTE_REPL_FIREWALL === 'off')
   })
@@ -289,6 +296,12 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     lock,
     // tiny event bus so subsystems can react to lock/unlock/op-applied
     on (ev, fn) { (listeners.get(ev) || listeners.set(ev, []).get(ev)).push(fn) },
+    off (ev, fn) {
+      const arr = listeners.get(ev)
+      if (!arr) return
+      const i = arr.indexOf(fn)
+      if (i !== -1) arr.splice(i, 1)
+    },
     emit (ev, payload) { for (const fn of listeners.get(ev) || []) { try { fn(payload) } catch (_) {} } }
   }
   ctx.replicationFirewall = firewall // observability for tests/status panels

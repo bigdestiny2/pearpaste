@@ -22,7 +22,7 @@ function localSecretRecord (dir) {
 
 test('§16 high-security restore does not unlock, persist keys, or join sync', async (t) => {
   const dir = tmp('restore-high')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   const created = await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
@@ -44,8 +44,8 @@ test('§16 high-security restore does not unlock, persist keys, or join sync', a
 test('§16 local device wrapper stores a random per-file salt', async (t) => {
   const dirA = tmp('salt-a')
   const dirB = tmp('salt-b')
-  const peA = await createPearEnd({ storagePath: dirA })
-  const peB = await createPearEnd({ storagePath: dirB })
+  const peA = await createPearEnd({ storagePath: dirA, relayClientFactory: false })
+  const peB = await createPearEnd({ storagePath: dirB, relayClientFactory: false })
   t.teardown(async () => {
     try { await peA.close() } catch (_) {}
     try { await peB.close() } catch (_) {}

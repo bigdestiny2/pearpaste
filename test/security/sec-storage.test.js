@@ -63,7 +63,7 @@ test('§16 storage + relay-export + log scan: sentinel never lands at rest', asy
   const cap = captureConsole()
   let pearEnd
   try {
-    pearEnd = await createPearEnd({ storagePath: dir })
+    pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   } finally {
     // restore briefly so a boot failure is visible, re-capture below
     if (!pearEnd) cap.restore()
@@ -175,7 +175,7 @@ test('§16 storage + relay-export + log scan: sentinel never lands at rest', asy
 
 test('§16 storage scan still passes for a clip-only vault (no notes)', async (t) => {
   const dir = tmp('clip')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => {
     try { await pearEnd.close() } catch (_) {}
     fs.rmSync(dir, { recursive: true, force: true })

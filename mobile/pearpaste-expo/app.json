@@ -36,6 +36,9 @@
     },
     "plugins": [
       [
+        "./plugins/pearpaste-bare-worklet"
+      ],
+      [
         "expo-router"
       ],
       [

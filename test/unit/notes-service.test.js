@@ -39,7 +39,7 @@ function scanForSentinel (dir) {
 
 test('NOTE_LIST is sealed; NOTE_OPEN returns plaintext; sentinel never at rest', async (t) => {
   const dir = tmp('seal')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pe.call(COMMANDS.CREATE_VAULT, { label: 's', platform: 'test', passphrase: 'pw' })
@@ -68,7 +68,7 @@ test('NOTE_LIST is sealed; NOTE_OPEN returns plaintext; sentinel never at rest',
 
 test('lock -> unlock re-opens the sync engine (sync-ready race regression)', async (t) => {
   const dir = tmp('lock')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   const created = await pe.call(COMMANDS.CREATE_VAULT, { label: 'lk', platform: 'test', passphrase: 'pw' })
@@ -246,7 +246,7 @@ test('NOTE_DELETE hard=true: verifiable erasure via public surface + on-disk sca
   // backend/autobase-sync.js); these assertions cover the user-observable
   // side of that contract.
   const dir = tmp('hard-del')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 'test', platform: 'macos', passphrase: 'pw' })
@@ -281,7 +281,7 @@ test('NOTE_DELETE hard=false: tombstone hides the note but keeps CRDT marker', a
   // convergence. Both paths satisfy the user-facing contract (open/list
   // refuse the deleted note); only hard delete removes the envelope.
   const dir = tmp('soft-del')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 'test', platform: 'macos', passphrase: 'pw' })
@@ -307,7 +307,7 @@ test('NOTE_UPSERT with expiresAt: temporary note round-trips + list/open filter 
   //   - the instant expiresAt is in the past, NOTE_LIST drops the row and
   //     NOTE_OPEN throws NOT_FOUND (even if the sweeper hasn't fired yet)
   const dir = tmp('temp-note')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 'test', platform: 'macos', passphrase: 'pw' })
@@ -347,7 +347,7 @@ test('NOTE_UPSERT expiresAt=0: persistent note (default)', async (t) => {
   // exactly like the pre-feature persistent default. No TTL, no chip, no
   // sweeper concern.
   const dir = tmp('persistent-note')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 'test', platform: 'macos', passphrase: 'pw' })
@@ -365,7 +365,7 @@ test('SEARCH filters expired temporary notes + surfaces expiresAt on live ones',
   // tap an "expired" result and hit NOT_FOUND, or worse, the UI would show
   // ghost rows for notes the user expects to be erased.
   const dir = tmp('search-expiry')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
   await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 't', platform: 'macos', passphrase: 'pw' })

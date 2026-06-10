@@ -69,7 +69,7 @@ const call = (bridge, command, params) => bridge.request({ id: ++_id, command, p
 
 test('Agent 3 acceptance: sealed list, tap-to-decrypt, lock clears, clip round-trip, no key leak', async (t) => {
   const dir = tmp('vault')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   const bridge = recordingBridge(pearEnd, t)
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
@@ -145,7 +145,7 @@ test('UI renderer clears the open item on the backend "locked" event', async (t)
   // renderer's lock handler: on 'locked' it must drop S.open. Here we assert
   // the bridge actually relays the 'locked' event the renderer subscribes to.
   const dir = tmp('evt')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   const bridge = createBridge(pearEnd)
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 
@@ -160,7 +160,7 @@ test('UI renderer clears the open item on the backend "locked" event', async (t)
 
 test('pairing invite is QR-encodable locally (no remote QR lib)', async (t) => {
   const dir = tmp('pair')
-  const pearEnd = await createPearEnd({ storagePath: dir })
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   const bridge = createBridge(pearEnd)
   t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
 

@@ -908,6 +908,11 @@ class SyncEngine {
         // ACK and unknown types are intentionally ignored.
       }
       await batch.flush()
+      // Wake pending-peer verdicts in the replication firewall: an apply pass
+      // is the ONLY place the committed device set changes, so this event (not
+      // a poll) drives the 'unknown device' recheck. Emitted AFTER the flush so
+      // a recheck observes this batch's DEVICE_ADD/REVOKE rows. Never throws.
+      try { ctx.emit('auth-cache-rebuilt') } catch (_) {}
     } catch (err) {
       try { await batch.close() } catch (_) {}
       // Surface but never crash the linearizer; ctx.log is redacted.
@@ -1654,8 +1659,27 @@ class SyncEngine {
     }
   }
 
+  // Coalesced: a burst of concurrent callers (RPC handlers + the convergence
+  // loop) costs at most TWO base.update() passes instead of N. A caller that
+  // arrives mid-flight is NOT handed the in-flight promise — that update may
+  // predate ops the caller expects to observe (e.g. "freshest device/epoch
+  // state before minting"). Instead every mid-flight caller shares ONE queued
+  // follow-up pass that starts after the current one finishes, so each caller
+  // always observes an update that began at-or-after its call.
   async refresh () {
-    if (this.base) await this.base.update()
+    if (!this.base) return
+    if (this._refreshPending) return this._refreshPending
+    if (this._refreshing) {
+      this._refreshPending = this._refreshing.catch(() => {}).then(() => {
+        this._refreshPending = null
+        return this.refresh()
+      })
+      return this._refreshPending
+    }
+    this._refreshing = Promise.resolve(this.base.update()).finally(() => {
+      this._refreshing = null
+    })
+    return this._refreshing
   }
 
   verifierDeviceSet () {
@@ -1784,26 +1808,66 @@ export async function attach (ctx) {
   })
   if (ctx.isUnlocked()) await openEngine()
 
-  // background convergence loop: periodic update() so a device that comes
-  // online catches up, PLUS durability reconciliation (FRESH-WRITER ORPHAN fix):
-  // re-materialize any of this device's additive content rows that an
-  // asynchronous indexer-migration rolled out of the view. Cancellable via
-  // scope.signal (spec §22). Tightens to a short interval while there is pending
-  // durability work (so a rolled-back note re-materializes within ~hundreds of
-  // ms of the migration settling) and relaxes back to the idle cadence
-  // otherwise (no steady-state overhead).
+  // background convergence loop: EVENT-DRIVEN with a slow heartbeat fallback.
+  // Autobase subscribes to every writer core's 'append' and auto-bumps, then
+  // emits 'update' when linearized state changed — so remote data wakes this
+  // loop within one debounce window instead of waiting out a poll interval.
+  // The pass itself runs refresh() PLUS durability reconciliation (FRESH-
+  // WRITER ORPHAN fix): re-materialize any of this device's additive content
+  // rows that an asynchronous indexer-migration rolled out of the view.
+  // Cadence: 300ms while durability work is pending; a 250ms debounce after
+  // an 'update' wake (coalesces bursts and prevents self-wake spin from our
+  // own refresh()); and a 10s idle heartbeat as the safety net for any path
+  // that delivers blocks without surfacing 'update' (e.g. sparse wakeups).
+  // Cancellable via scope.signal (spec §22).
   ctx.scope.spawn(async (scope) => {
+    const IDLE_HEARTBEAT_MS = 10000
+    const WAKE_DEBOUNCE_MS = 250
+    const PENDING_MS = 300
+    let dirty = false
+    let wakeResolve = null
+    const wake = () => {
+      dirty = true
+      if (wakeResolve) { const r = wakeResolve; wakeResolve = null; r() }
+    }
+    let attachedBase = null
+    const detach = () => {
+      if (attachedBase) {
+        try { attachedBase.off('update', wake) } catch (_) {}
+        attachedBase = null
+      }
+    }
     while (!scope.cancelled) {
       let pending = 0
       try {
         if (engine._opened) {
+          // (Re)attach the wake listener whenever a lock/unlock cycle gave the
+          // engine a fresh base instance.
+          if (engine.base && engine.base !== attachedBase) {
+            detach()
+            attachedBase = engine.base
+            attachedBase.on('update', wake)
+          }
+          dirty = false // events during OUR pass re-mark it
           await engine.refresh()
           await engine._reconcileDurability()
           pending = engine._pendingDurable ? engine._pendingDurable.size : 0
         }
       } catch (_) {}
-      try { await scope.sleep(pending > 0 ? 300 : 2000) } catch (_) { break }
+      try {
+        if (pending > 0) {
+          await scope.sleep(PENDING_MS)
+        } else if (dirty) {
+          await scope.sleep(WAKE_DEBOUNCE_MS)
+        } else {
+          const woken = new Promise((resolve) => { wakeResolve = resolve })
+          await Promise.race([scope.sleep(IDLE_HEARTBEAT_MS), woken])
+          wakeResolve = null
+          if (dirty && !scope.cancelled) await scope.sleep(WAKE_DEBOUNCE_MS)
+        }
+      } catch (_) { break }
     }
+    detach()
   }, 'sync-converge')
 
   ctx.scope.onClose(async () => { await engine.close() })

@@ -493,11 +493,12 @@ export class LocalSearchIndex {
 
   // AND-of-terms query. Returns sealed pointer rows (objectBlindId + envelope);
   // NO decrypted title/body (spec §9.3 "search returns sealed result rows").
+  // All term scans run concurrently — the bee serves independent range reads,
+  // so a k-term query costs one round of I/O latency instead of k.
   async search (query, { limit = 50 } = {}) {
-    const terms = LocalSearchIndex.tokenize(query)
+    const terms = [...new Set(LocalSearchIndex.tokenize(query))]
     if (terms.length === 0) return []
-    let acc = null
-    for (const term of terms) {
+    const perTerm = await Promise.all(terms.map(async (term) => {
       const tbid = this.tokenBlindId(term)
       const hits = new Map()
       for await (const { key, value } of this.bee.createReadStream({
@@ -506,12 +507,17 @@ export class LocalSearchIndex {
         const obid = key.slice(('search!' + tbid + '!').length)
         hits.set(obid, value)
       }
-      if (acc === null) acc = hits
-      else for (const k of [...acc.keys()]) if (!hits.has(k)) acc.delete(k)
-      if (acc.size === 0) break
+      return hits
+    }))
+    // Intersect smallest-first so the working set only ever shrinks.
+    perTerm.sort((a, b) => a.size - b.size)
+    const acc = perTerm[0]
+    for (let i = 1; i < perTerm.length && acc.size > 0; i++) {
+      const hits = perTerm[i]
+      for (const k of [...acc.keys()]) if (!hits.has(k)) acc.delete(k)
     }
     const rows = []
-    for (const [objectBlindId, envelope] of (acc || new Map())) {
+    for (const [objectBlindId, envelope] of acc) {
       rows.push({ objectBlindId, envelope, sealed: true })
       if (rows.length >= limit) break
     }

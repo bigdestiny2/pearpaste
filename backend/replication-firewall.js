@@ -57,7 +57,12 @@ export function createReplicationFirewall ({
   isRelayPeer = () => false, // (remotePubHex) => bool — relays replicate ciphertext-only (L2 channel)
   enforce = true, // kill-switch / permissive mode: still authenticate OUTBOUND, never gate inbound
   authTimeoutMs = AUTH_TIMEOUT_MS,
-  unknownGraceMs = UNKNOWN_GRACE_MS
+  unknownGraceMs = UNKNOWN_GRACE_MS,
+  // Optional event hook: (fn) => unsubscribe, fired whenever the committed
+  // device set was rebuilt (engine apply pass). When wired, pending 'unknown'
+  // peers re-check on that event instead of a 1s poll; when absent (lightweight
+  // test harnesses) the interval fallback below keeps the old behavior.
+  subscribeAuthChanges = null
 }) {
   // peer deviceId -> Set<conn> of live streams authenticated to that device,
   // so destroyPeer() can enumerate + destroy on DEVICE_REVOKE (SB2 part b).
@@ -146,10 +151,12 @@ export function createReplicationFirewall ({
     let authed = null // peer deviceId once verified
     let pendingTimer = null
     let graceTimer = null
+    let unsubAuth = null
 
     const clearTimers = () => {
       if (pendingTimer) { clearInterval(pendingTimer); pendingTimer = null }
       if (graceTimer) { clearTimeout(graceTimer); graceTimer = null }
+      if (unsubAuth) { try { unsubAuth() } catch (_) {} unsubAuth = null }
     }
     conn.on('close', clearTimers)
 
@@ -175,14 +182,25 @@ export function createReplicationFirewall ({
       if (v === 'revoked') return refuse('revoked-device', 'refusedRevoked')
       // 'unknown': keep pending and re-check — the peer's DEVICE_ADD may still
       // be linearizing into our committed view. Refused after the grace.
-      if (!pendingTimer && !conn.destroyed && enforce !== false) {
-        pendingTimer = setInterval(() => {
+      // Event-driven when subscribeAuthChanges is wired (re-check exactly when
+      // an apply pass rebuilt the device set — the only time the verdict can
+      // change); 1s-interval fallback otherwise. Grace timeout is unchanged.
+      const pending = !!(pendingTimer || unsubAuth)
+      if (!pending && !conn.destroyed && enforce !== false) {
+        const recheck = () => {
+          if (authed || conn.destroyed) return
           const v2 = verdictFor(cred.deviceId, cred.signingPubkey)
           if (v2 === 'allowed') return admit(cred.deviceId, 'authed', 'allowed')
           if (v2 === 'bootstrap') return admit(cred.deviceId, 'bootstrap', 'bootstrapAllowed')
           if (v2 === 'revoked') return refuse('revoked-device', 'refusedRevoked')
-        }, UNKNOWN_RECHECK_MS)
-        if (pendingTimer.unref) pendingTimer.unref()
+        }
+        if (typeof subscribeAuthChanges === 'function') {
+          try { unsubAuth = subscribeAuthChanges(recheck) } catch (_) { unsubAuth = null }
+        }
+        if (!unsubAuth) {
+          pendingTimer = setInterval(recheck, UNKNOWN_RECHECK_MS)
+          if (pendingTimer.unref) pendingTimer.unref()
+        }
         graceTimer = setTimeout(() => refuse('unknown-device', 'refusedUnknown'), unknownGraceMs)
         if (graceTimer.unref) graceTimer.unref()
       } else if (enforce === false) {

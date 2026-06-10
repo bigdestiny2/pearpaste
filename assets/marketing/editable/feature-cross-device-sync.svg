@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1080" viewBox="0 0 1080 1080" role="img" aria-label="Paste cross-device sync feature card">
+  <defs>
+    <linearGradient id="pasteGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="0.62" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6aa9ff"/>
+    </linearGradient>
+    <linearGradient id="panelGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151b22"/>
+      <stop offset="1" stop-color="#080b0f"/>
+    </linearGradient>
+    <linearGradient id="darkGlass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17212a" stop-opacity="0.86"/>
+      <stop offset="1" stop-color="#080b0f" stop-opacity="0.62"/>
+    </linearGradient>
+    <radialGradient id="mintGlow" cx="0.22" cy="0.18" r="0.72">
+      <stop offset="0" stop-color="#4ade80" stop-opacity="0.32"/>
+      <stop offset="0.44" stop-color="#22d3ee" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#07090c" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="violetGlow" cx="0.9" cy="0.04" r="0.62">
+      <stop offset="0" stop-color="#8b7bff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#07090c" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse">
+      <path d="M42 0H0V42" fill="none" stroke="#ffffff" stroke-opacity="0.055" stroke-width="1"/>
+    </pattern>
+    <filter id="blurGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="24" stdDeviation="26" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="roundClip">
+      <rect width="1080" height="1080" rx="0"/>
+    </clipPath>
+      <linearGradient id="leftFade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#07090c" stop-opacity="0.72"/>
+      <stop offset="0.42" stop-color="#07090c" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#07090c" stop-opacity="0.05"/>
+    </linearGradient>
+  </defs>
+  <rect width="1080" height="1080" fill="#07090c"/>
+  
+    <g clip-path="url(#roundClip)">
+    <image href="../source/campaign-backdrop.png" x="0" y="0" width="1080" height="1080" preserveAspectRatio="xMidYMid slice" opacity="0.72"/>
+    <rect width="1080" height="1080" fill="#07090c" opacity="0.54"/>
+    <rect width="1080" height="1080" fill="url(#mintGlow)"/>
+    <rect width="1080" height="1080" fill="url(#violetGlow)"/>
+    <rect width="1080" height="1080" fill="url(#grid)" opacity="0.52"/>
+    <circle cx="194.4" cy="237.6" r="302.40000000000003" fill="#4ade80" opacity="0.13" filter="url(#blurGlow)"/>
+    <circle cx="928.8" cy="172.8" r="216" fill="#22d3ee" opacity="0.12" filter="url(#blurGlow)"/>
+    <rect width="1080" height="1080" fill="url(#leftFade)"/>
+  </g>
+    <g>
+    <g transform="translate(88 92) scale(1.8125)" opacity="1">
+    <rect x="6" y="4.5" width="20" height="23" rx="4.5" fill="none" stroke="url(#pasteGrad)" stroke-width="2.4"/>
+    <rect x="11.5" y="2.6" width="9" height="5.4" rx="2.4" fill="none" stroke="url(#pasteGrad)" stroke-width="2.4"/>
+    <circle cx="16" cy="18.2" r="3.1" fill="none" stroke="url(#pasteGrad)" stroke-width="2.2"/>
+    <path d="M16 21.3v3" stroke="url(#pasteGrad)" stroke-width="2.2" stroke-linecap="round"/>
+  </g>
+    <text x="165" y="146" fill="#e9eef3" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="58" font-weight="760">Paste</text>
+    <text x="168" y="174" fill="#6b7682" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="600">Private clipboard / encrypted on-device</text>
+  </g>
+    <text x="88" y="282" fill="#4ade80" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="21" font-weight="760" text-anchor="start">
+    <tspan x="88" dy="0">Copy here. Paste there.</tspan>
+  </text>
+    <text x="88" y="360" fill="#e9eef3" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="72" font-weight="820" text-anchor="start">
+    <tspan x="88" dy="0">Your clipboard,</tspan>
+    <tspan x="88" dy="78">already there.</tspan>
+  </text>
+    <text x="88" y="540" fill="#9aa6b2" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="28" font-weight="540" text-anchor="start">
+    <tspan x="88" dy="0">Devices sync directly when they can,</tspan>
+    <tspan x="88" dy="37">then catch up when they reconnect.</tspan>
+  </text>
+    <rect x="72" y="628" width="936" height="382" rx="30" fill="#05070a" fill-opacity="0.52" stroke="#ffffff" stroke-opacity="0.08"/>
+    <g>
+    <rect x="108" y="666" width="410" height="132" rx="18" fill="#ffffff" fill-opacity="0.035" stroke="#ffffff" stroke-opacity="0.105"/>
+    <circle cx="150" cy="710" r="20" fill="url(#pasteGrad)" opacity="0.95"/>
+    <text x="150" y="717" fill="#04130d" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">01</text>
+    <text x="186" y="705" fill="#e9eef3" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="24" font-weight="740">Peer-to-peer sync</text>
+    <text x="186" y="739" fill="#9aa6b2" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="520" text-anchor="start">
+    <tspan x="186" dy="0">Built on the Pear and</tspan>
+    <tspan x="186" dy="24">Holepunch stack.</tspan>
+  </text>
+  </g>
+    <g>
+    <rect x="562" y="666" width="410" height="132" rx="18" fill="#ffffff" fill-opacity="0.035" stroke="#ffffff" stroke-opacity="0.105"/>
+    <circle cx="604" cy="710" r="20" fill="url(#pasteGrad)" opacity="0.95"/>
+    <text x="604" y="717" fill="#04130d" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">02</text>
+    <text x="640" y="705" fill="#e9eef3" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="24" font-weight="740">Offline-first</text>
+    <text x="640" y="739" fill="#9aa6b2" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="520" text-anchor="start">
+    <tspan x="640" dy="0">Your notes stay usable</tspan>
+    <tspan x="640" dy="24">with zero network.</tspan>
+  </text>
+  </g>
+    <g>
+    <rect x="108" y="834" width="410" height="132" rx="18" fill="#ffffff" fill-opacity="0.035" stroke="#ffffff" stroke-opacity="0.105"/>
+    <circle cx="150" cy="878" r="20" fill="url(#pasteGrad)" opacity="0.95"/>
+    <text x="150" y="885" fill="#04130d" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">03</text>
+    <text x="186" y="873" fill="#e9eef3" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="24" font-weight="740">Blind relays</text>
+    <text x="186" y="907" fill="#9aa6b2" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="520" text-anchor="start">
+    <tspan x="186" dy="0">Optional availability for</tspan>
+    <tspan x="186" dy="24">encrypted blocks only.</tspan>
+  </text>
+  </g>
+    <g>
+    <rect x="562" y="834" width="410" height="132" rx="18" fill="#ffffff" fill-opacity="0.035" stroke="#ffffff" stroke-opacity="0.105"/>
+    <circle cx="604" cy="878" r="20" fill="url(#pasteGrad)" opacity="0.95"/>
+    <text x="604" y="885" fill="#04130d" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="800">04</text>
+    <text x="640" y="873" fill="#e9eef3" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="24" font-weight="740">Clipboard TTL</text>
+    <text x="640" y="907" fill="#9aa6b2" opacity="1" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="520" text-anchor="start">
+    <tspan x="640" dy="0">Recent clips expire instead</tspan>
+    <tspan x="640" dy="24">of lingering forever.</tspan>
+  </text>
+  </g>
+    <text x="948" y="150" fill="#6b7682" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" font-weight="700">02 / 05</text>
+  
+</svg>

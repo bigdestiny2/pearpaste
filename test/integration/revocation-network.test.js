@@ -411,13 +411,25 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   await discOwn.flushed().catch(() => {})
   await B.swarm.flush().catch(() => {})
 
-  const caughtUp = await pumpUntil([A.engine, B.engine], async () =>
-    B.engine.epochKeys.has(epochTag1) && (await openNote(B.engine, 'note:n1')),
+  const caughtKey = await pumpUntil([A.engine, B.engine], async () =>
+    B.engine.epochKeys.has(epochTag1) && B.engine.activeEpochTag === epochTag1,
   { timeoutMs: 90000 })
-  t.ok(caughtUp, 'B caught up VIA ITS FOLLOW TOPIC: replicated the rotation through the firewall, unwrapped epochKey_1, read n1')
+  t.ok(caughtKey, 'B caught up VIA ITS FOLLOW TOPIC: replicated the rotation through the firewall and unwrapped epochKey_1')
   t.is(B.engine.activeEpochTag, epochTag1, 'B activated the rotation epoch it missed')
 
   // B now derives the SAME post-rotation topic locally (never transmitted).
   const topic1OnB = pairing.vaultDiscoveryTopic(crypto.topicSeedFromEpochKey(B.engine.epochKeys.get(epochTag1)))
   t.ok(b4a.equals(topic1OnB, topic1), 'B locally derives the identical topic_1 from its unwrapped epochKey_1')
+
+  // Production reconcileTopics() joins the active epoch topic as soon as the
+  // offline survivor applies KEY_ROTATE. The lightweight harness models that
+  // explicit step here: the follow topic carries B to the new key, then topic_1
+  // carries normal post-rotation content.
+  const discTopic1B = B.swarm.join(topic1OnB, { server: true, client: true })
+  await discTopic1B.flushed().catch(() => {})
+  await B.swarm.flush().catch(() => {})
+  const caughtContent = await pumpUntil([A.engine, B.engine], async () =>
+    await openNote(B.engine, 'note:n1'),
+  { timeoutMs: 90000 })
+  t.ok(caughtContent, 'B caught post-rotation content after walking forward onto topic_1')
 })

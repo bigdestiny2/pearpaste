@@ -3,8 +3,8 @@
 //
 // Covers these §16 items:
 //   - unlock does not bulk-decrypt notes or clips
-//   - sealed list rendering does not receive plaintext titles, bodies, or
-//     clip text
+//   - sealed list rendering receives only note labels for navigation, never
+//     plaintext bodies, tags, or clip text
 //   - selected item plaintext is cleared on close, background, timeout, and
 //     lock
 //
@@ -12,7 +12,7 @@
 // ctx.state.openItems (the single in-memory plaintext store); we assert it is
 // empty after unlock, populated only by an explicit open, and emptied by every
 // teardown trigger. We also scan every list/search RPC response for any
-// sentinel to prove the renderer never sees plaintext titles/bodies.
+// sentinel to prove the renderer never sees sealed plaintext bodies/tags.
 //
 // Run: node test/security/sec-access.test.js
 
@@ -20,8 +20,11 @@ import test from 'brittle'
 import os from 'os'
 import path from 'path'
 import fs from 'fs'
+import { EventEmitter } from 'events'
 
 import { createPearEnd } from '../../backend/index.js'
+import { createBridge } from '../../backend/desktop-bridge.js'
+import { attachDesktopWorkerPipe } from '../../backend/desktop-worker-protocol.js'
 import { COMMANDS } from '../../backend/rpc.js'
 import { SENTINEL_PREFIX } from '../../backend/shared-ops.js'
 
@@ -33,9 +36,67 @@ const call = (pe, c, p) => pe.call(c, p || {})
 // it is THE place plaintext is allowed to live transiently (spec §8.3).
 const openCount = (pe) => pe.ctx.state.openItems.size
 
+class MemoryWorkerWire extends EventEmitter {
+  constructor () {
+    super()
+    this._out = ''
+  }
+
+  send (msg) {
+    this.emit('data', Buffer.from(JSON.stringify(msg) + '\n'))
+  }
+
+  write (chunk) {
+    this._out += chunk && typeof chunk.toString === 'function' ? chunk.toString() : String(chunk)
+    let nl
+    while ((nl = this._out.indexOf('\n')) >= 0) {
+      const line = this._out.slice(0, nl).trim()
+      this._out = this._out.slice(nl + 1)
+      if (!line) continue
+      try { this.emit('message', JSON.parse(line)) } catch (_) {}
+    }
+    return true
+  }
+
+  end () {
+    this.emit('end')
+  }
+}
+
+function waitForPipeMessage (wire, predicate, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error('timed out waiting for worker pipe message'))
+    }, timeoutMs)
+    if (timer.unref) timer.unref()
+
+    function cleanup () {
+      clearTimeout(timer)
+      wire.off('message', onMessage)
+    }
+
+    function onMessage (msg) {
+      if (!predicate(msg)) return
+      cleanup()
+      resolve(msg)
+    }
+
+    wire.on('message', onMessage)
+  })
+}
+
+let _pipeId = 0
+async function pipeCall (wire, command, params) {
+  const id = ++_pipeId
+  const response = waitForPipeMessage(wire, (msg) => msg && msg.id === id)
+  wire.send({ id, command, params })
+  return response
+}
+
 test('§16 unlock does NOT bulk-decrypt; only an explicit open holds plaintext', async (t) => {
   const dir = tmp('bulk')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   const pw = 'pw-' + rnd()
@@ -48,7 +109,7 @@ test('§16 unlock does NOT bulk-decrypt; only an explicit open holds plaintext',
   for (let i = 0; i < 5; i++) {
     const b = SENTINEL_PREFIX + 'BODY' + i + '_' + rnd()
     bodies.push(b)
-    await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: SENTINEL_PREFIX + 'T' + i, body: b, tags: ['t' + i] } })
+    await call(pe, COMMANDS.NOTE_UPSERT, { note: { label: 'bulk-' + i, body: b, tags: ['t' + i] } })
   }
   for (let i = 0; i < 3; i++) {
     await call(pe, COMMANDS.CLIP_CAPTURE, { kind: 'text', body: SENTINEL_PREFIX + 'CLIP' + i + '_' + rnd() })
@@ -80,9 +141,9 @@ test('§16 unlock does NOT bulk-decrypt; only an explicit open holds plaintext',
   t.is(openCount(pe), 1, 'exactly one item held after one explicit NOTE_OPEN')
 })
 
-test('§16 sealed list/search rendering never carries titles, bodies, or clip text', async (t) => {
+test('§16 sealed list/search rendering carries labels but never bodies, tags, or clip text', async (t) => {
   const dir = tmp('seal')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
@@ -130,11 +191,11 @@ test('§16 sealed list/search rendering never carries titles, bodies, or clip te
 
 test('§16 selected-item plaintext is cleared on CLOSE', async (t) => {
   const dir = tmp('close')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
-  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: 't', body: SENTINEL_PREFIX + rnd() } })
+  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { label: 'close', body: SENTINEL_PREFIX + rnd() } })
   await call(pe, COMMANDS.NOTE_OPEN, { noteId: up.noteId })
   t.is(openCount(pe), 1, 'item held after open')
   await call(pe, COMMANDS.NOTE_CLOSE, { noteId: up.noteId })
@@ -143,27 +204,46 @@ test('§16 selected-item plaintext is cleared on CLOSE', async (t) => {
 
 test('§16 selected-item plaintext is cleared on BACKGROUND', async (t) => {
   const dir = tmp('bg')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
+  const bridge = createBridge(pe)
+  const wire = new MemoryWorkerWire()
+  bridge.onMessage((m) => {
+    try { wire.write(JSON.stringify(m) + '\n') } catch (_) {}
+  })
+  attachDesktopWorkerPipe({ wire, bridge, log: () => {} })
+  let backgrounded = 0
+  let foregrounded = 0
+  pe.ctx.on('backgrounded', () => { backgrounded++ })
+  pe.ctx.on('foregrounded', () => { foregrounded++ })
 
-  await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
-  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: 't', body: SENTINEL_PREFIX + rnd() } })
-  await call(pe, COMMANDS.NOTE_OPEN, { noteId: up.noteId })
+  const created = await pipeCall(wire, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
+  t.ok(created.ok, 'CREATE_VAULT ok through worker pipe')
+  const up = await pipeCall(wire, COMMANDS.NOTE_UPSERT, { note: { label: 'background', body: SENTINEL_PREFIX + rnd() } })
+  t.ok(up.ok, 'NOTE_UPSERT ok through worker pipe')
+  const opened = await pipeCall(wire, COMMANDS.NOTE_OPEN, { noteId: up.result.noteId })
+  t.ok(opened.ok, 'NOTE_OPEN ok through worker pipe')
   t.is(openCount(pe), 1, 'item held after open')
-  // app backgrounding (the desktop/mobile shell emits this via the bridge).
-  pe.ctx.emit('backgrounded')
+  const bgEvent = waitForPipeMessage(wire, (msg) => msg && msg.type === 'event' && msg.event === 'backgrounded')
+  wire.send({ type: 'visibility', visible: false })
+  await bgEvent
+  t.is(backgrounded, 1, 'worker pipe visibility message emitted backgrounded')
   t.is(openCount(pe), 0, 'app backgrounding cleared the decrypted plaintext')
+  const fgEvent = waitForPipeMessage(wire, (msg) => msg && msg.type === 'event' && msg.event === 'foregrounded')
+  wire.send({ type: 'visibility', visible: true })
+  await fgEvent
+  t.is(foregrounded, 1, 'worker pipe visibility message emitted foregrounded')
 })
 
 test('§16 selected-item plaintext is cleared on TIMEOUT', async (t) => {
   const dir = tmp('to')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
   // very short visibility window (spec §9.4 configurable convenience timeout)
   pe.ctx.state.visibilityMs = 150
-  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: 't', body: SENTINEL_PREFIX + rnd() } })
+  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { label: 'timeout', body: SENTINEL_PREFIX + rnd() } })
   await call(pe, COMMANDS.NOTE_OPEN, { noteId: up.noteId })
   t.is(openCount(pe), 1, 'item held immediately after open')
   await new Promise(resolve => setTimeout(resolve, 400))
@@ -172,11 +252,11 @@ test('§16 selected-item plaintext is cleared on TIMEOUT', async (t) => {
 
 test('§16 selected-item plaintext is cleared on LOCK', async (t) => {
   const dir = tmp('lock')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'macos', passphrase: 'pw' })
-  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { title: 't', body: SENTINEL_PREFIX + rnd() } })
+  const up = await call(pe, COMMANDS.NOTE_UPSERT, { note: { label: 'lock', body: SENTINEL_PREFIX + rnd() } })
   await call(pe, COMMANDS.NOTE_OPEN, { noteId: up.noteId })
   t.is(openCount(pe), 1, 'item held after open')
   await call(pe, COMMANDS.LOCK_VAULT, {})

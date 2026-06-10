@@ -1,47 +1,118 @@
-# Paste Mobile — Build & Run Guide
+# Paste Mobile - Expo Build & Run Guide
 
-Status: this directory contains the **complete mobile source** (Bare worklet,
-RPC bridge, React Native screens, smoke test) **and** a generated, wired React
-Native host project at `mobile/PearPasteMobile/`.
+Status: **`mobile/pearpaste-expo/` is the canonical mobile app.** It renders the
+shared React Native UI from `mobile/app/` and starts the shared Pear-end from
+`mobile/backend/` in a Bare worklet via `react-native-bare-kit`.
 
-**Android: a debug APK builds successfully and reproducibly** on macOS with the
-toolchain below, with the *entire* Pear-end native stack
-(`libsodium-native`, `librocksdb-native`, `libudx-native`,
-`libquickbit/rabin/crc/simdle-native`, `libbare-crypto`, …) packaged into the
-APK. Installing/running it on a device or emulator, and producing a *signed
-release* for the Play Store, need hardware / a keystore / a Play account and
-are the only genuinely out-of-scope steps (called out below).
-
-**iOS: the host project is wired and CocoaPods installs cleanly.** The Pear-end
-Bare addons are linked from the repo root during `pod install` and again during
-Xcode builds. Simulator/device builds still require a working Xcode simulator
-or physical-device signing environment.
+The older `mobile/PearPasteMobile/` RN-CLI project remains in the tree as a
+legacy/reference host. Do not use it as the release path unless the mobile
+strategy changes again.
 
 ---
 
-## What runs with no phone / no native toolchain
+## What Ships
+
+| Piece | Location | Notes |
+|---|---|---|
+| Expo host | `mobile/pearpaste-expo/` | The app users should build and run. |
+| Shared mobile UI | `mobile/app/` | Screens and bridge client used by Expo. |
+| Bare worklet source | `mobile/backend/worklet.mjs` | Imports the same `backend/index.js` Pear-end as desktop. |
+| Committed worklet bundles | `mobile/backend/app.android.bundle.js`, `mobile/backend/app.ios.bundle.js` | Platform bundles consumed by Metro shims. |
+| Platform shims | `mobile/backend/worklet-bundle.android.js`, `mobile/backend/worklet-bundle.ios.js` | Metro picks the matching bundle for the native platform. |
+
+The legacy all-host bundle `mobile/backend/app.bundle.js` is not part of the
+shipping path and remains ignored.
+
+---
+
+## Fast Checks Without A Phone
+
+From the repo root:
 
 ```sh
-node mobile/test/worklet-rpc.test.js     # or: npx brittle mobile/test/worklet-rpc.test.js
+npm run test:mobile
+npm --prefix mobile/pearpaste-expo run bundle:bare:check
 ```
 
-Boots the **real** `createPearEnd()` Pear-end and drives the real RPC
-server/client loop from `mobile/rpc-commands.mjs` over an in-process pipe — the
-same code path the device uses, only the byte transport differs (`BareKit.IPC`
-on device vs an in-memory pipe here). Proves worklet boot, `CREATE_VAULT →
-NOTE_UPSERT → NOTE_LIST (sealed) → NOTE_OPEN (plaintext) → LOCK`,
-`PAIR_CREATE_INVITE` + invite wire/expiry, clip capture+copy, and a
-worklet-crash → recoverable-error path. **4/4 tests, 34/34 asserts pass.**
+`test:mobile` boots a real `createPearEnd()` backend under Node and exercises the
+transport-agnostic mobile RPC helper over an in-process pipe. It proves the
+backend dispatcher, schema validation, lock gate, sealed rows, pairing invite
+wire format, clip copy, and recoverable error frames.
+
+`bundle:bare:check` regenerates the Android and iOS Bare worklet bundles into a
+temporary directory and compares them byte-for-byte with the committed platform
+bundles. It fails if `backend/rpc.js` or any imported backend/worklet source has
+made the checked-in bundles stale.
 
 ---
 
-## Prerequisites (macOS, verified)
+## Install Dependencies
+
+Run the root install first so `patch-package` applies the repo-root native
+patches used by the shared Pear-end:
+
+```sh
+npm install
+```
+
+Then install the Expo host dependencies:
+
+```sh
+cd mobile/pearpaste-expo
+npm install --legacy-peer-deps
+```
+
+The Expo host owns the pinned local `bare-pack` binary used by the bundler. The
+shared script deliberately prefers:
+
+```txt
+mobile/pearpaste-expo/node_modules/.bin/bare-pack
+```
+
+---
+
+## Worklet Bundle Guard
+
+Regenerate the committed platform bundles from the repo root:
+
+```sh
+npm --prefix mobile/pearpaste-expo run bundle:bare
+```
+
+Check them without rewriting:
+
+```sh
+npm --prefix mobile/pearpaste-expo run bundle:bare:check
+```
+
+The generated files include a deterministic RPC-surface stamp derived from
+`backend/rpc.js` (`COMMANDS`, `SCHEMAS`, and `UNLOCKED_NOT_REQUIRED`). Today the
+surface includes `NETWORK_STATUS`; stale bundles from the old path did not.
+
+The guard is wired into the canonical build path in three places:
+
+| Guard | Where | Purpose |
+|---|---|---|
+| npm lifecycle | `mobile/pearpaste-expo/package.json` `preandroid` / `preios` | `npm run android` and `npm run ios` regenerate bundles first. |
+| Expo config plugin | `mobile/pearpaste-expo/plugins/pearpaste-bare-worklet.js` | Re-applies native Gradle/Podfile hooks whenever Expo prebuilds native projects. |
+| Native build hooks | generated Android `preBuild`, generated iOS Podfile script phases | Direct native builds regenerate the platform worklet and link Bare addons. |
+
+The config plugin also runs `bare-link` against the repo root so
+`sodium-native`, `rocksdb-native`, `udx-native`, `quickbit`/`rabin`/`crc`,
+`simdle-native`, `bare-crypto`, and the other Pear-end native addons are linked
+into `react-native-bare-kit`. Without that step the app can build but the
+worklet crashes when it loads a native addon.
+
+---
+
+## Android
+
+Prerequisites on macOS:
 
 ```sh
 brew install openjdk@17
 export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
 
-# Android SDK (android-commandlinetools is a brew cask; sdkmanager needs JDK 17)
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
 sdkmanager --sdk_root="$ANDROID_HOME" \
@@ -51,217 +122,116 @@ sdkmanager --sdk_root="$ANDROID_HOME" \
   "ndk;27.1.12297006" "cmake;3.22.1"
 ```
 
-`bare-pack` is pinned as a local RN host dev dependency and `bare-link` comes
-from `react-native-bare-kit`; native builds invoke both through
-`mobile/PearPasteMobile/node_modules/.bin/*`. Run
-`npm install --legacy-peer-deps` in `mobile/PearPasteMobile/` to materialize
-those binaries. Use the pinned local packer for repeatable Android builds.
-
----
-
-## Step 1 — Bundle the Pear-end (`bare-pack`, no phone)
-
-From the **repo root**:
+Build and run through Expo:
 
 ```sh
-npm --prefix mobile/PearPasteMobile run bundle:bare
+cd mobile/pearpaste-expo
+npm run android
 ```
 
-Notes (corrects earlier drafts):
+If `android/` is absent, Expo prebuilds it and applies
+`./plugins/pearpaste-bare-worklet`. If `android/` already exists, the npm
+`preandroid` hook still regenerates the committed worklet bundles before
+`expo run:android` invokes Gradle.
 
-- The flag is `--host <triple>` (repeatable), **not** `--target`. Passing the
-  Android + iOS hosts makes `--linked` resolve each native addon's per-host
-  prebuild (the bundle then carries `linked:` refs for both `.so` and
-  `.framework`).
-- The script expands to the pinned local binary at
-  `mobile/PearPasteMobile/node_modules/.bin/bare-pack`; it never fetches a CLI
-  with `npx`.
-- Outputs are CJS modules: `app.bundle.js` for the legacy all-host bundle plus
-  `app.android.bundle.js` / `app.ios.bundle.js` for Metro's platform-resolved
-  `mobile/backend/worklet-bundle` shim. See `mobile/bare-pack.config`.
-
----
-
-## Step 2 — React Native host project
-
-Already generated and wired at `mobile/PearPasteMobile/` (RN **0.81.4**, app
-name `PearPaste`). To regenerate from scratch:
+For a direct native build after prebuild:
 
 ```sh
-npx @react-native-community/cli@latest init PearPaste \
-  --version 0.81.4 --skip-install --directory mobile/PearPasteMobile
-cd mobile/PearPasteMobile && npm install
-npm install --legacy-peer-deps \
-  react-native-bare-kit@0.14.0 bare-rpc @dr.pogodin/react-native-fs \
-  @react-native-clipboard/clipboard react-native-svg \
-  react-native-qrcode-svg react-native-camera-kit
+cd mobile/pearpaste-expo/android
+./gradlew :app:assembleDebug
 ```
 
-Wiring already committed in this repo:
+The generated Gradle hook makes `preBuild` depend on:
 
-- `mobile/PearPasteMobile/index.js` registers the shared `../app/App` under the
-  native name `PearPaste` (matches `app.json`).
-- `mobile/PearPasteMobile/metro.config.js`: `watchFolders` = **repo root** (so
-  `mobile/app`, `mobile/rpc-commands.mjs`, `mobile/backend/app*.bundle.js` and
-  the shared `backend/rpc.js` all resolve); `sourceExts` adds `mjs`/`cjs`;
-  optional pairing libs are mapped to `metro.empty.js` only when missing, so QR
-  rendering/scanning works when the native packages are installed and degrades
-  to manual-entry fallback when they are not.
-- `mobile/PearPasteMobile/android/build.gradle`: `minSdkVersion = 29`
-  (react-native-bare-kit requires ≥ 29; the RN template's default 24 fails the
-  manifest merge).
-- `android/local.properties`: `sdk.dir=$ANDROID_HOME`.
+```txt
+pearpasteBundleBareWorklet
+pearpasteLinkBareAddons
+```
+
+Release signing is not configured in this repo. Use a private keystore and keep
+it out of git before producing Play Store artifacts.
 
 ---
 
-## Step 2.5 — Link the Pear-end Bare native addons (the critical step)
+## iOS
 
-react-native-bare-kit's stock `link.mjs` runs `bare-link` graph-rooted at the
-RN host project, so it only finds bare-kit's *own* core addons. Paste's
-Pear-end native deps (`sodium-native`, `rocksdb-native`, `udx-native`,
-`quickbit/rabin/crc/simdle-native`, `bare-crypto`, `fs-native-extensions`, …)
-live in the **repo-root** `node_modules` and are only referenced as `linked:`
-specifiers inside the bare-pack bundle. Without linking them the APK builds but the
-worklet crashes at runtime loading sodium/rocksdb/udx.
+Prerequisites:
 
-**This is now automated**: `mobile/PearPasteMobile/android/app/build.gradle`
-defines `pearpasteLinkBareAddons` (a `preBuild` dependency) which runs:
+- Xcode with a simulator or an Apple Developer signing setup for device builds.
+- CocoaPods available through the Ruby environment used by Expo/React Native.
+- UTF-8 locale when running CocoaPods on system Ruby:
 
 ```sh
-# equivalent manual command (run from repo root):
-mobile/PearPasteMobile/node_modules/.bin/bare-link . \
-  --host android-arm64 --host android-arm --host android-ia32 --host android-x64 \
-  --out mobile/PearPasteMobile/node_modules/react-native-bare-kit/android/src/main/addons
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 ```
 
-Android Gradle also runs `pearpasteBundleBareWorklet` before `preBuild`, using
-the same local `bare-pack` binary to regenerate
-`mobile/backend/app.android.bundle.js` without `npx`. `bare-link` merges into
-bare-kit's `jniLibs` source dir, so it composes with bare-kit's own link step
-and is re-run on every Gradle build (durable across `npm install`, which wipes
-`node_modules`).
-
----
-
-## Step 3 — Build the Android APK (verified)
+Build and run through Expo:
 
 ```sh
-cd mobile/PearPasteMobile/android
-JAVA_HOME=… ANDROID_HOME=… ./gradlew :app:assembleDebug
-# => app/build/outputs/apk/debug/app-debug.apk  (~441 MB debug, 4 ABIs)
+cd mobile/pearpaste-expo
+npm run ios
 ```
 
-Verified: `BUILD SUCCESSFUL`; `lib/arm64-v8a/` contains the full Bare runtime
-plus `libsodium-native.5.1.0.so`, `librocksdb-native.so`, `libudx-native.so`,
-`libquickbit/rabin/crc/simdle-native.so`, `libbare-crypto.so` (45 `.so`). The
-debug APK loads JS from Metro (`npm --prefix mobile/PearPasteMobile run start`)
-at runtime.
+If `ios/` is absent, Expo prebuilds it and applies
+`./plugins/pearpaste-bare-worklet`. The generated Podfile runs the iOS worklet
+bundle and Bare addon link steps during `pod install`, and the generated Xcode
+script phases repeat them before compile so a backend/RPC change cannot ship
+with a stale worklet.
 
-### Genuinely out of scope (need hardware / accounts)
-
-- **Run it**: `npm --prefix mobile/PearPasteMobile run android`
-  (emulator/device) — needs a
-  connected device or an AVD + a running Metro server. Not executed here (no
-  device/emulator attached in the build environment).
-- **Release / Play Store**: `./gradlew :app:assembleRelease` (or
-  `bundleRelease` for an `.aab`) now fails closed unless release signing is
-  configured with a private keystore. Generate a keystore with
-  `keytool -genkeypair -v -keystore pearpaste-release.keystore -alias pearpaste
-  -keyalg RSA -keysize 2048 -validity 10000`, keep it out of git, then provide
-  these Gradle properties or environment variables:
-  `PEARPASTE_ANDROID_KEYSTORE`, `PEARPASTE_ANDROID_KEYSTORE_PASSWORD`,
-  `PEARPASTE_ANDROID_KEY_ALIAS`, and `PEARPASTE_ANDROID_KEY_PASSWORD`.
-  The checked-in `debug.keystore` is accepted for debug builds only and is
-  explicitly rejected for release signing.
-
----
-
-## iOS (VERIFIED — builds, installs & launches on the Simulator)
-
-Host: the same `mobile/PearPasteMobile/` (RN **0.81.4**, app name `PearPaste`,
-`ios/` project present). Verified on Xcode 26.4.1 + iOS 26.4 Simulator
-(iPhone 17): `npx react-native run-ios` → app installed and `Successfully
-launched`; Metro bundles all 999 modules (App + the 3.5 MB platform Bare
-bundle + screens + `rpc-commands.mjs`) with no resolve/redbox errors.
-
-Procedure (from `mobile/PearPasteMobile/`):
+For a direct native path after prebuild:
 
 ```sh
-# 1. Bundle the Pear-end (repo root) — CJS module Metro can import:
-npm --prefix mobile/PearPasteMobile run bundle:bare
-# 2. Host deps (RN 0.85 deep-dep peers require legacy-peer-deps):
-npm install --legacy-peer-deps
-# 3. Pods (CocoaPods needs a UTF-8 locale on system Ruby):
-cd ios && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bundle exec pod install && cd ..
-# 4. Build + run on Simulator (also starts Metro):
-LANG=en_US.UTF-8 npx react-native run-ios --simulator="iPhone 17"
-#    If Metro didn't auto-start: `npx react-native start` in another shell.
+cd mobile/pearpaste-expo/ios
+LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 pod install
+open PearPaste.xcworkspace
 ```
 
-Non-obvious gotchas resolved (all encoded in the repo so the steps above just
-work):
-
-- **`bare-link` iOS addons (critical).** `ios/Podfile` has a `pre_install`
-  hook (`pearpaste_link_bare_addons!`) that runs `bare-link <repoRoot> --host
-  ios-arm64 --host ios-arm64-simulator --host ios-x64-simulator --out
-  node_modules/react-native-bare-kit/ios/addons`. Mirrors the Android
-  `pearpasteLinkBareAddons` gradle task — bare-kit's stock `link.mjs` is
-  graph-rooted at the host and misses the repo-root Pear-end native deps
-  (sodium/udx/rocksdb/quickbit/bare-crypto/…). Without it the app links but the
-  worklet crashes at runtime. (29 iOS xcframeworks after linking.)
-- **fmt vs Xcode 26 clang.** RN's vendored `fmt` uses `consteval` format-string
-  checks that Xcode 26.4 clang rejects (`call to consteval function … is not a
-  constant expression`). `ios/Podfile` `post_install` patches
-  `Pods/fmt/include/fmt/base.h` (`FMT_CONSTEVAL` → `constexpr`; runtime
-  equivalent) — fmt's `base.h` has no `#ifndef` guard so a `-D` define alone is
-  ignored.
-- **Duplicate `RNFS*` symbols.** Only `@dr.pogodin/react-native-fs` (new-arch
-  fork) may be installed — the legacy `react-native-fs` must NOT be a dep, or
-  both autolink and produce ~45 duplicate Objective-C symbols at link.
-- **Metro outside-root sources.** `metro.config.js` sets
-  `watchFolders:[repoRoot]`, `resolver.nodeModulesPaths` to the host's
-  `node_modules`, adds `mjs` to `sourceExts` (for `rpc-commands.mjs`), and a
-  `resolveRequest` stub mapping only missing optional pairing libs
-  (`react-native-qrcode-svg`/`-svg`/`-camera-kit`) to an empty module. Installed
-  QR/camera packages stay live; the pairing screen feature-detects and falls
-  back to manual entry only when they are absent or permission is denied.
-- The host `index.js` registers `../app/App` (the real source lives outside the
-  generated project) under the `app.json` name `PearPaste`.
-- **Release/device signing fails closed.** The app target now uses checked-in
-  xcconfig wrappers at `ios/Config/PearPaste.Debug.xcconfig`,
-  `ios/Config/PearPaste.Release.xcconfig`, and
-  `ios/Config/PearPaste.Shared.xcconfig`. Debug keeps a non-secret development
-  bundle identifier for simulator work; Release deliberately has no checked-in
-  bundle identifier, Apple team, certificate, or provisioning profile. For a
-  real device/TestFlight archive, copy `ios/Config/Signing.example.xcconfig` to
-  `ios/Config/Signing.local.xcconfig` (ignored by `ios/.gitignore`) and replace
-  the placeholders, or pass the same `PEARPASTE_*` values as `xcodebuild`
-  build-setting overrides. The
-  `PearPaste Validate Release Signing` Xcode phase rejects Release `iphoneos`
-  builds if those values are missing or still placeholders. Automatic signing
-  can leave `PEARPASTE_PROVISIONING_PROFILE_SPECIFIER` blank; manual signing
-  must provide it.
-
-Not done here: a real device / TestFlight build (needs an Apple Developer
-signing cert + provisioning) and driving the on-device UI for an interactive
-vault-create smoke. The worklet↔RN RPC path itself is the same code covered by
-`mobile/test/worklet-rpc.test.js` (4/4) and the working desktop worker.
+Real device/TestFlight builds need a private Apple team, signing certificate,
+and provisioning profile. Those secrets are intentionally not checked in.
 
 ---
 
-## Storage & lifecycle (spec §9.1, §9.4, §10)
+## Native Project Regeneration
 
-- RN passes `RNFS.DocumentDirectoryPath` as `Bare.argv[0]`; the worklet creates
-  the Corestore at `<docDir>/pearpaste-corestore`. Exactly one Hyperswarm + one
-  Corestore (inside the single `createPearEnd`).
-- App backgrounded → the worklet's Bare `suspend` hook emits `backgrounded`,
-  dropping decrypted item plaintext while keeping sync warm. Worklet teardown
-  drains the `LifecycleScope` before Corestore/Hyperswarm close.
+The Expo native projects are generated output and are ignored:
 
-## Mobile clipboard reality (spec §13 — stated honestly in-app)
+```txt
+mobile/pearpaste-expo/android/
+mobile/pearpaste-expo/ios/
+```
 
-- **iOS**: no background clipboard monitoring. Capture = paste into Paste,
-  copy from Paste, or the share sheet. The Clips screen says this verbatim.
-- **Android**: foreground capture while the app is open; background sync is
-  **not promised**. The Clips screen says this verbatim.
+Regenerate them from tracked config:
+
+```sh
+cd mobile/pearpaste-expo
+npx expo prebuild --clean
+```
+
+After prebuild, confirm the worklet guard:
+
+```sh
+npm run bundle:bare:check
+```
+
+---
+
+## Legacy RN-CLI Host
+
+`mobile/PearPasteMobile/` still contains useful historical wiring for
+`react-native-bare-kit`, Android signing guards, and iOS Podfile workarounds.
+It is not the canonical mobile app because the current shared UI imports Expo
+modules and the shipping build hooks now live under `mobile/pearpaste-expo/`.
+
+Keep changes to the legacy host narrowly scoped unless there is an explicit
+decision to revive it.
+
+---
+
+## Mobile Clipboard Reality
+
+- **iOS:** no background clipboard monitoring. Capture means paste into Paste,
+  copy from Paste, or use the share sheet.
+- **Android:** foreground capture while the app is open; background clipboard
+  sync is not promised.
 - No invisible background clipboard sync is claimed on any mobile OS.

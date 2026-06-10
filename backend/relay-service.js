@@ -840,21 +840,23 @@ export async function attach (ctx) {
 
   // ---- Auto-seed the encrypted vault log when the vault is unlocked -------
   // The sync subsystem owns the vault log core; if it publishes the public
-  // key on ctx.state we seed it. This loop is cancellable via ctx.scope and
-  // never blocks local use (§10/§11).
+  // key on ctx.state we seed it. Seeds IMMEDIATELY when the key is already
+  // known (warm start / re-unlock). A cold first unlock has no key yet — the
+  // 'sync-open' handler below seeds the moment sync announces it, so there is
+  // nothing to wait for here. Cancellable via ctx.scope and never blocks
+  // local use (§10/§11).
   ctx.on('unlocked', () => {
     if (!rstate.enabled) return
+    const vaultLogKey =
+      (ctx.state && (ctx.state.vaultLogKey || ctx.state.autobaseKey)) || null
+    if (!vaultLogKey) {
+      log.debug('relay-autoseed-skip', { reason: 'no-vault-log-key-published' })
+      return
+    }
+    if (rstate.seeded.has(vaultLogKey)) return
     ctx.scope.spawn(async (scope) => {
       try {
-        // Give the sync subsystem a moment to create/announce the log key.
-        await scope.sleep(1000)
-        const vaultLogKey =
-          (ctx.state && (ctx.state.vaultLogKey || ctx.state.autobaseKey)) || null
-        if (vaultLogKey) {
-          await seedVault(vaultLogKey, {})
-        } else {
-          log.debug('relay-autoseed-skip', { reason: 'no-vault-log-key-published' })
-        }
+        await seedVault(vaultLogKey, {})
       } catch (err) {
         if (scope.cancelled) return
         log.warn('relay-autoseed-error', { err: String((err && err.message) || err) })

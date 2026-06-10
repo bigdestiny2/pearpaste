@@ -1,0 +1,13 @@
+:root {
+  --paste-bg: #07090c;
+  --paste-bg-2: #0b0d10;
+  --paste-surface: #0f1318;
+  --paste-text: #e9eef3;
+  --paste-muted: #9aa6b2;
+  --paste-faint: #6b7682;
+  --paste-mint: #4ade80;
+  --paste-cyan: #22d3ee;
+  --paste-blue: #6aa9ff;
+  --paste-violet: #8b7bff;
+  --paste-gradient: linear-gradient(120deg, #4ade80 0%, #22d3ee 60%, #6aa9ff 100%);
+}

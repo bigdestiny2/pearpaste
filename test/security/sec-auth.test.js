@@ -78,7 +78,7 @@ function reducerBody (engine, op) {
 
 test('§16 modified ciphertext fails AEAD (the reducer body-decrypt refuses it)', async (t) => {
   const dir = tmp('aead')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'test', passphrase: 'pw' })
@@ -93,7 +93,7 @@ test('§16 modified ciphertext fails AEAD (the reducer body-decrypt refuses it)'
     type: pe.ctx.ops.OP_TYPES.NOTE_UPSERT,
     schema: pe.ctx.ops.SCHEMAS.NOTE,
     objectId,
-    payload: { noteId, title: 't', body, createdAt: Date.now(), updatedAt: Date.now() },
+    payload: { noteId, label: 'aead', body, createdAt: Date.now(), updatedAt: Date.now() },
     signer
   })
   t.absent(Object.prototype.hasOwnProperty.call(op, 'objectId'), 'replicated op does not expose the plaintext objectId')
@@ -130,7 +130,7 @@ test('§16 modified ciphertext fails AEAD (the reducer body-decrypt refuses it)'
 
 test('§16 modified op header fails signature (the reducer signature gate refuses it)', async (t) => {
   const dir = tmp('hdr')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'd', platform: 'test', passphrase: 'pw' })
@@ -143,7 +143,7 @@ test('§16 modified op header fails signature (the reducer signature gate refuse
     type: pe.ctx.ops.OP_TYPES.NOTE_UPSERT,
     schema: pe.ctx.ops.SCHEMAS.NOTE,
     objectId,
-    payload: { noteId, title: 't', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
+    payload: { noteId, label: 'header', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
     signer: engine._localSigner()
   })
 
@@ -169,7 +169,7 @@ test('§16 modified op header fails signature (the reducer signature gate refuse
 
 test('§16 revoked device cannot append (reducer authorization gate denies it post-revoke)', async (t) => {
   const dir = tmp('rev')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'admin', platform: 'test', passphrase: 'pw' })
@@ -209,7 +209,7 @@ test('§16 revoked device cannot append (reducer authorization gate denies it po
     type: pe.ctx.ops.OP_TYPES.NOTE_UPSERT,
     schema: pe.ctx.ops.SCHEMAS.NOTE,
     objectId: 'note:post-' + rnd(),
-    payload: { noteId: 'p', title: 'n', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
+    payload: { noteId: 'p', label: 'post-revoke', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
     signer: { deviceId: victim.deviceId, signingPubkey: victim.signingPubkey, signingSecretKey: victim.signingSecretKey }
   })
   t.ok(reducerSigOk(postOp), 'the revoked device CAN still produce a validly-signed op (key not magically broken)')
@@ -256,7 +256,7 @@ test('§16 replayed old op rejected after key rotation', async (t) => {
   // while trusted; retroactively rejecting them would corrupt history. Replay
   // of those specific ops is defeated by (B).
   const dir = tmp('replay')
-  const pe = await createPearEnd({ storagePath: dir })
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
   t.teardown(async () => { try { await pe.close() } catch (_) {} ; fs.rmSync(dir, { recursive: true, force: true }) })
 
   await call(pe, COMMANDS.CREATE_VAULT, { label: 'admin', platform: 'test', passphrase: 'pw' })
@@ -318,7 +318,7 @@ test('§16 replayed old op rejected after key rotation', async (t) => {
     type: pe.ctx.ops.OP_TYPES.NOTE_UPSERT,
     schema: pe.ctx.ops.SCHEMAS.NOTE,
     objectId: 'note:fresh-' + rnd(),
-    payload: { noteId: 'x', title: 'new', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
+    payload: { noteId: 'x', label: 'new', body: SENTINEL_PREFIX + rnd(), createdAt: Date.now(), updatedAt: Date.now() },
     signer: { deviceId: dev.deviceId, signingPubkey: dev.signingPubkey, signingSecretKey: dev.signingSecretKey }
   })
   t.absent(engine._signerAuthorized({ signerPubkey: dev.signingPubkey }, Number(fresh.header.lamport)),
