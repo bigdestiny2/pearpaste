@@ -1,6 +1,8 @@
 param(
   [string] $PearLink = $env:PEARPASTE_LINK,
-  [string] $OutputDir = ""
+  [string] $OutputDir = "",
+  [int] $LaunchSmokeTimeoutSeconds = 20,
+  [switch] $SkipLaunchSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +14,93 @@ if (-not $PearLink -or -not $PearLink.StartsWith("pear://")) {
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $pearRuntimeExe = Join-Path $env:APPDATA "pear\current\by-arch\win32-x64\bin\pear-runtime.exe"
 if (-not (Test-Path -LiteralPath $pearRuntimeExe)) { throw "Missing Pear runtime: $pearRuntimeExe" }
+
+function Assert-ReleasedPearLink([string] $link) {
+  $beforeIds = New-PearProcessMap
+  try {
+    $info = (& $pearRuntimeExe info $link 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+      throw "Pear link info failed with exit code $LASTEXITCODE`n$info"
+    }
+  } finally {
+    Stop-NewPearRelatedProcesses $beforeIds
+  }
+  if ($info -notmatch "(?m)^\s*release\s+(\S+)\s*$") {
+    throw "Could not verify Pear release for $link`n$info"
+  }
+  $release = $Matches[1]
+  if ($release -eq "Unreleased") {
+    throw "Refusing to package unreleased Pear link: $link. Run pear release/stage on the production key first."
+  }
+  if ($release -notmatch "^\d+$") {
+    throw "Unexpected Pear release value for ${link}: $release"
+  }
+  Write-Host "Pear link release: $release"
+}
+
+function Get-PearRelatedProcesses {
+  Get-Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.ProcessName -eq "pear-runtime" -or
+      $_.ProcessName -eq "Pear Runtime" -or
+      $_.ProcessName -eq "PearPaste"
+    }
+}
+
+function New-PearProcessMap {
+  $ids = @{}
+  foreach ($process in Get-PearRelatedProcesses) { $ids[$process.Id] = $true }
+  return ,$ids
+}
+
+function Stop-NewPearRelatedProcesses([hashtable] $beforeIds) {
+  for ($i = 0; $i -lt 10; $i++) {
+    $created = @(Get-PearRelatedProcesses | Where-Object { -not $beforeIds.ContainsKey($_.Id) })
+    if (-not $created.Count) { break }
+    foreach ($process in $created) {
+      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 500
+  }
+}
+
+function Test-LauncherVisibleWindow([string] $exePath, [int] $timeoutSeconds) {
+  $beforeIds = New-PearProcessMap
+
+  $launcher = Start-Process `
+    -FilePath $exePath `
+    -WorkingDirectory (Split-Path -Parent $exePath) `
+    -PassThru
+
+  $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+  $visible = $null
+  while ((Get-Date) -lt $deadline) {
+    $visible = Get-PearRelatedProcesses |
+      Where-Object { -not $beforeIds.ContainsKey($_.Id) -and $_.MainWindowHandle -ne 0 } |
+      Select-Object -First 1
+    if ($visible) { break }
+    Start-Sleep -Milliseconds 500
+  }
+
+  $newProcesses = @(Get-PearRelatedProcesses | Where-Object { -not $beforeIds.ContainsKey($_.Id) })
+  if ($launcher -and -not $launcher.HasExited) {
+    Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+  }
+  Stop-NewPearRelatedProcesses $beforeIds
+
+  if (-not $visible) {
+    $snapshot = if ($newProcesses.Count) {
+      ($newProcesses | Select-Object Id, ProcessName, MainWindowHandle, MainWindowTitle, Path | Format-List | Out-String).Trim()
+    } else {
+      "No Pear-related child processes remained."
+    }
+    throw "PearPaste launcher did not create a visible window within $timeoutSeconds seconds.`n$snapshot"
+  }
+
+  Write-Host "Launcher visible-window smoke passed: $($visible.ProcessName) pid=$($visible.Id)"
+}
+
+Assert-ReleasedPearLink $PearLink
 
 if (-not $OutputDir) {
   $OutputDir = Join-Path $root "dist\windows"
@@ -64,8 +153,17 @@ $selfTest = Start-Process `
   -PassThru
 if ($selfTest.ExitCode -ne 0) { throw "PearPaste launcher self-test failed with exit code $($selfTest.ExitCode)" }
 
-& $pearRuntimeExe help run | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Pear runtime smoke test failed with exit code $LASTEXITCODE" }
+$pearSmokeProcessIds = New-PearProcessMap
+try {
+  & $pearRuntimeExe help run | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Pear runtime smoke test failed with exit code $LASTEXITCODE" }
+} finally {
+  Stop-NewPearRelatedProcesses $pearSmokeProcessIds
+}
+
+if (-not $SkipLaunchSmoke) {
+  Test-LauncherVisibleWindow (Join-Path $payloadDir "PearPaste.exe") $LaunchSmokeTimeoutSeconds
+}
 
 Compress-Archive -LiteralPath $payloadDir -DestinationPath $zipPath -CompressionLevel Optimal
 
