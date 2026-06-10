@@ -148,9 +148,17 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   function isPairingConnection (info) {
     const pending = state._pendingInvite
     const accepting = state._acceptingPairTopic
+    const lookup = state._lookupRendezvousTopic // joiner-side short-code lookup window
     const topics = info && Array.isArray(info.topics) ? info.topics : []
     if (accepting && topics.some(t => topicMatches(t, accepting))) return true
     if (accepting && topics.length === 0) return true
+    // While PAIR_LOOKUP_SHORTCODE is in flight, its rendezvous conns must stay
+    // RAW: if the firewall protomuxes them, its credential frames poison the
+    // inviter's JSON accumulator and the plaintext invite reply never parses.
+    // Mirrors the `accepting` posture above (incl. the topic-less skip —
+    // server-side Hyperswarm conns carry no topics).
+    if (lookup && topics.some(t => topicMatches(t, lookup))) return true
+    if (lookup && topics.length === 0) return true
     if (!pending) return false
     if (topics.some(t => topicMatches(t, pending.topic))) return true
     if (pending.rendezvousTopic && topics.some(t => topicMatches(t, pending.rendezvousTopic))) return true
@@ -567,10 +575,8 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
         topicPrefix: b4a.toString(rendezvousTopic, 'hex').slice(0, 16)
       })
       const rendezvousDiscovery = swarm.join(rendezvousTopic, { server: true, client: false })
-      const onRendezvousConn = (conn, info) => {
-        const topics = info && Array.isArray(info.topics) ? info.topics : []
-        // Match only the short-code rendezvous, NOT the main pair topic.
-        if (!topics.some(t => b4a.equals(b4a.from(t), rendezvousTopic))) return
+      const rendezvousTopicHex = b4a.toString(rendezvousTopic, 'hex')
+      const serveInvite = (conn) => {
         try {
           conn.write(b4a.from(JSON.stringify({ v: 1, invite: invite.invite })))
           // Half-close so the joiner sees end-of-stream; they don't reply.
@@ -578,8 +584,44 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
           log.info('pair-shortcode-served')
         } catch (_) { /* peer dropped — let TTL/cleanup handle it */ }
       }
+      const onRendezvousConn = (conn, info) => {
+        const topics = info && Array.isArray(info.topics) ? info.topics : []
+        // Topic-tagged conns (client-side dials and the in-memory test swarm)
+        // identify themselves — serve immediately, as before.
+        if (topics.some(t => b4a.equals(b4a.from(t), rendezvousTopic))) return serveInvite(conn)
+        // REAL server-side Hyperswarm connections are NEVER topic-tagged
+        // (PeerInfo.topics is only populated by the dialer's own lookups), so
+        // a joiner that found us via the short-code topic arrives here with
+        // topics=[]. Serve on an explicit request frame naming the full
+        // 32-byte rendezvous topic: deriving it requires the short code
+        // (app-namespaced HMAC), the same bar as dialing the topic. Invites
+        // are discovery-only — admission still requires source-side approval
+        // + the matching confirmation phrase (autobase-sync).
+        if (topics.length !== 0) return
+        let buf = b4a.alloc(0)
+        const onData = (d) => {
+          buf = b4a.concat([buf, d])
+          if (buf.byteLength > 4096) { conn.removeListener('data', onData); return }
+          let msg = null
+          try { msg = JSON.parse(b4a.toString(buf)) } catch (_) { return }
+          conn.removeListener('data', onData)
+          if (msg && msg.v === 1 && msg.want === 'pp-shortcode-invite' && msg.topic === rendezvousTopicHex) {
+            serveInvite(conn)
+          }
+        }
+        conn.on('data', onData)
+        conn.on('error', () => {})
+      }
       swarm.on('connection', onRendezvousConn)
-      rendezvousDiscovery.flushed().catch(() => {})
+      // Wait (bounded) for the announce to actually land on the DHT before
+      // returning the code to the renderer — the user reads the code to the
+      // other device IMMEDIATELY, and an unflushed announce is invisible to
+      // the joiner's lookup.
+      await Promise.race([
+        rendezvousDiscovery.flushed().catch(() => {}),
+        new Promise((resolve) => { const t = setTimeout(resolve, 10000); if (t.unref) t.unref() })
+      ])
+      log.info('pair-create-shortcode-rendezvous-flushed')
       rendezvousCleanup = () => {
         try { swarm.removeListener('connection', onRendezvousConn) } catch (_) {}
         try { rendezvousDiscovery.destroy() } catch (_) {}
@@ -614,6 +656,12 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       try { await ctx.relay.waitForFirstConnected({ timeoutMs: 5000 }) } catch (_) {}
     }
     const limit = Math.max(1000, Math.min(120000, Number(timeoutMs) || 30000))
+    const topicHex = b4a.toString(topic, 'hex')
+    // Open the joiner-side pairing window: isPairingConnection() keeps these
+    // rendezvous conns RAW (no firewall protomux) for the lookup's duration —
+    // otherwise the firewall's credential frames poison the inviter's JSON
+    // accumulator and the invite reply never arrives.
+    state._lookupRendezvousTopic = topic
     return await new Promise((resolve, reject) => {
       let settled = false
       const timer = setTimeout(() => {
@@ -628,6 +676,12 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       const onConn = (conn, info) => {
         const topics = info && Array.isArray(info.topics) ? info.topics : []
         if (!topics.some(t => b4a.equals(b4a.from(t), topic))) return
+        // Ask for the invite explicitly: the inviter's server-side view of
+        // this conn carries NO topic tags (real Hyperswarm never tags them),
+        // so it cannot know this conn is a short-code lookup until we say so.
+        try {
+          conn.write(b4a.from(JSON.stringify({ v: 1, want: 'pp-shortcode-invite', topic: topicHex })))
+        } catch (_) { /* conn raced shut — timeout covers it */ }
         let buf = b4a.alloc(0)
         const onData = (d) => {
           buf = b4a.concat([buf, d])
@@ -648,11 +702,25 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       swarm.on('connection', onConn)
       const discovery = swarm.join(topic, { server: false, client: true })
       function cleanup () {
+        if (state._lookupRendezvousTopic === topic) state._lookupRendezvousTopic = null
         try { swarm.removeListener('connection', onConn) } catch (_) {}
         try { discovery.destroy() } catch (_) {}
       }
-      // Best-effort flush so the lookup actively dials known peers.
-      discovery.flushed().catch(() => {})
+      // ACTIVE lookup driver: a single flushed() query races the inviter's
+      // announce propagation (seconds on a healthy DHT, longer across NATs) —
+      // if the one-shot query ran first, a passive joiner would sit blind
+      // until Hyperswarm's own (multi-minute) refresh and time out. Re-run
+      // the lookup every few seconds for the whole window instead.
+      ;(async () => {
+        try { await discovery.flushed() } catch (_) {}
+        while (true) {
+          if (settled) return
+          await new Promise((resolve) => { const t = setTimeout(resolve, 3000); if (t.unref) t.unref() })
+          if (settled) return
+          try { await discovery.refresh() } catch (_) {}
+          try { await swarm.flush() } catch (_) {}
+        }
+      })().catch(() => {})
     })
   })
 
