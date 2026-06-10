@@ -205,7 +205,10 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       try {
         const discovery = swarm.join(want.topic, want.opts)
         state.joinedTopics.set(hex, { topic: want.topic, kind: want.kind })
-        scope.spawn(async () => { await discovery.flushed() }, 'swarm-announce-' + want.kind)
+        scope.spawn(async () => {
+          await discovery.flushed()
+          try { await swarm.flush() } catch (_) {}
+        }, 'swarm-announce-' + want.kind)
       } catch (err) {
         log.warn('topic-join-failed', { kind: want.kind, err: String((err && err.message) || err) })
       }

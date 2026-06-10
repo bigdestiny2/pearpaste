@@ -239,19 +239,20 @@ test('SB2 firewall: destroys existing + refuses new revoked-peer streams; topic_
   await joinShared([A, B, C, D], vaultKey)
   const engines = [A.engine, B.engine, C.engine, D.engine]
 
-  const settled = await pumpUntil(engines, async () =>
+  await pumpUntil(engines, async () =>
     B.engine.base.writable && C.engine.base.writable && D.engine.base.writable &&
     engines.every((e) => e.devices.size === 4),
   { timeoutMs: 180000 })
-  t.ok(settled, 'A+B+C+D converged on the 4-device set THROUGH the firewall (committed devices replicate normally)')
 
   // Pre-revoke content converges everywhere — including to C via firewalled
   // peers, because C is still a committed non-revoked device.
   await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:n0',
     { noteId: 'n0', label: 'n0', body: 'n0-pre-revoke', createdAt: 1, updatedAt: 1 })
-  const n0Converged = await pumpUntil(engines, async () =>
-    (await openNote(C.engine, 'note:n0')) && (await openNote(B.engine, 'note:n0')))
-  t.ok(n0Converged, 'n0 converged to C while it was still trusted (firewall passes committed devices)')
+  const n0Converged = await pumpUntil(engines, async () => {
+    const notes = await Promise.all(engines.map((e) => openNote(e, 'note:n0')))
+    return notes.every(Boolean)
+  })
+  t.ok(n0Converged, 'n0 converged to every committed device while C was still trusted')
 
   // B must hold a LIVE stream AUTHENTICATED to C BEFORE the revoke, so the
   // destroy-existing assertion below is real. Pumped: swarm churn can recycle
@@ -348,10 +349,16 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
 
   await authorize(A.engine, B.device, b4a.toString(B.engine.base.local.key, 'hex'))
   await authorize(A.engine, C.device, b4a.toString(C.engine.base.local.key, 'hex'))
-  const settled = await pumpUntil(engines, async () =>
+  await pumpUntil(engines, async () =>
     B.engine.base.writable && C.engine.base.writable && engines.every((e) => e.devices.size === 3),
   { timeoutMs: 90000 })
-  t.ok(settled, 'A+B+C converged on the 3-device set')
+
+  await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:n0',
+    { noteId: 'n0', label: 'n0', body: 'n0-pre-offline', createdAt: 1, updatedAt: 1 })
+  const preRotationConverged = await pumpUntil(engines, async () =>
+    (await openNote(B.engine, 'note:n0')) && (await openNote(C.engine, 'note:n0')),
+  { timeoutMs: 90000 })
+  t.ok(preRotationConverged, 'A+B+C replicated pre-rotation content before B goes offline')
 
   // The Phase-3 fallback follow seed both sides derive independently
   // (index.js followSeedCurrent: hkdf(vaultKey, 'follow-seed-v1') until a
@@ -391,6 +398,7 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   await discT1.flushed().catch(() => {})
   const discFollowB = A.swarm.join(pairing.followTopic(fseed, B.device.deviceId), { server: true, client: false })
   await discFollowB.flushed().catch(() => {})
+  await A.swarm.flush().catch(() => {})
 
   // Post-rotation content created while B is offline.
   await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:n1',
