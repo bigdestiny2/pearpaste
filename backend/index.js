@@ -105,7 +105,9 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   // kill-switch: legacy unconditional replication, still authenticating
   // outbound so enforcing peers accept us.
   const firewall = createReplicationFirewall({
-    store: vaultStore.store,
+    // Resolved lazily: resetReplicatedStorage() (vault switch, Fix A2) replaces
+    // the Corestore object, so the firewall must always replicate the live one.
+    getStore: () => vaultStore.store,
     log,
     getDevice: () => state.device,
     getEngine: () => ctx.sync,
@@ -285,6 +287,40 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     return out
   }
 
+  // DEVICE_HYGIENE Fix A2 — vault-scoped storage hygiene on replacement.
+  // When CREATE_VAULT / RESTORE_VAULT targets a vaultId that DIFFERS from the
+  // one this install last stored, the prior vault's replicated cores (shared
+  // under the fixed autobase/search namespaces) would otherwise stay on disk
+  // and its device records would surface as unresolvable `{ sealed: true }`
+  // rows in the new vault's DEVICE_LIST. So we tear the prior vault down and
+  // wipe its cores BEFORE the new base is opened. A same-vault restore (prior
+  // === new) is a no-op, so an existing paired vault keeps its cores and its
+  // committed writerKey — the breaking-migration trap is avoided by never
+  // touching the namespace. Returns true iff a reset was performed.
+  async function maybeSwitchVaultStorage (newVaultId) {
+    let priorVaultId = null
+    try {
+      const h = await vaultStore.getVaultHeader()
+      priorVaultId = h && h.vaultId
+    } catch (_) { priorVaultId = null }
+    if (!priorVaultId || priorVaultId === newVaultId) return false
+    log.info('vault-switch-reset', { reason: 'different vaultId on this install' })
+    // Cleanly tear down the outgoing vault: lock() wipes its keys + leaves the
+    // swarm and re-arms the sync readiness gate (via the 'locked' event) so a
+    // handler racing the new open() waits for the NEW engine, not the old one.
+    if (isUnlocked()) lock()
+    // lock() spawns engine.close(); await it directly so no core session is
+    // open when we wipe storage (close() is idempotent).
+    if (ctx.sync && typeof ctx.sync.close === 'function') {
+      try { await ctx.sync.close() } catch (_) {}
+    }
+    // Let the relay service drop its cached client (it captured the old store).
+    ctx.emit('vault-storage-reset')
+    await vaultStore.resetReplicatedStorage()
+    state._vaultHeaderCache = null
+    return true
+  }
+
   function lock () {
     leaveVault()
     for (const [, v] of state.openItems) if (v.timer) clearTimeout(v.timer)
@@ -364,8 +400,13 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   dispatcher.register(COMMANDS.CREATE_VAULT, async ({ label, platform, passphrase = '' }) => {
     const mnemonic = identity.generateMnemonic()
     const rootSeed = identity.deriveRootSeed(mnemonic, passphrase)
+    const newVaultId = identity.vaultIdFromRootSeed(rootSeed)
+    // Wipe a prior, different vault's replicated cores before opening this one
+    // (Fix A2). Done while state still reflects the outgoing vault so lock()
+    // can tear it down cleanly.
+    await maybeSwitchVaultStorage(newVaultId)
     state.vaultKeys = crypto.deriveVaultKeys(rootSeed)
-    state.vaultId = identity.vaultIdFromRootSeed(rootSeed)
+    state.vaultId = newVaultId
     state.device = identity.createDeviceIdentity({ label, platform })
     // Remember the unlock secret + epoch chain so the sync engine can re-wrap a
     // newly-unwrapped epoch key into the local blob at rotation (design §5.9).
@@ -415,6 +456,10 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
         approvalRequired: true
       })
     }
+    // Wipe a prior, different vault's replicated cores before restoring onto
+    // this install (Fix A2). A same-vault restore (recovery / re-pair) is a
+    // no-op so the existing base + its committed writerKeys are preserved.
+    const didReset = await maybeSwitchVaultStorage(vaultId)
     state.vaultKeys = crypto.deriveVaultKeys(rootSeed)
     state.vaultId = vaultId
     let restoredDev = null
@@ -439,6 +484,21 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
       epochKeys: state._epochKeysLocal,
       followSeed: state._followSeed
     })
+    // If we wiped a prior vault's storage, the meta bee is empty — re-record
+    // this vault's id so a future CREATE/RESTORE can detect the next switch.
+    // (The autobaseKey is intentionally omitted; sync.open() writes it as this
+    // device bootstraps/joins the base.) Skipped on a same-vault restore so an
+    // existing header's autobaseKey is never clobbered into a fork.
+    if (didReset) {
+      await vaultStore.putVaultHeader({
+        version: 1,
+        vaultId: state.vaultId,
+        createdAt: Date.now(),
+        kdf: 'argon2id',
+        crypto: 'xchacha20poly1305-ietf',
+        sync: 'autobase-v1'
+      })
+    }
     crypto.wipe(rootSeed)
     state.locked = false
     await joinVault()

@@ -213,6 +213,45 @@ export class VaultStore {
     this.saveLocalDevice(device, unlockSecret, vaultSecrets)
   }
 
+  // Switch this install to a DIFFERENT vault: tear down and WIPE every
+  // replicated core (the Autobase op log + view, the local search index, and
+  // the vault header) so a prior vault's device records can never surface as
+  // unresolvable `{ sealed: true }` rows in the new vault, and its cores never
+  // linger on disk (DEVICE_HYGIENE Fix A2).
+  //
+  // Why a full close + reopen + storage.clear() rather than per-core deletion:
+  // the namespaces that seed the derived writer keypair are LEFT UNCHANGED
+  // (so a vault that is NOT being replaced keeps its committed `writerKey` —
+  // the breaking-migration trap the obvious one-line namespace change falls
+  // into). corestore (7.9.2) keeps cores cached in memory beyond session close,
+  // so clearing the live store leaves stale heads; and hypercore (11.30.2)
+  // `core.purge()` is non-functional. The robust path is therefore: fully close
+  // the Corestore, reopen a fresh one on the same dir, and `storage.clear()`
+  // BEFORE any core is opened — verified to drop every core from disk while the
+  // store stays reusable.
+  //
+  // local-device.json (a sibling file, never part of the Corestore) is left
+  // untouched; the caller re-persists it for the new vault. The Corestore
+  // OBJECT is replaced here, so any long-lived holder of `vaultStore.store`
+  // MUST re-read it: the replication firewall reads it lazily, and the relay
+  // service drops its cached client on the 'vault-storage-reset' event.
+  async resetReplicatedStorage () {
+    try { if (this._meta) await this._meta.close() } catch (_) {}
+    this._meta = null
+    this._opened = false
+    try { await this.store.close() } catch (_) {}
+    this.store = new Corestore(this.storagePath)
+    await this.store.ready()
+    // Wipe every core from disk in place on the freshly reopened (cache-empty)
+    // store. clear() lives on the underlying hypercore-storage instance.
+    if (this.store.storage && typeof this.store.storage.clear === 'function') {
+      await this.store.storage.clear()
+    } else {
+      throw new CryptoError('corestore storage.clear() unavailable; cannot wipe prior vault', 'NO_STORAGE_CLEAR')
+    }
+    await this.ready()
+  }
+
   async close () {
     try { if (this._meta) await this._meta.close() } catch (_) {}
     try { await this.store.close() } catch (_) {}

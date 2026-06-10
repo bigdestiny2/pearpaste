@@ -864,6 +864,19 @@ export async function attach (ctx) {
     }, 'relay-autoseed')
   })
 
+  // Vault switch (DEVICE_HYGIENE Fix A2): the install replaced its vault and
+  // vaultStore reopened a NEW Corestore object. Our cached relay client captured
+  // the OLD (now closed) store, so drop it — the next ensureClient() rebuilds it
+  // against the live store, and seeded-key state from the prior vault is void.
+  ctx.on('vault-storage-reset', () => {
+    const client = rstate.client
+    rstate.client = null
+    rstate.seeded.clear()
+    if (client && typeof client.destroy === 'function') {
+      ctx.scope.spawn(async () => { try { await client.destroy() } catch (_) {} }, 'relay-reset')
+    }
+  })
+
   // Cross-agent wiring: the sync subsystem announces the encrypted vault-log
   // key via the 'sync-open' event ({ autobaseKey }), not on ctx.state. Capture
   // it here so the auto-seed actually fires once the log key is known (the

@@ -51,6 +51,12 @@ const UNKNOWN_RECHECK_MS = 1000
 
 export function createReplicationFirewall ({
   store,
+  // Optional lazy store resolver. The Corestore object is REPLACED when the
+  // install switches to a different vault (DEVICE_HYGIENE Fix A2 wipes + reopens
+  // it), so a captured `store` reference would go stale. When `getStore` is
+  // wired we resolve the live store at replicate() time; `store` stays as a
+  // back-compat fallback for lightweight test harnesses.
+  getStore = null,
   log = { debug () {}, info () {}, warn () {}, error () {} },
   getDevice, // () => local device identity (deviceId/signingPubkey/signingSecretKey) or null when locked
   getEngine, // () => sync engine (devices map + isDeviceAllowed) or null before attach/open
@@ -98,10 +104,12 @@ export function createReplicationFirewall ({
     })
   }
 
+  const resolveStore = typeof getStore === 'function' ? getStore : () => store
+
   function replicate (conn, tag) {
     if (conn.__ppReplicating || conn.destroyed) return
     conn.__ppReplicating = true
-    try { store.replicate(conn) } catch (err) {
+    try { resolveStore().replicate(conn) } catch (err) {
       log.warn('replicate-failed', { err: String(err), via: tag })
     }
   }
