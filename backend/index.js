@@ -196,7 +196,7 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
           if (d.revokedAtLamport != null) continue // NEVER announce a revoked device's follow topic
           if (state.device && d.deviceId === state.device.deviceId) continue
           const ft = pairing.followTopic(fseed, d.deviceId)
-          desired.set(b4a.toString(ft, 'hex'), { topic: ft, kind: 'follow-peer', opts: { server: true, client: false } })
+          desired.set(b4a.toString(ft, 'hex'), { topic: ft, kind: 'follow-peer', opts: { server: true, client: true } })
         }
       }
     }
