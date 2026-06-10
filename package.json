@@ -42,9 +42,19 @@
       ],
       "ignore": [
         "/.git",
+        "/.github",
+        "/.claude",
+        "/.planning",
+        "/.pear-stage",
         "/test",
+        "/docs",
+        "/mobile",
+        "/website",
+        "/dist",
+        "/flatpak",
+        "/assets/marketing",
         "/node_modules/.cache",
-        "/docs"
+        ".DS_Store"
       ]
     }
   },
