@@ -162,8 +162,14 @@ class SyncEngine {
     }
 
     // local-only (un-topic'd) search index
+    // [AUDIT I-14/I-8] Core name bumped local-search-v1 -> local-search-v2 to
+    // abandon the old row format (per-token sealed-envelope values + no reverse
+    // rows). The index is DERIVED from the committed notes, so v2 starts empty
+    // and is rebuilt below via the new (fast) indexObject path. v1 cores are
+    // simply left behind (local-only, never replicated — no migration to
+    // coordinate across devices).
     const searchStore = ctx.vaultStore.namespace(NAMESPACES.SEARCH)
-    const searchCore = searchStore.get({ name: 'local-search-v1' })
+    const searchCore = searchStore.get({ name: 'local-search-v2' })
     await searchCore.ready()
     this._searchBee = beeFromCore(searchCore)
     await this._searchBee.ready()
@@ -203,8 +209,85 @@ class SyncEngine {
     await this.base.update()
     ctx.state.lamport.observe(await this._maxDurableLamport())
 
+    // [AUDIT I-14/I-8] v2 search-index rebuild. The search core name was bumped
+    // (v1 -> v2), so a vault that already has committed notes opens with an
+    // EMPTY v2 search bee. The reducer's apply pass does NOT re-run on a
+    // fully-indexed reopen (it replays only the un-indexed tail), so the rebuild
+    // cannot be left to apply — it must be explicit here. The index is DERIVED
+    // from notes, so we re-index every committed note via the new (fast,
+    // O(tokens)) indexObject path. Idempotent + cheap: skipped entirely once the
+    // v2 bee holds any row (steady-state reopens are a single peek).
+    await this._rebuildSearchIndexIfEmpty()
+
     this._opened = true
     ctx.emit('sync-open', { autobaseKey: b4a.toString(this.base.key, 'hex') })
+  }
+
+  // [AUDIT I-14/I-8] One-shot, idempotent rebuild of the local-only v2 search
+  // index from the committed notes. Returns the number of notes (re)indexed
+  // (0 when the index was already populated or the vault has none). Fail-soft:
+  // search is a derived convenience, so a rebuild hiccup must never block
+  // unlock. Bounded + logged so a huge vault cannot silently stall the unlock
+  // path (it is fast with the new indexObject, but we still cap + report).
+  async _rebuildSearchIndexIfEmpty () {
+    if (!this.localSearch || !this._searchBee || !this.view) return 0
+    try {
+      // Empty-check via a single peek over the whole bee (limit-1 range read);
+      // if ANY row exists (token pointer or reverse row) the index is already
+      // built — no-op, so steady-state reopens pay one cheap read.
+      const existing = await this._searchBee.peek({})
+      if (existing) return 0
+    } catch (_) { return 0 }
+
+    let sealed
+    try {
+      sealed = await this.view.scanNotes()
+    } catch (_) { return 0 }
+    if (!sealed || sealed.length === 0) return 0
+
+    const started = Date.now()
+    // Hard ceiling so a pathological vault cannot pin the unlock indefinitely.
+    // 50k notes >> any realistic local vault; the new indexObject is O(tokens),
+    // so even this bound completes in well under a second. If ever exceeded we
+    // index the bound and log — search degrades gracefully (later writes still
+    // index incrementally), unlock never hangs.
+    const MAX_REBUILD = 50000
+    let indexed = 0
+    let skipped = 0
+    const cap = Math.min(sealed.length, MAX_REBUILD)
+    for (let i = 0; i < cap; i++) {
+      const { objectBlindId, envelope } = sealed[i]
+      // Resolve the plaintext objectId (note:<id>) the row was sealed under,
+      // exactly as NOTE_LIST does, then decrypt to recover the searchable text.
+      let objectId = null
+      try {
+        const meta = await this.view.resolveObjMeta(objectBlindId)
+        objectId = meta && meta.objectId
+      } catch (_) { objectId = null }
+      if (!objectId) { skipped++; continue } // sealed/orphan row this device cannot resolve
+      let body = null
+      try { body = this.view.openRecord({ objectId, envelope }) } catch (_) { body = null }
+      if (!body) { skipped++; continue } // no epoch key on this device — leave unindexed
+      try {
+        // MUST mirror the reducer's texts byte-for-byte (_applyNoteUpsert) so
+        // the rebuilt index equals what apply would have written: deleted notes
+        // contribute no tokens; otherwise [title?, body, ...tags].
+        await this.localSearch.indexObject({
+          objectId,
+          objectBlindId,
+          type: 'note',
+          texts: body.deletedAt ? [] : [body.title, body.body, ...(body.tags || [])]
+        })
+        indexed++
+      } catch (_) { skipped++ }
+    }
+    const ms = Date.now() - started
+    try {
+      this.ctx.log && this.ctx.log.info && this.ctx.log.info('search-index-rebuild', {
+        notes: sealed.length, indexed, skipped, capped: sealed.length > MAX_REBUILD, ms
+      })
+    } catch (_) {}
+    return indexed
   }
 
   _bootstrapKey () {
