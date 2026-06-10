@@ -1,6 +1,6 @@
 # Device hygiene — phantom / stale device records
 
-**Status:** 1 of 3 fixed (liveness surfacing). Two root-cause fixes specified below, deferred because each carries a real risk that must be designed for, not rushed into the append-only multi-writer core.
+**Status:** 2 of 3 fixed (liveness surfacing + pairing-phantom cleanup). The remaining root-cause fix (Fix A) stays deferred because it is a breaking storage migration that must be designed for, not rushed into the append-only multi-writer core.
 
 **Reported:** a Devices list showing several "Sealed — tap to decrypt" records plus a revoked device, after repeated vault creation + abandoned pairing attempts on one install — read as "random devices connected."
 
@@ -21,7 +21,7 @@ All launches of the production link share **one** per-link storage dir
    commits `_appendDeviceAdd` the instant the user clicks **Approve**, then
    delivers the sealed bootstrap. If the joiner never completes (disconnect,
    abandon, crash), the device is permanently authorized but never connects. →
-   **DEFERRED — see Fix B.**
+   **FIXED — see Fix B.**
 
 3. **Stale cross-vault records.** Re-creating/restoring a vault on an install
    that already had one can leave device records from a prior vault key visible
@@ -79,7 +79,47 @@ install → `DEVICE_LIST` for B returns exactly B's genesis device; zero
 
 ---
 
-## DEFERRED — Fix B: pairing-phantom cleanup
+## FIXED — Fix B: pairing-phantom cleanup
+
+Implemented in `backend/autobase-sync.js` exactly along the join-confirmation
+path below, with one deliberate deviation forced by the multi-writer core:
+
+- **Joiner half (PAIR_ACCEPT).** After opening the bootstrap, persisting keys,
+  and bringing the engine up, the joiner spawns a scoped task that waits for its
+  writer seat to linearize, appends its **genesis-tail `DEVICE_ADD`** (an
+  idempotent self-confirmation — a new `_applyDeviceAdd` branch accepts a
+  present, non-revoked device re-asserting its own already-committed record
+  silently, so it mutates nothing but makes the joiner's writer core produce a
+  node), then sends `pp-pair-joined { deviceId, confirmation }` back on the
+  pairing conn.
+- **Inviter half (`approvePairRequest`).** Returns success immediately, then
+  spawns a `ctx.scope` confirm task (`spawnJoinConfirm`) that confirms via
+  **either** the `pp-pair-joined` ack (a fresh data listener with its own
+  buffer, so the earlier hello frame can't corrupt parsing) **or**
+  `_writerHasNode(writerKey)` (the joiner's writer produced a node — conn
+  independent). Only if **neither** appears within `engine.pairJoinConfirmMs`
+  (default 15 min; overridable, e.g. tests use ~1 s) does it append a
+  compensating revoke via `revokePhantomDevice`.
+- **Deviation — the compensating revoke does NOT rotate the epoch key.** A
+  phantom was admitted as an *indexer* writer that never connected, so its
+  writer core never replicated; appending the usual `KEY_ROTATE` drives an
+  indexer-set advance that can never checkpoint against that permanently-offline
+  indexer and the linearizer interrupts the base (the GATE SB1 freeze —
+  reproduced directly while building this fix). A *plain* `DEVICE_REVOKE`
+  linearizes cleanly. Rotation's forward-secrecy is moot here regardless: a
+  phantom never established replication, so it pulled zero ciphertext, and once
+  the revoke commits the B12 reject-committed-revoked gate denies its writes
+  while the replication firewall (SB2) refuses it any future stream — it can
+  never obtain content sealed under the current key, held or not.
+
+Regression-guarded by `test/integration/pairing-phantom.test.js` (both
+acceptance cases, configurable short window); the happy-path approval flow in
+`test/security/sec-pairing.test.js` passes unchanged (the generous default
+window never fires within a test's lifetime).
+
+---
+
+## DESIGN — Fix B: pairing-phantom cleanup
 
 **Goal:** an approval whose peer never finishes joining does not leave a
 permanently-authorized device.
