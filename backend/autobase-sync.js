@@ -168,6 +168,22 @@ class SyncEngine {
       await this.base.update()
     }
 
+    // [AUDIT I-1] Restore the Lamport high-water mark on reopen. The clock is
+    // constructed fresh as new Lamport(0) on every unlock (index.js), and its
+    // only re-raise (`observe(h.lamport)` in _apply) does NOT run on a
+    // fully-indexed reopen — Autobase replays apply only over the un-indexed
+    // tail, so a vault opened at rest leaves the clock at 0. The first edit of
+    // any existing note would then mint a tiny lamport that loses LWW against
+    // the note's own stored lamport (Lamport.beats), silently dropping the
+    // edit. Re-seed from the max header.lamport durably present across every
+    // active writer core (lamport is a PUBLIC header field — shared-ops.js
+    // HEADER_PUBLIC_FIELDS — so this reads no secret; observe() is a monotonic
+    // max-merge, hence reorg-safe). MUST run after the genesis bootstrap above:
+    // that self-add re-appends a fresh DEVICE_ADD at the writer tail with a
+    // small lamport, so the max is taken over ALL nodes, never the tail alone.
+    await this.base.update()
+    ctx.state.lamport.observe(await this._maxDurableLamport())
+
     this._opened = true
     ctx.emit('sync-open', { autobaseKey: b4a.toString(this.base.key, 'hex') })
   }
@@ -635,6 +651,43 @@ class SyncEngine {
       const peers = w.core.peers
       return Array.isArray(peers) && peers.length > 0
     } catch (_) { return false }
+  }
+
+  // [AUDIT I-1] Highest `header.lamport` durably present across every active
+  // writer core, used by open() to restore the Lamport high-water mark after a
+  // reopen. Each writer core stores Autobase OplogMessage nodes (verified on
+  // autobase 7.28.1): `core.get(seq)` decodes to `{ node: { value } }` where
+  // `node.value` is the JSON-encoded ReplicatedOp; `header.lamport` is a PUBLIC
+  // field (shared-ops.js HEADER_PUBLIC_FIELDS), so this leaks no secret bytes.
+  // We take the max over ALL nodes (not just the tail): a fully-indexed reopen
+  // re-appends a fresh genesis DEVICE_ADD with a SMALL lamport at the local
+  // writer's tail, so a tail-only read would under-recover. Scanning all active
+  // writers (incl. remote ones bootstrapped into the local store) also keeps
+  // the clock monotone across devices. Best-effort and fail-soft: any read
+  // error is skipped so a transient core hiccup never blocks unlock.
+  async _maxDurableLamport () {
+    let max = 0
+    try {
+      const base = this.base
+      if (!base || !base.activeWriters) return 0
+      for (const w of base.activeWriters) {
+        const core = w && w.core
+        if (!core) continue
+        try { await core.ready() } catch (_) { continue }
+        const len = core.length
+        for (let i = 0; i < len; i++) {
+          let node
+          try { node = await core.get(i) } catch (_) { continue }
+          const value = node && node.node ? node.node.value : null
+          if (value == null) continue
+          let op
+          try { op = b4a.isBuffer(value) ? JSON.parse(b4a.toString(value)) : value } catch (_) { continue }
+          const lam = op && op.header && op.header.lamport != null ? Number(op.header.lamport) : NaN
+          if (Number.isFinite(lam) && lam > max) max = lam
+        }
+      }
+    } catch (_) { /* fail-soft: never block unlock on clock recovery */ }
+    return max
   }
 
   // Bounded wait until this device's Autobase writer seat has linearized so
@@ -2366,6 +2419,17 @@ export async function attach (ctx) {
     try { await engine.ready(15000) } catch (_) { return { devices: [] } }
     await engine.refresh()
     const rows = await engine.view.listDevicesSealed()
+    // Live connection truth: the replication firewall holds the set of peer
+    // deviceIds with a CURRENTLY-authenticated replication stream. A device
+    // record existing in the log means "authorized," NOT "connected" — a
+    // device added via a pairing approval that never completed is authorized
+    // but has never connected. Surfacing `connected` lets the UI stop implying
+    // every authorized record is a live peer (the "phantom connected devices"
+    // confusion). Read-only; absent firewall (tests) → nobody connected.
+    const live = (ctx.replicationFirewall && typeof ctx.replicationFirewall.authenticatedPeers === 'function')
+      ? ctx.replicationFirewall.authenticatedPeers()
+      : {}
+    const selfId = ctx.state.device && ctx.state.device.deviceId
     const devices = []
     for (const { key, value } of rows) {
       const blindId = key.slice('devices!'.length)
@@ -2381,16 +2445,23 @@ export async function attach (ctx) {
           break
         }
       }
-      devices.push(plain
-        ? {
-            deviceId: plain.deviceId,
-            label: plain.label,
-            platform: plain.platform,
-            roles: plain.roles,
-            revoked: plain.revokedAt != null,
-            createdAt: plain.createdAt
-          }
-        : { blindId, sealed: true })
+      if (plain) {
+        const isSelf = !!selfId && plain.deviceId === selfId
+        devices.push({
+          deviceId: plain.deviceId,
+          label: plain.label,
+          platform: plain.platform,
+          roles: plain.roles,
+          revoked: plain.revokedAt != null,
+          createdAt: plain.createdAt,
+          // `self` is always reachable; a peer is connected only with a live
+          // authenticated stream. Revoked devices are never connected.
+          self: isSelf,
+          connected: plain.revokedAt != null ? false : (isSelf || (Number(live[plain.deviceId]) || 0) > 0)
+        })
+      } else {
+        devices.push({ blindId, sealed: true, connected: false })
+      }
     }
     return { devices }
   })

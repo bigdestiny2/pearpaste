@@ -297,3 +297,29 @@ test('Phase 1: epochkeys! family + vault-state activeEpoch round-trip through th
 
 // Resolve this PearEnd's local deviceId for cache lookups.
 function ctxDeviceId (pe) { return pe.ctx.state.device.deviceId }
+
+test('DEVICE_LIST reports liveness: own device is self+connected, no phantom peers', async (t) => {
+  const dir = tmp()
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
+  t.teardown(async () => { await pe.close(); fs.rmSync(dir, { recursive: true, force: true }) })
+
+  await pe.call(COMMANDS.CREATE_VAULT, { label: 'mac', platform: 'macos', passphrase: 'pw' })
+  const selfId = ctxDeviceId(pe)
+
+  const { devices } = await pe.call(COMMANDS.DEVICE_LIST, {})
+  t.ok(Array.isArray(devices), 'DEVICE_LIST returns an array')
+
+  const resolved = devices.filter((d) => d.deviceId)
+  t.is(resolved.length, 1, 'a fresh vault has exactly ONE device (the genesis self device) — no phantoms')
+
+  const me = resolved.find((d) => d.deviceId === selfId)
+  t.ok(me, 'own device present')
+  t.is(me.self, true, 'own device is flagged self')
+  t.is(me.connected, true, 'own device is always reachable (connected=true)')
+
+  // No record may claim a live peer connection: the firewall has zero
+  // authenticated peer streams on a solo vault, so the only connected=true
+  // entry is self. This is the regression guard for "phantom connected devices".
+  const peerConnected = resolved.filter((d) => d.connected && d.deviceId !== selfId)
+  t.is(peerConnected.length, 0, 'no non-self device reports connected=true')
+})
