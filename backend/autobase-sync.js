@@ -2000,12 +2000,23 @@ export async function attach (ctx) {
     }
 
     const bootstrap = await new Promise((resolve, reject) => {
-      // 90 s — first-time DHT rendezvous + UDX hole-punching across asymmetric
-      // networks (Wi-Fi ↔ carrier-grade NAT on cellular) can take well over the
-      // 30 s the original timeout allowed, and a backgrounded source app pauses
-      // its sockets until it foregrounds. Users perceive "pairing failed" long
-      // before the spec's recovery kicks in if we bail too early.
-      const timer = setTimeout(() => { cleanup(); reject(new Error('pairing timed out — keep both devices unlocked and foregrounded, then retry')) }, 90000)
+      // The joiner must wait long enough to cover BOTH first-time DHT
+      // rendezvous + UDX hole-punching (Wi-Fi ↔ CGNAT can exceed 30 s, and a
+      // backgrounded source app pauses its sockets until it foregrounds) AND
+      // the HUMAN approval round-trip on the inviter (read + compare the
+      // confirmation phrase, click approve). The old flat 90 s budget was
+      // consumed by connection setup first, so a user approving across two
+      // machines routinely blew the window while the invite itself was still
+      // valid (DEFAULT_TTL 5 min) — the inviter's prompt appeared, but the
+      // joiner had already given up by the time they accepted. Wait until the
+      // invite can no longer be approved (its expiresAt, plus a clock-skew
+      // grace so we don't bail a hair before the inviter would), with a 90 s
+      // floor so a short-TTL invite still gets full connect headroom. Only ever
+      // EXTENDS the wait; never shortens it.
+      const SKEW_GRACE_MS = 30000
+      const remainingTtl = (Number(decoded.expiresAt) || 0) - Date.now()
+      const waitMs = Math.max(90000, remainingTtl + SKEW_GRACE_MS)
+      const timer = setTimeout(() => { cleanup(); reject(new Error('pairing timed out — keep both devices unlocked and foregrounded, then retry')) }, waitMs)
       // Track which connections we've already greeted so we don't double-hello
       // (the connection event can sometimes fire twice as topics get associated).
       const greeted = new WeakSet()
