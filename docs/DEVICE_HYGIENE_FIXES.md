@@ -1,6 +1,6 @@
 # Device hygiene — phantom / stale device records
 
-**Status:** 2 of 3 fixed (liveness surfacing + pairing-phantom cleanup). The remaining root-cause fix (Fix A) stays deferred because it is a breaking storage migration that must be designed for, not rushed into the append-only multi-writer core.
+**Status:** 3 of 3 addressed (liveness surfacing + pairing-phantom cleanup + vault-switch storage reset). Fix A landed as **A2** (explicit reset on replacement, never a namespace change) covering `CREATE_VAULT`/`RESTORE_VAULT`; known residuals for both Fix A and Fix B are tracked in their sections below.
 
 **Reported:** a Devices list showing several "Sealed — tap to decrypt" records plus a revoked device, after repeated vault creation + abandoned pairing attempts on one install — read as "random devices connected."
 
@@ -26,7 +26,7 @@ All launches of the production link share **one** per-link storage dir
 3. **Stale cross-vault records.** Re-creating/restoring a vault on an install
    that already had one can leave device records from a prior vault key visible
    as unresolvable `{ sealed: true }` rows (the current vault key can't open
-   them). → **DEFERRED — see Fix A.**
+   them). → **FIXED (A2) — see Fix A.**
 
 Confirmed NOT a confidentiality breach: vaults are isolated by a per-vault
 autobase key, a vault-key-derived discovery topic, and the signed replication
@@ -51,10 +51,41 @@ Recommended UI follow-up: render `connected` (e.g. a dot), label
 
 ---
 
-## DEFERRED — Fix A: vault-scoped storage isolation
+## FIXED (A2) — Fix A: vault-scoped storage isolation
 
 **Goal:** a new/restored vault on an install can never surface a prior vault's
 device records.
+
+**Implemented as A2** (`backend/index.js` `maybeSwitchVaultStorage` +
+`backend/vault-store.js` `resetReplicatedStorage`): on `CREATE_VAULT` /
+`RESTORE_VAULT` where the new `vaultId` differs from the header's stored one,
+the prior vault is locked, the sync engine torn down (waiting out the in-flight
+close), and the Corestore is closed → reopened → `storage.clear()`ed before any
+core opens — verified to wipe every core while named-core keys stay stable
+(`corestore` caches cores past session close, and `hypercore` 11's
+`core.purge()` is non-functional, so this is the only robust path). The
+namespaces are untouched, so a vault that is NOT replaced keeps its committed
+`writerKey` — no breaking migration. Vault-lifecycle commands are serialized
+through one promise chain so a concurrent `UNLOCK_VAULT` cannot interleave into
+a half-finished switch, and the new vault's id is stamped into the header
+immediately after the wipe so a crash mid-switch stays detectable. Both
+`CREATE_VAULT` and `RESTORE_VAULT` always record `vaultId` in the header
+(merge-write), closing the restore-onto-fresh-install detection hole.
+Regression-guarded by `test/integration/device-hygiene-vault-switch.test.js`.
+
+**KNOWN RESIDUALS (reviewed, deliberate):**
+- **`PAIR_ACCEPT` is a third vault-switch entry point** and does NOT reset
+  storage: it adopts the inviter's `vaultId`/header directly, so a prior
+  vault's cores survive that path (and the header overwrite makes the leak
+  invisible to later switch detection). The fix must run BEFORE the pairing
+  hello derives the joiner `writerKey` (the committed writer must match
+  post-wipe storage) and needs same-vault re-pair semantics decided — do not
+  bolt it on without that design.
+- **`local-device.json` is not vault-scoped.** Restoring a DIFFERENT vault with
+  the SAME non-empty passphrase resurrects the prior vault's device identity,
+  epoch keys, and follow seed from the local blob (no `vaultId` check on the
+  decrypted blob). Empty-passphrase installs are safe (the wrap secret is the
+  mnemonic, which differs per vault).
 
 **Why not a one-line namespace change.** The obvious fix —
 `namespace(NAMESPACES.AUTOBASE + ':' + vaultId)` — also changes the *derived
@@ -116,6 +147,28 @@ Regression-guarded by `test/integration/pairing-phantom.test.js` (both
 acceptance cases, configurable short window); the happy-path approval flow in
 `test/security/sec-pairing.test.js` passes unchanged (the generous default
 window never fires within a test's lifetime).
+
+**KNOWN CAVEATS (code review, 2026-06-11 — confirmed against the committed
+code, follow-ups for this fix):**
+- **Locking the vault during the window suppresses the cleanup.** The confirm
+  loop reads `engine.devices` — which `engine.close()` clears on every lock —
+  and treats an absent device as "confirmed", emitting a spurious
+  `pair-join-confirmed` and never revoking. The loop needs an
+  `engine._opened` guard distinguishing "engine closed" from "device gone".
+- **No durable re-arm.** The confirm task is in-memory only; quit/restart
+  inside the window leaves the phantom permanently authorized. The pending
+  confirmation should be persisted (or re-derived from committed state) and
+  re-armed at engine open.
+- **The no-rotation premise fails for bootstrap-holding joiners.** The sealed
+  bootstrap (vaultKey + active epoch key + autobaseKey) is delivered BEFORE the
+  window starts, so a joiner that received it and then went silent is revoked
+  WITHOUT rotation while holding the current epoch key — and third-party relays
+  serve post-revoke ciphertext (the documented L2 residual). The premise
+  "pulled zero ciphertext" only holds for joiners that never got the bootstrap.
+- **`_writerHasNode` has no baseline.** Any pre-existing writer-core history
+  (e.g. a revoked device re-pairing from the same install, which presents the
+  same deterministic `writerKey`) counts as a fresh join confirmation; capture
+  the core length at approve time and confirm only on growth.
 
 ---
 

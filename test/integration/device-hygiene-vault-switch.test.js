@@ -126,3 +126,38 @@ test('Fix A2: a new vault on the same install never inherits the prior vault\'s 
   // device (B's genesis) proves A's cores were wiped from disk.
   t.is(pe.ctx.sync.devices.size, 1, 'committed device set rebuilt from disk holds only vault B\'s genesis')
 })
+
+// Regression (review finding): a vault that arrives via RESTORE_VAULT onto a
+// FRESH install must still stamp its vaultId into the header. Without that,
+// the header ends up holding only { autobaseKey } (written by sync.open), the
+// NEXT switch reads priorVaultId === undefined, and the Fix A2 wipe is
+// silently skipped — leaking the restored vault's cores into its successor.
+test('Fix A2: restore onto a fresh install stamps vaultId so the NEXT switch still wipes', { timeout: 60000 }, async (t) => {
+  const dir = tmp('restore-stamp')
+  const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
+  t.teardown(async () => { try { await pe.close() } catch (_) {}; fs.rmSync(dir, { recursive: true, force: true }) })
+
+  // Vault B arrives via restore-from-mnemonic on a fresh install (no prior
+  // header, so no reset happens — the stamping must not depend on didReset).
+  const mn = identity.generateMnemonic()
+  const r = await call(pe, COMMANDS.RESTORE_VAULT, { mnemonic: mn, passphrase: 'pw-b' })
+  await pe.ctx.sync.ready(15000)
+  await pumpUntil(pe.ctx.sync, () => pe.ctx.sync.devices.size >= 1, { timeoutMs: 8000 })
+
+  const hdr = await pe.vaultStore.getVaultHeader()
+  t.is(hdr && hdr.vaultId, r.vaultId, 'restored header carries the vaultId')
+  t.ok(hdr && hdr.autobaseKey, 'merge-write preserved the autobaseKey sync.open recorded')
+
+  // Now CREATE a different vault C on the same install — the switch must be
+  // detected (via the stamped header) and B's cores wiped.
+  const c = await call(pe, COMMANDS.CREATE_VAULT, { label: 'next', platform: 'macos', passphrase: 'pw-c' })
+  t.not(c.vaultId, r.vaultId, 'vault C has a different vaultId')
+  await pe.ctx.sync.ready(15000)
+  await pumpUntil(pe.ctx.sync, () => pe.ctx.sync.devices.size >= 1, { timeoutMs: 8000 })
+
+  const list = await call(pe, COMMANDS.DEVICE_LIST, {})
+  t.is(list.devices.filter((d) => d.sealed).length, 0, 'zero sealed rows leaked from the restored vault')
+  t.is(list.devices.length, 1, 'DEVICE_LIST(C) returns exactly one device')
+  t.is(list.devices[0].deviceId, c.deviceId, 'the one device is vault C\'s genesis device')
+  t.is(pe.ctx.sync.devices.size, 1, 'committed device set holds only vault C\'s genesis')
+})

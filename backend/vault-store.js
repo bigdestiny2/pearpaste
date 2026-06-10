@@ -235,6 +235,12 @@ export class VaultStore {
   // OBJECT is replaced here, so any long-lived holder of `vaultStore.store`
   // MUST re-read it: the replication firewall reads it lazily, and the relay
   // service drops its cached client on the 'vault-storage-reset' event.
+  //
+  // storage.clear() also wipes the corestore primary-key SEED. Verified safe:
+  // every core created afterwards persists its own keypair in its core record,
+  // so existing cores stay readable AND writable across a process restart
+  // (probed on corestore 7.9.2 — append works after restart); a later boot
+  // simply mints a fresh install seed for future first-time derivations.
   async resetReplicatedStorage () {
     try { if (this._meta) await this._meta.close() } catch (_) {}
     this._meta = null
