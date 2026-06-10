@@ -14,6 +14,18 @@ No account. No hosted database. No plaintext replicated storage. The source, bui
 
 **Tags:** `local-first`, `end-to-end-encryption`, `private-notes`, `clipboard-sync`, `p2p`, `Pear`, `Holepunch`, `Hypercore`, `Hyperbee`, `Autobase`, `Hyperswarm`, `Expo`, `React Native`, `open-source`, `verifiable-security`
 
+## Download
+
+Installers for macOS, Windows, and Linux are on [paste.global](https://www.paste.global/#platforms) and the [releases page](https://github.com/bigdestiny2/pearpaste/releases/latest). Every artifact ships with a `.sha256` checksum.
+
+With the [Pear runtime](https://pears.com) installed, any platform can also run Paste directly over P2P — no installer:
+
+```sh
+pear run pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy
+```
+
+The desktop packages are thin launchers around that same link (macOS embeds the runtime), so app updates flow peer-to-peer without re-downloading an installer.
+
 ## Why Paste Exists
 
 Modern clipboards and quick notes are useful because they disappear into the background. They are also risky because the things people paste are often sensitive: access codes, links, recovery hints, fragments of messages, addresses, private drafts, and operational notes.
