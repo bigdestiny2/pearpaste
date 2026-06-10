@@ -267,6 +267,11 @@ export async function attach (ctx) {
     if (rstate.client) return rstate.client
     if (clientFactory === false) return null
     if (typeof clientFactory !== 'function' && !HiveRelayClient) return null
+    // Capture the store identity NOW: a vault switch (Fix A2) replaces
+    // vaultStore.store while client.start() is in flight (a multi-second
+    // warm-up), and caching a client bound to the old, closed store would
+    // silently break relay seeding for the new vault until restart.
+    const storeAtBuild = ctx.vaultStore.store
     try {
       const client = typeof clientFactory === 'function'
         ? await clientFactory({ swarm: ctx.swarm, store: ctx.vaultStore.store })
@@ -307,6 +312,13 @@ export async function attach (ctx) {
       client.on('seeded', (e) => log.info('relay-seeded', { appKey: e && (e.appKey || e.key) }))
       client.on('seed-cap-warning', (e) => log.warn('relay-seed-cap', { appKey: e && e.appKey }))
       await client.start()
+      // A vault switch replaced the store while start() was in flight: this
+      // client is bound to the old, closed Corestore — discard, do not cache.
+      // The next caller rebuilds against the live store.
+      if (ctx.vaultStore.store !== storeAtBuild) {
+        try { await client.destroy() } catch (_) {}
+        return null
+      }
       rstate.client = client
       rstate.available = true
       rstate.degradedReason = null
@@ -862,6 +874,25 @@ export async function attach (ctx) {
         log.warn('relay-autoseed-error', { err: String((err && err.message) || err) })
       }
     }, 'relay-autoseed')
+  })
+
+  // Vault switch (DEVICE_HYGIENE Fix A2): the install replaced its vault and
+  // vaultStore reopened a NEW Corestore object. Our cached relay client captured
+  // the OLD (now closed) store, so drop it — the next ensureClient() rebuilds it
+  // against the live store, and seeded-key state from the prior vault is void.
+  ctx.on('vault-storage-reset', () => {
+    const client = rstate.client
+    rstate.client = null
+    rstate.seeded.clear()
+    // client.destroy() does not emit per-relay 'relay-disconnected' (it only
+    // clears its own relay map), so prune the connected set here — stale
+    // pubkeys would otherwise keep isRelayPeer()/waitForFirstConnected()
+    // reporting phantom relay connections for the new vault.
+    rstate.connectedRelays.clear()
+    ctx.emit('relay-connected-changed', { count: 0 })
+    if (client && typeof client.destroy === 'function') {
+      ctx.scope.spawn(async () => { try { await client.destroy() } catch (_) {} }, 'relay-reset')
+    }
   })
 
   // Cross-agent wiring: the sync subsystem announces the encrypted vault-log

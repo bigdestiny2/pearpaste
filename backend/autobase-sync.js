@@ -26,6 +26,19 @@ import { MaterializedView, LocalSearchIndex, beeFromCore } from './materialized-
 
 const VIEW_NAME = 'pearpaste-view-v1'
 
+// Pairing-phantom cleanup window (DEVICE_HYGIENE_FIXES Fix B). After an admin
+// approves a pair request the joiner's writer is authorized IMMEDIATELY (for a
+// responsive UX), but a joiner that never finishes (disconnect/abandon/crash)
+// would linger as a permanently-authorized phantom in DEVICE_LIST. The inviter
+// spawns a scoped task that waits THIS LONG for a join confirmation (the
+// pp-pair-joined ack OR the joiner's writer producing a node); only if NEITHER
+// arrives does it append a compensating DEVICE_REVOKE. The default is
+// deliberately GENEROUS — biased hard toward NOT revoking, because a wrongful
+// revoke of a slow-but-legitimate joiner rotates the epoch key (disruptive),
+// strictly worse than a cheap phantom. Overridable per-engine
+// (engine.pairJoinConfirmMs) so tests can use a short window.
+const PAIR_JOIN_CONFIRM_DEFAULT_MS = 15 * 60 * 1000
+
 // The autobase instance + reducer state for an unlocked vault. Rebuilt on every
 // unlock, torn down on lock so no decrypted material survives.
 class SyncEngine {
@@ -95,6 +108,12 @@ class SyncEngine {
     // avoid the migration) crash this Autobase version, so this app-layer
     // reconciliation is the correct closure. Cleared on lock/close.
     this._pendingDurable = new Map()
+    // Pairing-phantom cleanup window (Fix B). Generous by default (bias toward
+    // NOT revoking); tests/wiring may shorten it. A ctx.config override wins so
+    // production can tune it without a code change.
+    this.pairJoinConfirmMs = (ctx.config && Number(ctx.config.pairJoinConfirmMs) > 0)
+      ? Number(ctx.config.pairJoinConfirmMs)
+      : PAIR_JOIN_CONFIRM_DEFAULT_MS
   }
 
   get vaultKey () { return this.ctx.state.vaultKeys && this.ctx.state.vaultKeys.vaultKey }
@@ -653,6 +672,67 @@ class SyncEngine {
     } catch (_) { return false }
   }
 
+  // [Fix B] Has the writer core `writerKeyHex` produced at least one node in the
+  // base? This is the CONN-INDEPENDENT half of the pairing-join confirmation: a
+  // freshly paired device that wrote its genesis-tail DEVICE_ADD makes its
+  // writer core length >= 1, replicated into our corestore — durable proof it
+  // actually joined even if the pp-pair-joined ack on the (transient) pairing
+  // conn was lost. Conservative by construction: a writer we cannot resolve, or
+  // one with length 0, is treated as "no node" so absence can NEVER fabricate a
+  // join that wasn't real (which would suppress a warranted phantom cleanup).
+  _writerHasNode (writerKeyHex) {
+    try {
+      const base = this.base
+      if (!base || !base.activeWriters || !writerKeyHex) return false
+      const key = b4a.from(writerKeyHex, 'hex')
+      const w = base.activeWriters.get(key)
+      if (!w || !w.core) return false
+      return (w.core.length || 0) > 0
+    } catch (_) { return false }
+  }
+
+  // [Fix B] Compensating revoke for a pairing phantom. A device authorized at
+  // approve-time that never confirmed joining (no pp-pair-joined ack, no writer
+  // node) is rolled back with a PLAIN DEVICE_REVOKE — deliberately WITHOUT the
+  // epoch KEY_ROTATE the normal DEVICE_REVOKE dispatcher pairs with.
+  //
+  // Why no rotation (the load-bearing deviation): a phantom was admitted as an
+  // INDEXER writer (addWriter indexer:true) but never connected, so its writer
+  // core never replicated. Appending a KEY_ROTATE then drives an indexer-set
+  // advance that can never checkpoint against that permanently-offline indexer,
+  // and the linearizer interrupts the base ("Autobase is closing") — the exact
+  // GATE SB1 freeze, reproduced directly while building this Fix. Rotation's
+  // forward-secrecy is moot for a phantom regardless: it never established
+  // replication, so it pulled ZERO ciphertext, and once this revoke commits the
+  // B12 reject-committed-revoked gate denies its writes while the replication
+  // firewall (SB2) refuses it any future stream — it can never obtain content
+  // sealed under the current key, held or not. The plain revoke linearizes
+  // cleanly (a single non-indexer-migrating append does not block on the offline
+  // indexer) and removes the phantom from the active set, which is the whole
+  // deliverable.
+  //
+  // Idempotent: a device already revoked or already gone from the committed set
+  // is a clean no-op. Bias toward not acting — every exit that isn't "a real,
+  // present, non-revoked device" returns without appending anything.
+  async revokePhantomDevice (deviceId) {
+    if (!this.base || this._closing) return { ok: false, reason: 'closing' }
+    await this.refresh() // freshest committed device state before judging
+    const target = this.devices.get(deviceId)
+    if (!target) return { ok: false, reason: 'absent' }
+    if (target.revokedAtLamport != null) return { ok: false, reason: 'already-revoked' }
+    const signer = this._localSigner()
+    const revOp = this._makeOp({
+      type: this.ctx.ops.OP_TYPES.DEVICE_REVOKE,
+      schema: this.ctx.ops.SCHEMAS.DEVICE,
+      objectId: 'device:' + deviceId,
+      payload: { deviceId },
+      signer
+    })
+    await this._append(revOp)
+    await this.refresh()
+    return { ok: true, revoked: deviceId }
+  }
+
   // [AUDIT I-1] Highest `header.lamport` durably present across every active
   // writer core, used by open() to restore the Lamport high-water mark after a
   // reopen. Each writer core stores Autobase OplogMessage nodes (verified on
@@ -1073,9 +1153,25 @@ class SyncEngine {
     const isGenesis = this.devices.size === 0 && body.selfRoot === true
     if (isGenesis) {
       this.rootPubkey = body.rootPubkey || op.signerPubkey
-    } else if (!this._signerAuthorized(op, opLamport, { adminOnly: true })) {
-      this.ctx.log.warn('op-rejected', { reason: 'DEVICE_ADD_NOT_ADMIN' })
-      return
+    } else {
+      // [Fix B] Idempotent self-confirmation: a freshly paired device writes its
+      // OWN already-committed DEVICE_ADD as a "genesis-tail" so its writer core
+      // produces a node (making it a live writer the inviter's confirm task can
+      // observe). The record is already in the committed set (the admin's
+      // approving add); a self-signed re-assertion by a present, non-revoked
+      // device changes nothing, so accept it silently — no admin gate, no
+      // warning, no roster mutation (we do NOT re-read roles from the body, so it
+      // cannot self-escalate). A revoked device, or one re-adding a DIFFERENT
+      // device, or any non-self signer, falls through to the normal admin gate.
+      const prevSelf = this.devices.get(dev.deviceId)
+      const selfConfirm = prevSelf && prevSelf.revokedAtLamport == null &&
+        op.signerPubkey && op.signerPubkey === dev.signingPubkey &&
+        prevSelf.signingPubkey === op.signerPubkey
+      if (selfConfirm) return
+      if (!this._signerAuthorized(op, opLamport, { adminOnly: true })) {
+        this.ctx.log.warn('op-rejected', { reason: 'DEVICE_ADD_NOT_ADMIN' })
+        return
+      }
     }
 
     // [RT-FIX B1] ADMIT POLICY: under N≥2, a DEVICE_ADD needs N DISTINCT
@@ -2205,6 +2301,31 @@ export async function attach (ctx) {
     }
     ctx.emit('paired', { deviceId: newDevice.deviceId })
 
+    // [Fix B] JOINER half of pairing-phantom cleanup: prove we actually finished
+    // joining so the inviter's confirm task never revokes us. Once our writer
+    // seat linearizes (the admin's approving DEVICE_ADD authorized our writerKey
+    // and must replicate back before we are writable), append our genesis-tail
+    // DEVICE_ADD — an idempotent self-confirmation that makes our writer core
+    // produce a node the inviter observes — then send pp-pair-joined back on the
+    // pairing conn as the fast-path ack. Fire-and-forget and best-effort: the
+    // inviter ALSO confirms via the writer node, and its window is generous, so
+    // a slow seat or a dropped conn must never fail PAIR_ACCEPT. Scoped so a
+    // closing engine drains it.
+    ctx.scope.spawn(async () => {
+      try {
+        await engine._awaitWritable(60000)
+        await engine._appendDeviceAdd(ctx.state.device, { signer: engine._localSigner() })
+        await engine.refresh()
+      } catch (_) { /* slow seat — inviter's window + writer-node fallback cover us */ }
+      try {
+        bootstrap.conn.write(b4a.from(JSON.stringify({
+          t: 'pp-pair-joined',
+          deviceId: newDevice.deviceId,
+          confirmation: expectedConfirmation
+        })))
+      } catch (_) { /* conn gone — the writer node remains the durable signal */ }
+    }, 'pair-joined-ack')
+
     return { ok: true, deviceId: newDevice.deviceId, vaultId: ctx.state.vaultId, confirmation: expectedConfirmation }
   })
 
@@ -2276,7 +2397,79 @@ export async function attach (ctx) {
       confirmation: req.confirmation
     })))
     ctx.emit('pair-admitted', { deviceId: req.newDev.deviceId })
+    // [Fix B] Approval authorized req.newDev's writer IMMEDIATELY (responsive
+    // UX), but a joiner that never finishes would linger as a permanently-
+    // authorized phantom. Spawn a scoped task that waits a generous, configurable
+    // window for a join confirmation and, ONLY if none arrives, appends a
+    // compensating revoke. Returns success NOW regardless — the cleanup is
+    // entirely out-of-band.
+    spawnJoinConfirm(req)
     return { ok: true, deviceId: req.newDev.deviceId }
+  }
+
+  // [Fix B] Background pairing-join confirmation + conservative compensating
+  // revoke. Spawned by approvePairRequest after the bootstrap is delivered.
+  // Confirms the joiner via EITHER the pp-pair-joined ack on the pairing conn OR
+  // the joiner's writer producing a node in the base; only if NEITHER signal
+  // appears within engine.pairJoinConfirmMs (and the device is still a present,
+  // non-revoked member) does it append a compensating DEVICE_REVOKE. Bias is
+  // HARD toward not revoking: a wrongful revoke rotates the epoch key on a real,
+  // merely-slow device — strictly worse than a cheap phantom.
+  function spawnJoinConfirm (req) {
+    const deviceId = req.newDev && req.newDev.deviceId
+    const writerKey = req.newDev && req.newDev.writerKey
+    if (!deviceId) return
+    const conn = req.conn
+    const windowMs = Math.max(1, Number(engine.pairJoinConfirmMs) || 0)
+    ctx.scope.spawn(async (scope) => {
+      let confirmed = false
+      // Fast-path ack: attach a FRESH data listener with its OWN buffer so the
+      // earlier pp-pair-hello frame already consumed by the responder's
+      // accumulator does not corrupt parsing of pp-pair-joined.
+      let ackBuf = b4a.alloc(0)
+      const onAck = (d) => {
+        try { ackBuf = b4a.concat([ackBuf, d]) } catch (_) { return }
+        let msg
+        try { msg = JSON.parse(b4a.toString(ackBuf)) } catch (_) { return }
+        ackBuf = b4a.alloc(0)
+        if (msg && msg.t === 'pp-pair-joined' && msg.deviceId === deviceId &&
+            msg.confirmation === req.confirmation) {
+          confirmed = true
+        }
+      }
+      try { if (conn && typeof conn.on === 'function') conn.on('data', onAck) } catch (_) {}
+      const deadline = Date.now() + windowMs
+      try {
+        while (!scope.cancelled && Date.now() < deadline) {
+          if (confirmed) break
+          // Conn-independent signal: the joiner's writer produced a node.
+          if (engine._writerHasNode(writerKey)) { confirmed = true; break }
+          // The device may already be gone or revoked by another path — stop.
+          const cur = engine.devices.get(deviceId)
+          if (!cur || cur.revokedAtLamport != null) { confirmed = true; break }
+          try { await scope.sleep(Math.min(200, windowMs)) } catch (_) { break }
+        }
+      } finally {
+        try { if (conn && typeof conn.removeListener === 'function') conn.removeListener('data', onAck) } catch (_) {}
+      }
+      // Final re-check covers a node/ack that landed on the last tick.
+      if (!confirmed && engine._writerHasNode(writerKey)) confirmed = true
+      if (confirmed || scope.cancelled) {
+        if (confirmed) { try { ctx.emit('pair-join-confirmed', { deviceId }) } catch (_) {} }
+        return
+      }
+      // NEITHER signal within the window: treat as a phantom and roll it back.
+      // Best-effort; never throws past the scope.
+      try {
+        const res = await engine.revokePhantomDevice(deviceId)
+        if (res && res.ok) {
+          ctx.log.warn('pair-phantom-revoked', { deviceId, reason: 'join-unconfirmed', windowMs })
+          try { ctx.emit('pair-phantom-revoked', { deviceId, ...res }) } catch (_) {}
+        }
+      } catch (err) {
+        ctx.log.warn('pair-phantom-revoke-failed', { deviceId, err: String((err && err.message) || err) })
+      }
+    }, 'pair-join-confirm')
   }
 
   ctx.dispatcher.register(COMMANDS.PAIR_APPROVE, async ({ requestId, grantHistory = false, cosigs = [] }) => {
