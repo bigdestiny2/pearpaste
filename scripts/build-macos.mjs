@@ -345,6 +345,35 @@ function completeRuntimeTree (target) {
   ok('completed deployment tree (boot.bundle + prebuilds from the local pear-electron asset)')
 }
 
+function stageDmgRoot (treeRoot) {
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'pearpaste-macos-dmg-'))
+  const required = ['boot.bundle', 'package.json', 'prebuilds', 'by-arch']
+  for (const name of required) {
+    const src = path.join(treeRoot, name)
+    if (!fs.existsSync(src)) die(`cannot stage macOS .dmg: missing ${path.relative(ROOT, src)}`)
+    fs.cpSync(src, path.join(stage, name), { recursive: true })
+  }
+
+  const appRel = path.join('by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
+  const appTarget = path.join(stage, appRel)
+  if (!fs.existsSync(appTarget)) die(`cannot stage macOS .dmg: missing ${appRel}`)
+  fs.symlinkSync(appRel, path.join(stage, `${PRODUCT_NAME}.app`))
+
+  // Keep the Pear deployment tree next to the app so boot.js can resolve
+  // ../../../../../../../boot.bundle, but hide the plumbing from Finder.
+  if (process.platform === 'darwin') {
+    for (const name of required) {
+      try {
+        execFileSync('chflags', ['hidden', path.join(stage, name)], { stdio: 'ignore' })
+      } catch (_) {
+        warn(`could not hide ${name} in staged .dmg root`)
+      }
+    }
+  }
+
+  return stage
+}
+
 // ---- Create the .dmg (hdiutil) --------------------------------------------
 // Produces <dist>/<name>.dmg from the .app. In --build mode the name carries an
 // explicit "-unsigned" marker; in --release mode it is signed + notarized.
@@ -353,10 +382,14 @@ function makeDmg (app, signed, dry) {
   const distDir = path.dirname(path.dirname(path.dirname(path.dirname(app)))) // .../dist/macos (best-effort)
   // EMPIRICAL (2026-06-10): wrap the deployment TREE, not the bare .app — the
   // shell boots `<tree-root>/boot.bundle` (see completeRuntimeTree), so a
-  // .dmg containing only Paste.app produces an app that cannot start. When
-  // the tree root (boot.bundle beside by-arch/) exists, image the whole tree.
+  // .dmg containing only Paste.app produces an app that cannot start. The
+  // image root exposes a Paste.app symlink for testers while keeping the Pear
+  // deployment tree in the required relative position.
   const wrapTree = fs.existsSync(path.join(distDir, 'boot.bundle'))
-  const src = wrapTree ? distDir : app
+  let stagingDir = null
+  const src = wrapTree
+    ? (dry ? '<staged macOS dmg root>' : (stagingDir = stageDmgRoot(distDir)))
+    : app
   // Never write the .dmg INSIDE the folder being imaged.
   const outDir = process.env.PEARPASTE_DIST_DIR
     ? path.join(ROOT, process.env.PEARPASTE_DIST_DIR)
@@ -365,9 +398,13 @@ function makeDmg (app, signed, dry) {
   const dmg = path.join(outDir, dmgName)
   log(`hdiutil create -volname "${PRODUCT_NAME}" -srcfolder "${src}" -ov -format UDZO "${dmg}"`)
   if (dry) { ok('dry-run: hdiutil not executed'); return dmg }
-  fs.mkdirSync(outDir, { recursive: true })
-  fs.rmSync(dmg, { force: true })
-  execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', src, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
+  try {
+    fs.mkdirSync(outDir, { recursive: true })
+    fs.rmSync(dmg, { force: true })
+    execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', src, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
+  } finally {
+    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true })
+  }
   const digest = sha256(dmg)
   fs.writeFileSync(`${dmg}.sha256`, `${digest}  ${path.basename(dmg)}\n`)
   // Record which pear:// link this wrapper resolves (the .app embeds the runtime
