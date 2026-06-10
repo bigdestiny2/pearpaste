@@ -30,7 +30,7 @@ const DEFAULT_TTL_MS = 5 * 60 * 1000
 // barrier — a revoked device can still dial the immutable Autobase core key.
 // The replication firewall (replication-firewall.js) is the real control.
 export function vaultDiscoveryTopic (topicSeed) {
-  return hmac(topicSeed, 'swarm-topic-v1') // Buffer(32)
+  return hmac(topicSeed, 'swarm-topic-v1')
 }
 
 // Per-device follow/catch-up topic (REVOCATION_DESIGN §4, default-on).
