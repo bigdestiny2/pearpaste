@@ -74,6 +74,9 @@ const MODE = has('--release')
 // release must fail closed without a cert).
 const UNSIGNED = has('--unsigned') || MODE === 'build'
 const LINK = val('--link', 'PEARPASTE_LINK')
+const PEAR_BIN = process.platform === 'win32' && process.env.APPDATA
+  ? path.join(process.env.APPDATA, 'pear', 'current', 'by-arch', 'win32-x64', 'bin', 'pear-runtime.exe')
+  : 'pear'
 // Deliberate product/display name. `pear build` requires the platform app dir's
 // basename to equal (package.json) productName ?? name; we pin productName to
 // "Paste" so the win32 app dir + .exe path are predictable for signing.
@@ -139,7 +142,7 @@ function preflight () {
 
   // 6. `pear` runtime available (needed to stage; not to preflight).
   try {
-    execFileSync('pear', ['--help'], { stdio: 'ignore' })
+    execFileSync(PEAR_BIN, ['--help'], { stdio: 'ignore' })
     ok('`pear` runtime on PATH')
   } catch (_) { warn('`pear` not on PATH — required for --stage/--release') }
 
@@ -215,9 +218,9 @@ function stage (dry) {
   if (dry) args.push('--dry-run')
   args.push(link, '.')
   log('staging Tier 1 (P2P link). Windows users: `pear run pear://<key>` — Pear fetches the win32 runtime automatically.')
-  log(`$ pear ${args.join(' ')}`)
+  log(`$ ${PEAR_BIN} ${args.join(' ')}`)
   if (dry) { ok('dry-run: not executed'); return }
-  execFileSync('pear', args, { cwd: ROOT, stdio: 'inherit' })
+  execFileSync(PEAR_BIN, args, { cwd: ROOT, stdio: 'inherit' })
   ok('staged')
 }
 
@@ -261,11 +264,11 @@ function buildSignAndPack (dry) {
   }
   const target = val('--target', 'PEARPASTE_WIN_TARGET') || path.join(ROOT, 'dist', 'win32')
   const buildArgs = ['build', '--win32-x64-app', wrapper, '--target', target]
-  log(`$ pear ${buildArgs.join(' ')}`)
+  log(`$ ${PEAR_BIN} ${buildArgs.join(' ')}`)
   if (dry) {
     ok('dry-run: pear build not executed')
   } else {
-    execFileSync('pear', buildArgs, { cwd: ROOT, stdio: 'inherit' })
+    execFileSync(PEAR_BIN, buildArgs, { cwd: ROOT, stdio: 'inherit' })
     ok(`packaged win32 app dir into ${path.relative(ROOT, target)}/by-arch/win32-x64/app`)
   }
 
