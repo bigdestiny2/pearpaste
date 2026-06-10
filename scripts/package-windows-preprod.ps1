@@ -2,6 +2,7 @@ param(
   [string] $PearLink = $env:PEARPASTE_LINK,
   [string] $OutputDir = "",
   [int] $LaunchSmokeTimeoutSeconds = 20,
+  [int] $StableSmokeSeconds = 45,
   [switch] $SkipLaunchSmoke
 )
 
@@ -64,7 +65,15 @@ function Stop-NewPearRelatedProcesses([hashtable] $beforeIds) {
   }
 }
 
-function Test-LauncherVisibleWindow([string] $exePath, [int] $timeoutSeconds) {
+function Format-NewPearProcessSnapshot([hashtable] $beforeIds) {
+  $created = @(Get-PearRelatedProcesses | Where-Object { -not $beforeIds.ContainsKey($_.Id) })
+  if ($created.Count) {
+    return ($created | Select-Object Id, ProcessName, MainWindowHandle, MainWindowTitle, Path | Format-List | Out-String).Trim()
+  }
+  return "No Pear-related child processes remained."
+}
+
+function Test-LauncherVisibleWindow([string] $exePath, [int] $timeoutSeconds, [int] $stableSeconds) {
   $beforeIds = New-PearProcessMap
 
   $launcher = Start-Process `
@@ -72,32 +81,43 @@ function Test-LauncherVisibleWindow([string] $exePath, [int] $timeoutSeconds) {
     -WorkingDirectory (Split-Path -Parent $exePath) `
     -PassThru
 
-  $deadline = (Get-Date).AddSeconds($timeoutSeconds)
-  $visible = $null
-  while ((Get-Date) -lt $deadline) {
-    $visible = Get-PearRelatedProcesses |
-      Where-Object { -not $beforeIds.ContainsKey($_.Id) -and $_.MainWindowHandle -ne 0 } |
-      Select-Object -First 1
-    if ($visible) { break }
-    Start-Sleep -Milliseconds 500
-  }
-
-  $newProcesses = @(Get-PearRelatedProcesses | Where-Object { -not $beforeIds.ContainsKey($_.Id) })
-  if ($launcher -and -not $launcher.HasExited) {
-    Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
-  }
-  Stop-NewPearRelatedProcesses $beforeIds
-
-  if (-not $visible) {
-    $snapshot = if ($newProcesses.Count) {
-      ($newProcesses | Select-Object Id, ProcessName, MainWindowHandle, MainWindowTitle, Path | Format-List | Out-String).Trim()
-    } else {
-      "No Pear-related child processes remained."
+  try {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    $visible = $null
+    while ((Get-Date) -lt $deadline) {
+      $visible = Get-PearRelatedProcesses |
+        Where-Object { -not $beforeIds.ContainsKey($_.Id) -and $_.MainWindowHandle -ne 0 } |
+        Select-Object -First 1
+      if ($visible) { break }
+      Start-Sleep -Milliseconds 500
     }
-    throw "PearPaste launcher did not create a visible window within $timeoutSeconds seconds.`n$snapshot"
-  }
 
-  Write-Host "Launcher visible-window smoke passed: $($visible.ProcessName) pid=$($visible.Id)"
+    if (-not $visible) {
+      $snapshot = Format-NewPearProcessSnapshot $beforeIds
+      throw "PearPaste launcher did not create a visible window within $timeoutSeconds seconds.`n$snapshot"
+    }
+
+    $stableDeadline = (Get-Date).AddSeconds($stableSeconds)
+    while ((Get-Date) -lt $stableDeadline) {
+      Start-Sleep -Seconds 1
+      $current = Get-Process -Id $visible.Id -ErrorAction SilentlyContinue
+      if (-not $current) {
+        $snapshot = Format-NewPearProcessSnapshot $beforeIds
+        throw "PearPaste visible window process exited before the $stableSeconds second stable smoke completed.`n$snapshot"
+      }
+      if ($current.MainWindowHandle -eq 0) {
+        $snapshot = Format-NewPearProcessSnapshot $beforeIds
+        throw "PearPaste visible window disappeared before the $stableSeconds second stable smoke completed.`n$snapshot"
+      }
+    }
+
+    Write-Host "Launcher visible-window smoke passed: $($visible.ProcessName) pid=$($visible.Id) stayed visible for $stableSeconds seconds"
+  } finally {
+    if ($launcher -and -not $launcher.HasExited) {
+      Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+    }
+    Stop-NewPearRelatedProcesses $beforeIds
+  }
 }
 
 Assert-ReleasedPearLink $PearLink
@@ -162,7 +182,7 @@ try {
 }
 
 if (-not $SkipLaunchSmoke) {
-  Test-LauncherVisibleWindow (Join-Path $payloadDir "PearPaste.exe") $LaunchSmokeTimeoutSeconds
+  Test-LauncherVisibleWindow (Join-Path $payloadDir "PearPaste.exe") $LaunchSmokeTimeoutSeconds $StableSmokeSeconds
 }
 
 Compress-Archive -LiteralPath $payloadDir -DestinationPath $zipPath -CompressionLevel Optimal

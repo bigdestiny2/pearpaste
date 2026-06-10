@@ -44,9 +44,7 @@ internal static class Program
                 FileName = pearRuntimePath,
                 WorkingDirectory = appDir,
                 UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true
+                CreateNoWindow = true
             };
             start.ArgumentList.Add("run");
             start.ArgumentList.Add(link);
@@ -68,9 +66,7 @@ internal static class Program
 
             if (child.WaitForExit(5000) && child.ExitCode != 0)
             {
-                var output = (child.StandardError.ReadToEnd() + Environment.NewLine + child.StandardOutput.ReadToEnd()).Trim();
-                var detail = string.IsNullOrWhiteSpace(output) ? string.Empty : $"{Environment.NewLine}{Environment.NewLine}{output}";
-                ShowError($"Pear runtime exited with code {child.ExitCode}.{detail}");
+                ShowError($"Pear runtime exited with code {child.ExitCode}.");
                 return child.ExitCode;
             }
 
