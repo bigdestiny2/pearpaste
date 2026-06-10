@@ -4,30 +4,9 @@
 // This script keeps Linux distribution honest without pretending this repo has
 // distro signing infrastructure. Preflight is safe on any OS; package/release
 // modes create a distro-neutral tarball on Linux that launches the production
-// pear:// link through the local Pear runtime. A native Debian package (.deb)
-// and an AppImage are produced ALONGSIDE the tarball when their tools are on
-// PATH (dpkg-deb / appimagetool); both degrade gracefully to "tarball only"
-// when the tool is absent — they are NEVER fatal. .rpm wrapping can still
+// pear:// link through the local Pear runtime. .deb/.rpm/AppImage wrapping can
 // consume the generated payload later, with signing handled by the maintainer's
 // distro or release process.
-//
-// Signing model (matches docs/RELEASE.md §3.2 + the CI release-guard gate):
-//   - --release REQUIRES a detached signature sidecar (.sig/.asc/.minisig/.p7s)
-//     next to EVERY distributable artifact (tarball, .deb, AppImage). Fails
-//     closed when any is missing.
-//   - --package emits artifacts WITHOUT requiring a signature (dev/CI lane).
-//   - --unsigned is an explicit dev/CI flag: it produces the same artifacts but
-//     clearly marks them unsigned (skips the signature requirement even if it
-//     were otherwise on). It does NOT weaken --release: a real signed release
-//     still fails closed without sidecars. Passing --unsigned WITH --release is
-//     rejected (a signed release cannot be unsigned).
-//
-// Usage:
-//   node scripts/package-linux.mjs --preflight            # readiness (any OS)
-//   node scripts/package-linux.mjs --dry-run              # plan, no writes
-//   node scripts/package-linux.mjs --package              # tarball + .deb + AppImage
-//   node scripts/package-linux.mjs --package --unsigned   # same, marked unsigned
-//   node scripts/package-linux.mjs --release              # requires signatures
 
 import { execFileSync } from 'child_process'
 import crypto from 'crypto'
@@ -51,16 +30,8 @@ const MODE = has('--release')
   ? 'release'
   : has('--package') ? 'package' : has('--dry-run') ? 'dry-run' : 'preflight'
 const LINK = val('--link', 'PEARPASTE_LINK')
-// Explicit dev/CI escape hatch: build the artifacts but mark them unsigned and
-// skip the signature requirement. It must NOT be combinable with --release —
-// a signed release cannot be "unsigned" — so we reject that combination below.
-const UNSIGNED = has('--unsigned')
-if (UNSIGNED && MODE === 'release') {
-  console.error('\x1b[31m[linux:error]\x1b[0m --unsigned cannot be combined with --release (a signed release must fail closed without signatures); use --package --unsigned for an unsigned dev/CI artifact')
-  process.exit(1)
-}
-const REQUIRE_SIGNATURE = !UNSIGNED && (has('--require-signature') || MODE === 'release')
-const PACKAGE_TYPE = val('--type', 'PEARPASTE_LINUX_PACKAGE_TYPE') || 'tar'
+const REQUIRE_SIGNATURE = has('--require-signature') || MODE === 'release'
+const PACKAGE_TYPE = val('--type', 'PEARPASTE_LINUX_PACKAGE_TYPE') || 'both'
 
 const log = (msg) => console.log(`[linux] ${msg}`)
 const ok = (msg) => console.log(`${C.ok}[linux:ok]${C.x} ${msg}`)
@@ -108,15 +79,6 @@ function sha256 (absPath) {
 
 function linuxArch () {
   if (process.arch === 'x64') return 'x64'
-  if (process.arch === 'arm64') return 'arm64'
-  return process.arch
-}
-
-// Debian architecture names differ from Node's process.arch: x64 -> amd64,
-// arm64 -> arm64 (same). dpkg uses these in both DEBIAN/control's Architecture
-// field and the conventional <pkg>_<version>_<arch>.deb filename.
-function debArch () {
-  if (process.arch === 'x64') return 'amd64'
   if (process.arch === 'arm64') return 'arm64'
   return process.arch
 }
@@ -195,10 +157,17 @@ function preflight () {
     else warn(`${cmd} unavailable; ${purpose} remains maintainer/manual`)
   }
 
-  if (PACKAGE_TYPE !== 'tar') {
-    warn(`--type ${PACKAGE_TYPE} requested; this helper currently emits tar and preflights native packager tools only`)
+  const VALID_TYPES = ['tar', 'deb', 'both', 'all']
+  if (!VALID_TYPES.includes(PACKAGE_TYPE)) {
+    warn(`--type ${PACKAGE_TYPE} is unknown; expected one of ${VALID_TYPES.join(', ')}`)
     fatal++
+  } else if (PACKAGE_TYPE !== 'tar' && !hasCommand('dpkg-deb')) {
+    warn(`--type ${PACKAGE_TYPE} requested but dpkg-deb is unavailable; only the tarball will be produced`)
   }
+
+  const linuxIcons = ICON_SOURCES.filter(([, rel]) => exists(rel))
+  if (linuxIcons.length > 0) ok(`app icons present: ${linuxIcons.map(([s]) => s).join(', ')}`)
+  else warn('no app icons found under assets/; packages will ship without an icon')
 
   if (process.platform !== 'linux') {
     warn(`running on ${process.platform}; package mode should run on linux-latest or a Linux maintainer host`)
@@ -217,41 +186,170 @@ function writeFile (absPath, content, mode) {
   if (mode) fs.chmodSync(absPath, mode)
 }
 
+function walkFiles (absDir) {
+  const out = []
+  for (const entry of safeReaddir(absDir)) {
+    const p = path.join(absDir, entry)
+    const st = fs.lstatSync(p)
+    if (st.isDirectory()) out.push(...walkFiles(p))
+    else out.push(p)
+  }
+  return out
+}
+
+// Single source of truth for the launcher + desktop entry so the tarball and the
+// .deb stay byte-for-byte consistent.
+const launcherScript = (link) => `#!/usr/bin/env sh
+set -eu
+PEARPASTE_LINK="\${PEARPASTE_LINK:-${link}}"
+exec pear run "$PEARPASTE_LINK" "$@"
+`
+
+const desktopEntry = `[Desktop Entry]
+Type=Application
+Name=Paste
+Comment=End-to-end encrypted note and clipboard sync over Pear
+Exec=pearpaste
+Icon=pearpaste
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+`
+
+// Icon sizes to ship, each mapped to its source asset in the repo.
+const ICON_SOURCES = [
+  ['512x512', 'assets/icon-512.png'],
+  ['256x256', 'assets/icon-256.png']
+]
+
+function resolveIcons () {
+  const found = []
+  for (const [size, rel] of ICON_SOURCES) {
+    if (exists(rel)) found.push({ size, abs: path.join(ROOT, rel) })
+    else warn(`icon source missing: ${rel} (icon ${size} will be omitted)`)
+  }
+  return found
+}
+
+function wantsDeb () {
+  return PACKAGE_TYPE === 'deb' || PACKAGE_TYPE === 'both' || PACKAGE_TYPE === 'all'
+}
+
+function debArch () {
+  return process.arch === 'arm64' ? 'arm64' : 'amd64'
+}
+
+function buildDeb (pkg, link, icons) {
+  if (!hasCommand('dpkg-deb')) {
+    warn('dpkg-deb unavailable; skipping .deb (tarball still produced)')
+    return null
+  }
+  const arch = debArch()
+  const stage = path.join(DIST, `.deb-stage-${pkg.name}-${pkg.version}-${arch}`)
+  fs.rmSync(stage, { recursive: true, force: true })
+
+  writeFile(path.join(stage, 'usr', 'lib', pkg.name, 'pearpaste'), launcherScript(link), 0o755)
+
+  // /usr/bin/pearpaste is a relative symlink into /usr/lib so the launcher stays
+  // a single canonical file (matches the published package layout).
+  const binLink = path.join(stage, 'usr', 'bin', 'pearpaste')
+  fs.mkdirSync(path.dirname(binLink), { recursive: true })
+  fs.symlinkSync(`../lib/${pkg.name}/pearpaste`, binLink)
+
+  writeFile(path.join(stage, 'usr', 'share', 'applications', 'pearpaste.desktop'), desktopEntry, 0o644)
+  for (const ic of icons) {
+    const dst = path.join(stage, 'usr', 'share', 'icons', 'hicolor', ic.size, 'apps', 'pearpaste.png')
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
+    fs.copyFileSync(ic.abs, dst)
+    fs.chmodSync(dst, 0o644)
+  }
+
+  let bytes = 0
+  for (const f of walkFiles(path.join(stage, 'usr'))) bytes += fs.lstatSync(f).size
+  const installedKib = Math.max(1, Math.ceil(bytes / 1024))
+
+  const control = `Package: ${pkg.name}
+Version: ${pkg.version}
+Architecture: ${arch}
+Maintainer: Paste Maintainers <defidon@protonmail.com>
+Priority: optional
+Section: utils
+Installed-Size: ${installedKib}
+Recommends: pear
+Homepage: ${pkg.homepage || 'https://paste.global'}
+Description: End-to-end encrypted note and clipboard sync over Pear
+ Paste is a personal, end-to-end encrypted note and clipboard sync app
+ built on the Pear / Holepunch P2P stack. This package installs a thin
+ launcher that resolves the production pear:// link through the locally
+ installed Pear runtime; app content updates flow over P2P, so the
+ launcher rarely needs to be rebuilt.
+ .
+ Requires the Pear runtime on PATH (https://pears.com).
+`
+  writeFile(path.join(stage, 'DEBIAN', 'control'), control, 0o644)
+
+  // Refresh the desktop + icon caches so the launcher and icon appear without a
+  // re-login. Best-effort: never fail the install if the tools are absent.
+  writeFile(path.join(stage, 'DEBIAN', 'postinst'), `#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications || true; fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true; fi
+fi
+exit 0
+`, 0o755)
+  writeFile(path.join(stage, 'DEBIAN', 'postrm'), `#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications || true; fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true; fi
+exit 0
+`, 0o755)
+
+  const debOut = path.join(DIST, `paste_${pkg.version}_${arch}.deb`)
+  fs.rmSync(debOut, { force: true })
+  execFileSync('dpkg-deb', ['--root-owner-group', '--build', stage, debOut], { stdio: 'inherit' })
+  fs.rmSync(stage, { recursive: true, force: true })
+
+  const digest = sha256(debOut)
+  writeFile(`${debOut}.sha256`, `${digest}  ${path.basename(debOut)}\n`, 0o644)
+  ok(`wrote ${path.relative(ROOT, debOut)}`)
+  ok(`wrote ${path.relative(ROOT, `${debOut}.sha256`)}`)
+  return debOut
+}
+
 function buildPayload (pkg, dryRun) {
   const link = pearLink()
   const name = packageName(pkg)
   const payloadDir = path.join(DIST, name)
   const artifact = path.join(DIST, `${name}.tar.gz`)
+  const icons = resolveIcons()
   const commands = [
     `mkdir -p ${path.relative(ROOT, payloadDir)}`,
     `write ${path.relative(ROOT, path.join(payloadDir, 'bin', 'pearpaste'))}`,
     `write ${path.relative(ROOT, path.join(payloadDir, 'share', 'applications', 'pearpaste.desktop'))}`,
-    `tar -czf ${path.relative(ROOT, artifact)} -C ${path.relative(ROOT, DIST)} ${name}`
+    ...icons.map((ic) => `copy assets -> ${path.relative(ROOT, path.join(payloadDir, 'share', 'icons', 'hicolor', ic.size, 'apps', 'pearpaste.png'))}`),
+    `tar -czf ${path.relative(ROOT, artifact)} -C ${path.relative(ROOT, DIST)} ${name}`,
+    ...(wantsDeb() ? [`dpkg-deb --root-owner-group --build -> ${path.relative(ROOT, path.join(DIST, `paste_${pkg.version}_${debArch()}.deb`))}`] : [])
   ]
 
   if (dryRun) {
     for (const command of commands) log(`(dry-run) ${command}`)
-    return { artifact, payloadDir }
+    return { artifact, payloadDir, deb: null }
   }
 
   fs.rmSync(payloadDir, { recursive: true, force: true })
   fs.mkdirSync(DIST, { recursive: true })
 
-  writeFile(path.join(payloadDir, 'bin', 'pearpaste'), `#!/usr/bin/env sh
-set -eu
-PEARPASTE_LINK="\${PEARPASTE_LINK:-${link}}"
-exec pear run "$PEARPASTE_LINK" "$@"
-`, 0o755)
+  writeFile(path.join(payloadDir, 'bin', 'pearpaste'), launcherScript(link), 0o755)
 
-  writeFile(path.join(payloadDir, 'share', 'applications', 'pearpaste.desktop'), `[Desktop Entry]
-Type=Application
-Name=Paste
-Comment=End-to-end encrypted note and clipboard sync over Pear
-Exec=pearpaste
-Terminal=false
-Categories=Utility;Office;
-StartupNotify=true
-`, 0o644)
+  writeFile(path.join(payloadDir, 'share', 'applications', 'pearpaste.desktop'), desktopEntry, 0o644)
+
+  for (const ic of icons) {
+    const dst = path.join(payloadDir, 'share', 'icons', 'hicolor', ic.size, 'apps', 'pearpaste.png')
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
+    fs.copyFileSync(ic.abs, dst)
+    fs.chmodSync(dst, 0o644)
+  }
 
   writeFile(path.join(payloadDir, 'README-linux.txt'), `Paste ${pkg.version} Linux package
 
@@ -264,8 +362,12 @@ Requirements:
 
 Install:
   1. Put bin/pearpaste on PATH.
-  2. Optionally install share/applications/pearpaste.desktop.
+  2. Optionally install share/applications/pearpaste.desktop and copy
+     share/icons/hicolor/* into ~/.local/share/icons (or /usr/share/icons).
   3. Run: pearpaste
+
+Debian/Ubuntu users can instead install the paste_${pkg.version}_${debArch()}.deb,
+which wires up the launcher, desktop entry and icon automatically.
 
 The Pear P2P update path remains intact: app content updates flow through the
 pear:// link, so this launcher rarely needs to be rebuilt.
@@ -278,6 +380,7 @@ pear:// link, so this launcher rarely needs to be rebuilt.
     arch: linuxArch(),
     pearLink: link,
     packageType: 'tar',
+    icons: icons.map((ic) => ic.size),
     generatedAt: new Date().toISOString()
   }
   writeFile(path.join(payloadDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 0o644)
@@ -287,7 +390,9 @@ pear:// link, so this launcher rarely needs to be rebuilt.
   writeFile(`${artifact}.sha256`, `${digest}  ${path.basename(artifact)}\n`, 0o644)
   ok(`wrote ${path.relative(ROOT, artifact)}`)
   ok(`wrote ${path.relative(ROOT, `${artifact}.sha256`)}`)
-  return { artifact, payloadDir }
+
+  const deb = wantsDeb() ? buildDeb(pkg, link, icons) : null
+  return { artifact, payloadDir, deb }
 }
 
 function assertSignature (artifact) {
@@ -299,214 +404,15 @@ function assertSignature (artifact) {
   die(`missing detached signature for ${path.relative(ROOT, artifact)}; expected .sig/.asc/.minisig/.p7s`)
 }
 
-// Optional AppImage wrapping. Only attempted on Linux when appimagetool is on
-// PATH; skipped gracefully otherwise (the tarball remains the primary artifact).
-// Builds a minimal AppDir around the same pear:// launcher and emits a
-// <name>.AppImage plus its .sha256. Never fatal — a missing appimagetool or a
-// build hiccup degrades to "tarball only".
-function maybeBuildAppImage (pkg, payloadDir, dryRun) {
-  if (process.platform !== 'linux') return null
-  if (!hasCommand('appimagetool')) {
-    warn('appimagetool unavailable; skipping AppImage (tarball is the primary artifact)')
-    return null
-  }
-  const link = pearLink()
-  const name = packageName(pkg)
-  const appDir = path.join(DIST, `${name}.AppDir`)
-  const appImage = path.join(DIST, `${name}.AppImage`)
-  if (dryRun) {
-    log(`(dry-run) mkdir -p ${path.relative(ROOT, appDir)} (AppDir)`)
-    log(`(dry-run) appimagetool ${path.relative(ROOT, appDir)} ${path.relative(ROOT, appImage)}`)
-    return { appImage, appDir }
-  }
-  try {
-    fs.rmSync(appDir, { recursive: true, force: true })
-    // AppRun launcher -> the pear:// link (same contract as the tarball bin).
-    writeFile(path.join(appDir, 'AppRun'), `#!/usr/bin/env sh
-set -eu
-PEARPASTE_LINK="\${PEARPASTE_LINK:-${link}}"
-exec pear run "$PEARPASTE_LINK" "$@"
-`, 0o755)
-    // Top-level .desktop + icon are required by appimagetool.
-    writeFile(path.join(appDir, 'pearpaste.desktop'), `[Desktop Entry]
-Type=Application
-Name=Paste
-Comment=End-to-end encrypted note and clipboard sync over Pear
-Exec=AppRun
-Icon=pearpaste
-Terminal=false
-Categories=Utility;Office;
-`, 0o644)
-    const icon = path.join(ROOT, 'assets', 'icon-256.png')
-    if (fs.existsSync(icon)) fs.copyFileSync(icon, path.join(appDir, 'pearpaste.png'))
-    // Reuse the staged payload's launcher tree inside the AppDir for parity.
-    if (payloadDir && fs.existsSync(payloadDir)) {
-      fs.cpSync(payloadDir, path.join(appDir, 'usr'), { recursive: true })
-    }
-    execFileSync('appimagetool', [appDir, appImage], { stdio: 'inherit', env: { ...process.env, ARCH: process.arch === 'arm64' ? 'aarch64' : 'x86_64' } })
-    const digest = sha256(appImage)
-    writeFile(`${appImage}.sha256`, `${digest}  ${path.basename(appImage)}\n`, 0o644)
-    ok(`wrote ${path.relative(ROOT, appImage)}`)
-    ok(`wrote ${path.relative(ROOT, `${appImage}.sha256`)}`)
-    return { appImage, appDir }
-  } catch (err) {
-    warn(`AppImage wrapping failed (${err.message}); tarball remains the primary artifact`)
-    return null
-  }
-}
-
-// Optional Debian package (.deb) wrapping. Mirrors maybeBuildAppImage(): Linux-
-// only, gated on dpkg-deb being on PATH, and NEVER fatal — a missing dpkg-deb
-// or a build hiccup degrades to "tarball (+ AppImage) only". Lays out a minimal
-// FHS install tree:
-//   /usr/lib/pearpaste/pearpaste            launcher -> pear run <link>
-//   /usr/bin/pearpaste                      symlink -> ../lib/pearpaste/pearpaste
-//   /usr/share/applications/pearpaste.desktop
-//   /usr/share/icons/hicolor/512x512/apps/pearpaste.png  (when the asset exists)
-//   DEBIAN/control                          package metadata
-// then runs `dpkg-deb --root-owner-group --build <root> <out.deb>` and emits the
-// conventional dist/linux/paste_<version>_amd64.deb + its .sha256.
-function maybeBuildDeb (pkg, dryRun) {
-  if (process.platform !== 'linux') return null
-  if (!hasCommand('dpkg-deb')) {
-    warn('dpkg-deb unavailable; skipping .deb (tarball is the primary artifact)')
-    return null
-  }
-  const link = pearLink()
-  const arch = debArch()
-  // Conventional Debian artifact name uses the package name ("pearpaste") — the
-  // brief pins the product short-name "paste" for the FILE, so we honour that.
-  const debName = `paste_${pkg.version}_${arch}`
-  const buildRoot = path.join(DIST, `${debName}.deb-root`)
-  const deb = path.join(DIST, `${debName}.deb`)
-  // Sizes/paths for control + the on-disk layout.
-  const launcherRel = 'usr/lib/pearpaste/pearpaste'
-  const binSymlinkRel = 'usr/bin/pearpaste'
-  const desktopRel = 'usr/share/applications/pearpaste.desktop'
-  const iconRel = 'usr/share/icons/hicolor/512x512/apps/pearpaste.png'
-  if (dryRun) {
-    log(`(dry-run) mkdir -p ${path.relative(ROOT, buildRoot)} (.deb root)`)
-    log(`(dry-run) write ${launcherRel} (pear run launcher)`)
-    log(`(dry-run) ln -s ../lib/pearpaste/pearpaste ${binSymlinkRel}`)
-    log(`(dry-run) write ${desktopRel} + DEBIAN/control`)
-    log(`(dry-run) dpkg-deb --root-owner-group --build ${path.relative(ROOT, buildRoot)} ${path.relative(ROOT, deb)}`)
-    return { deb, buildRoot }
-  }
-  try {
-    fs.rmSync(buildRoot, { recursive: true, force: true })
-    // Launcher: resolves the production pear:// link through the Pear runtime,
-    // honouring an optional PEARPASTE_LINK override (same contract as tarball).
-    writeFile(path.join(buildRoot, launcherRel), `#!/usr/bin/env sh
-set -eu
-PEARPASTE_LINK="\${PEARPASTE_LINK:-${link}}"
-exec pear run "$PEARPASTE_LINK" "$@"
-`, 0o755)
-    // /usr/bin symlink -> the launcher (relative so it stays valid post-install).
-    const binAbs = path.join(buildRoot, binSymlinkRel)
-    fs.mkdirSync(path.dirname(binAbs), { recursive: true })
-    fs.symlinkSync('../lib/pearpaste/pearpaste', binAbs)
-    // Desktop entry + icon (icon optional — skip cleanly if the asset is gone).
-    writeFile(path.join(buildRoot, desktopRel), `[Desktop Entry]
-Type=Application
-Name=Paste
-Comment=End-to-end encrypted note and clipboard sync over Pear
-Exec=pearpaste
-Icon=pearpaste
-Terminal=false
-Categories=Utility;Office;
-StartupNotify=true
-`, 0o644)
-    const icon = path.join(ROOT, 'assets', 'icon-512.png')
-    if (fs.existsSync(icon)) {
-      const iconAbs = path.join(buildRoot, iconRel)
-      fs.mkdirSync(path.dirname(iconAbs), { recursive: true })
-      fs.copyFileSync(icon, iconAbs)
-    } else {
-      warn('assets/icon-512.png missing; .deb ships without a hicolor icon')
-    }
-    // Installed-Size is in KiB (Debian policy 5.6.20): du -k of the data tree.
-    let installedKib = 0
-    try {
-      installedKib = Math.max(1, Math.ceil(dirSizeBytes(buildRoot) / 1024))
-    } catch (_) { installedKib = 0 }
-    // DEBIAN/control — minimal but policy-valid. Depends is left light: the
-    // launcher only needs the Pear runtime, which is NOT a distro package, so
-    // we do not assert a hard Depends on it (documented in the long Description
-    // + Recommends note). coreutils provides /usr/bin/env sh prerequisites.
-    const control = [
-      'Package: pearpaste',
-      `Version: ${pkg.version}`,
-      `Architecture: ${arch}`,
-      'Maintainer: Paste Maintainers <defidon@protonmail.com>',
-      'Priority: optional',
-      'Section: utils',
-      ...(installedKib ? [`Installed-Size: ${installedKib}`] : []),
-      // The Pear runtime is fetched/installed out-of-band (pears.com), not from
-      // apt, so it is a Recommends note rather than a hard Depends.
-      'Recommends: pear',
-      'Homepage: https://pears.com',
-      'Description: End-to-end encrypted note and clipboard sync over Pear',
-      ' Paste is a personal, end-to-end encrypted note and clipboard sync app',
-      ' built on the Pear / Holepunch P2P stack. This package installs a thin',
-      ' launcher that resolves the production pear:// link through the locally',
-      ' installed Pear runtime; app content updates flow over P2P, so the',
-      ' launcher rarely needs to be rebuilt.',
-      ' .',
-      ' Requires the Pear runtime on PATH (https://pears.com).',
-      ''
-    ].join('\n')
-    writeFile(path.join(buildRoot, 'DEBIAN', 'control'), control, 0o644)
-    // `--root-owner-group` makes the package contents owned by root:root without
-    // needing fakeroot (dpkg >= 1.18.8); deterministic across CI hosts.
-    execFileSync('dpkg-deb', ['--root-owner-group', '--build', buildRoot, deb], { stdio: 'inherit' })
-    const digest = sha256(deb)
-    writeFile(`${deb}.sha256`, `${digest}  ${path.basename(deb)}\n`, 0o644)
-    ok(`wrote ${path.relative(ROOT, deb)}`)
-    ok(`wrote ${path.relative(ROOT, `${deb}.sha256`)}`)
-    return { deb, buildRoot }
-  } catch (err) {
-    warn(`.deb wrapping failed (${err.message}); tarball remains the primary artifact`)
-    return null
-  }
-}
-
-// Recursively sum regular-file sizes under a directory (for Installed-Size).
-function dirSizeBytes (dir) {
-  let total = 0
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name)
-    if (entry.isDirectory()) total += dirSizeBytes(full)
-    else if (entry.isFile()) total += fs.statSync(full).size
-  }
-  return total
-}
-
 log(`mode=${MODE} platform=${process.platform} arch=${process.arch}`)
 const pkg = preflight()
 
 if (MODE === 'preflight') {
   console.log(`${C.dim}Use: PEARPASTE_LINK=pear://<key> npm run build:linux for the distro-neutral package.${C.x}`)
 } else if (MODE === 'dry-run') {
-  const { payloadDir } = buildPayload(pkg, true)
-  maybeBuildDeb(pkg, true)
-  maybeBuildAppImage(pkg, payloadDir, true)
+  buildPayload(pkg, true)
 } else {
   if (process.platform !== 'linux') die('Linux package mode must run on a Linux host')
-  if (UNSIGNED) warn('UNSIGNED mode: emitting dev/CI artifacts WITHOUT a signature requirement — do NOT distribute as a release (use --release for a signed, fail-closed build)')
-  const { artifact, payloadDir } = buildPayload(pkg, false)
-  // Optional native .deb + AppImage alongside the tarball. Both skip gracefully
-  // when their tool (dpkg-deb / appimagetool) is absent — tarball stays primary.
-  const debResult = maybeBuildDeb(pkg, false)
-  const appImageResult = maybeBuildAppImage(pkg, payloadDir, false)
-  if (REQUIRE_SIGNATURE) {
-    // Every distributable artifact must carry its own detached signature sidecar
-    // (matches the CI release-guard gate). Fail closed if any is missing.
-    assertSignature(artifact)
-    if (debResult && debResult.deb && fs.existsSync(debResult.deb)) {
-      assertSignature(debResult.deb)
-    }
-    if (appImageResult && appImageResult.appImage && fs.existsSync(appImageResult.appImage)) {
-      assertSignature(appImageResult.appImage)
-    }
-  }
+  const { artifact } = buildPayload(pkg, false)
+  if (REQUIRE_SIGNATURE) assertSignature(artifact)
 }
