@@ -345,32 +345,105 @@ function completeRuntimeTree (target) {
   ok('completed deployment tree (boot.bundle + prebuilds from the local pear-electron asset)')
 }
 
-function stageDmgRoot (treeRoot) {
-  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'pearpaste-macos-dmg-'))
-  const required = ['boot.bundle', 'package.json', 'prebuilds', 'by-arch']
+// Assemble a SELF-CONTAINED, drag-installable Paste.app: the entire Pear
+// deployment tree lives INSIDE the bundle at Contents/Resources/runtime/, and
+// a tiny launcher script execs the embedded pear-electron shell binary.
+//
+// WHY: the shell's boot.js resolves `../../../../../../../boot.bundle` — seven
+// dirs up from <shell>.app/Contents/Resources/app. Embedded at
+// Contents/Resources/runtime/by-arch/<arch>/app/<shell>.app, those seven hops
+// land EXACTLY on Contents/Resources/runtime/ → boot.bundle resolves inside
+// the bundle. A dmg-root symlink (previous approach) worked only while the
+// volume was mounted: dragging the symlink (or the bare inner app) to
+// /Applications left boot.bundle/by-arch behind and the app died on launch
+// with MODULE_NOT_FOUND. Self-containment makes drag-install work because the
+// runtime tree travels inside the .app.
+function assembleSelfContainedApp (treeRoot) {
+  const required = ['boot.bundle', 'package.json', 'by-arch']
   for (const name of required) {
-    const src = path.join(treeRoot, name)
-    if (!fs.existsSync(src)) die(`cannot stage macOS .dmg: missing ${path.relative(ROOT, src)}`)
-    fs.cpSync(src, path.join(stage, name), { recursive: true })
-  }
-
-  const appRel = path.join('by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
-  const appTarget = path.join(stage, appRel)
-  if (!fs.existsSync(appTarget)) die(`cannot stage macOS .dmg: missing ${appRel}`)
-  fs.symlinkSync(appRel, path.join(stage, `${PRODUCT_NAME}.app`))
-
-  // Keep the Pear deployment tree next to the app so boot.js can resolve
-  // ../../../../../../../boot.bundle, but hide the plumbing from Finder.
-  if (process.platform === 'darwin') {
-    for (const name of required) {
-      try {
-        execFileSync('chflags', ['hidden', path.join(stage, name)], { stdio: 'ignore' })
-      } catch (_) {
-        warn(`could not hide ${name} in staged .dmg root`)
-      }
+    if (!fs.existsSync(path.join(treeRoot, name))) {
+      die(`cannot assemble self-contained app: missing ${path.relative(ROOT, path.join(treeRoot, name))}`)
     }
   }
+  const innerAppRel = path.join('by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
+  const innerApp = path.join(treeRoot, innerAppRel)
+  if (!fs.existsSync(innerApp)) die(`cannot assemble self-contained app: missing ${innerAppRel}`)
 
+  // The embedded shell's executable name comes from ITS Info.plist — do not
+  // hardcode "Pear Runtime" (a rebrand or runtime update may change it).
+  let innerExec = 'Pear Runtime'
+  try {
+    innerExec = execFileSync('plutil',
+      ['-extract', 'CFBundleExecutable', 'raw', path.join(innerApp, 'Contents', 'Info.plist')],
+      { encoding: 'utf8' }).trim() || innerExec
+  } catch (_) {
+    warn(`could not read CFBundleExecutable from the embedded shell — assuming "${innerExec}"`)
+  }
+
+  const bundle = path.join(path.dirname(treeRoot), 'macos-selfcontained', `${PRODUCT_NAME}.app`)
+  fs.rmSync(path.dirname(bundle), { recursive: true, force: true })
+  const macosDir = path.join(bundle, 'Contents', 'MacOS')
+  const resources = path.join(bundle, 'Contents', 'Resources')
+  const runtime = path.join(resources, 'runtime')
+  fs.mkdirSync(macosDir, { recursive: true })
+  fs.mkdirSync(runtime, { recursive: true })
+
+  for (const name of [...required, 'prebuilds']) {
+    const src = path.join(treeRoot, name)
+    if (fs.existsSync(src)) fs.cpSync(src, path.join(runtime, name), { recursive: true })
+  }
+
+  const icns = path.join(ROOT, 'assets', `${PRODUCT_NAME}.icns`)
+  if (fs.existsSync(icns)) fs.copyFileSync(icns, path.join(resources, `${PRODUCT_NAME}.icns`))
+
+  // Launcher: exec the embedded shell binary. Relative paths inside the bundle
+  // survive both /Applications installs and Gatekeeper app translocation (the
+  // whole bundle is translocated together). Runtime state goes to the Pear
+  // platform dirs, never into the (possibly read-only) bundle.
+  const launcher = path.join(macosDir, PRODUCT_NAME)
+  fs.writeFileSync(launcher, `#!/bin/sh
+HERE="$(cd "$(dirname "$0")" && pwd)"
+exec "$HERE/../Resources/runtime/${innerAppRel}/Contents/MacOS/${innerExec}" "$@"
+`, { mode: 0o755 })
+
+  const ver = appVersion()
+  fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleName</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleDisplayName</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleIdentifier</key><string>global.paste.app</string>
+  <key>CFBundleExecutable</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleIconFile</key><string>${PRODUCT_NAME}.icns</string>
+  <key>CFBundleVersion</key><string>${ver}</string>
+  <key>CFBundleShortVersionString</key><string>${ver}</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+`)
+
+  // Ad-hoc sign the assembled bundle so its structure is at least internally
+  // consistent (real signing/notarization is the --release lane's job).
+  try {
+    execFileSync('codesign', ['--force', '--deep', '--sign', '-', bundle], { stdio: 'ignore' })
+  } catch (_) {
+    warn('ad-hoc codesign of the assembled bundle failed — Gatekeeper friction will be worse, app still runs via right-click → Open')
+  }
+
+  ok(`assembled self-contained ${path.relative(ROOT, bundle)} (runtime tree embedded, launcher → ${innerExec})`)
+  return bundle
+}
+
+function stageDmgRoot (treeRoot) {
+  // The dmg carries exactly: one drag-installable Paste.app + an /Applications
+  // symlink (standard macOS install affordance). No loose plumbing.
+  const app = assembleSelfContainedApp(treeRoot)
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'pearpaste-macos-dmg-'))
+  fs.cpSync(app, path.join(stage, `${PRODUCT_NAME}.app`), { recursive: true, verbatimSymlinks: true })
+  fs.symlinkSync('/Applications', path.join(stage, 'Applications'))
   return stage
 }
 
@@ -380,11 +453,11 @@ function stageDmgRoot (treeRoot) {
 function makeDmg (app, signed, dry) {
   const ver = appVersion()
   const distDir = path.dirname(path.dirname(path.dirname(path.dirname(app)))) // .../dist/macos (best-effort)
-  // EMPIRICAL (2026-06-10): wrap the deployment TREE, not the bare .app — the
-  // shell boots `<tree-root>/boot.bundle` (see completeRuntimeTree), so a
-  // .dmg containing only Paste.app produces an app that cannot start. The
-  // image root exposes a Paste.app symlink for testers while keeping the Pear
-  // deployment tree in the required relative position.
+  // When the deployment tree exists (boot.bundle beside by-arch/), build the
+  // SELF-CONTAINED drag-installable bundle from it (see
+  // assembleSelfContainedApp) and image {Paste.app, Applications↗}. A .dmg of
+  // the bare shell .app cannot start (boot.js resolves boot.bundle seven dirs
+  // up), and a dmg-root symlink breaks on drag-install — both prior layouts.
   const wrapTree = fs.existsSync(path.join(distDir, 'boot.bundle'))
   let stagingDir = null
   const src = wrapTree
@@ -412,7 +485,9 @@ function makeDmg (app, signed, dry) {
   const link = LINK || 'pear://<production-key>'
   fs.writeFileSync(path.join(outDir, `README-macos-${ver}.txt`), `Paste ${ver} macOS .dmg (${ARCH}${signed ? ', signed+notarized' : ', UNSIGNED dev/CI build'})
 
-This .dmg wraps the Pear runtime and resolves the production link:
+Install: open the .dmg and drag Paste.app to Applications. The app is fully
+self-contained (Pear runtime embedded under Contents/Resources/runtime) and
+resolves the production link:
   ${link}
 
 ${signed ? 'Signed with a Developer ID identity and notarized + stapled.' : 'UNSIGNED: Gatekeeper will quarantine this build. Internal/dev use only.'}
