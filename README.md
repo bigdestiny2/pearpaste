@@ -24,7 +24,7 @@ With the [Pear runtime](https://pears.com) installed, any platform can also run 
 pear run pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy
 ```
 
-The desktop packages are thin launchers around that same link (macOS embeds the runtime), so app updates flow peer-to-peer without re-downloading an installer.
+The desktop packages (macOS, Windows, Linux) are thin launchers that run that same link via the Pear runtime, so app updates flow peer-to-peer without re-downloading an installer.
 
 ## Why Paste Exists
 
