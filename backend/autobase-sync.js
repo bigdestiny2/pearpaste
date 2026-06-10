@@ -2384,29 +2384,50 @@ export async function attach (ctx) {
     }
     ctx.emit('paired', { deviceId: newDevice.deviceId })
 
-    // [Fix B] JOINER half of pairing-phantom cleanup: prove we actually finished
-    // joining so the inviter's confirm task never revokes us. Once our writer
-    // seat linearizes (the admin's approving DEVICE_ADD authorized our writerKey
-    // and must replicate back before we are writable), append our genesis-tail
-    // DEVICE_ADD — an idempotent self-confirmation that makes our writer core
-    // produce a node the inviter observes — then send pp-pair-joined back on the
-    // pairing conn as the fast-path ack. Fire-and-forget and best-effort: the
-    // inviter ALSO confirms via the writer node, and its window is generous, so
-    // a slow seat or a dropped conn must never fail PAIR_ACCEPT. Scoped so a
-    // closing engine drains it.
+    // [Fix B] JOINER fast-path ack: send pp-pair-joined on the pairing conn NOW,
+    // while it is still a live raw stream, so the inviter's confirm task clears
+    // us instantly (responsive UX). The ack carries no writability requirement —
+    // it is a plain frame on the same raw channel that delivered the bootstrap.
+    try {
+      bootstrap.conn.write(b4a.from(JSON.stringify({
+        t: 'pp-pair-joined',
+        deviceId: newDevice.deviceId,
+        confirmation: expectedConfirmation
+      })))
+    } catch (_) { /* conn raced shut — the writer node below is the durable signal */ }
+
+    // [I-15] Tear down the stale pairing connection now that the bootstrap
+    // exchange has fully flushed (keys + header persisted, vault joined, engine
+    // open, fast-path ack sent). The pairing conn is classified `pairing` for
+    // its whole life (index.js short-circuits it BEFORE the replication
+    // firewall), so store.replicate(conn) never runs on it — and Hyperswarm
+    // dedups on remotePublicKey, so while this raw conn lives the vault-topic
+    // join can never produce a second, REPLICATING connection. Result: the
+    // joiner stays writable=false and store.replicate 0/0 for the whole window,
+    // so a note written right after pairing never syncs (audit I-15). Destroying
+    // it frees the dedup: Hyperswarm immediately redials via the vault topic, the
+    // firewall admits the fresh joiner (verdict `bootstrap` — no committed device
+    // set yet, so the redial re-authenticates; security model unchanged), and
+    // replication begins in ~ms. Best-effort + idempotent; an already-closed conn
+    // is a no-op. This must precede _awaitWritable below — it is the redial that
+    // lets the joiner's writer seat finally linearize.
+    try { bootstrap.conn.destroy() } catch (_) {}
+
+    // [Fix B] JOINER durable confirm: once our writer seat linearizes (the
+    // admin's approving DEVICE_ADD authorized our writerKey and must replicate
+    // back — over the redialed vault-topic stream above — before we are
+    // writable), append our genesis-tail DEVICE_ADD: an idempotent
+    // self-confirmation that makes our writer core produce a node the inviter
+    // observes even if the fast-path ack was missed. Fire-and-forget and
+    // best-effort: the inviter ALSO confirms via the ack, and its window is
+    // generous, so a slow seat must never fail PAIR_ACCEPT. Scoped so a closing
+    // engine drains it.
     ctx.scope.spawn(async () => {
       try {
         await engine._awaitWritable(60000)
         await engine._appendDeviceAdd(ctx.state.device, { signer: engine._localSigner() })
         await engine.refresh()
-      } catch (_) { /* slow seat — inviter's window + writer-node fallback cover us */ }
-      try {
-        bootstrap.conn.write(b4a.from(JSON.stringify({
-          t: 'pp-pair-joined',
-          deviceId: newDevice.deviceId,
-          confirmation: expectedConfirmation
-        })))
-      } catch (_) { /* conn gone — the writer node remains the durable signal */ }
+      } catch (_) { /* slow seat — inviter's window + ack fallback cover us */ }
     }, 'pair-joined-ack')
 
     return { ok: true, deviceId: newDevice.deviceId, vaultId: ctx.state.vaultId, confirmation: expectedConfirmation }
@@ -2538,6 +2559,17 @@ export async function attach (ctx) {
       // Final re-check covers a node/ack that landed on the last tick.
       if (!confirmed && engine._writerHasNode(writerKey)) confirmed = true
       if (confirmed || scope.cancelled) {
+        // [I-15] APPROVER teardown: the bootstrap exchange is done and the join
+        // is confirmed, so end our half of the stale pairing conn too. The
+        // joiner already destroys its end after sending the ack (which triggers
+        // a `close` here), but destroying ours is idempotent and covers the case
+        // where the joiner's teardown is delayed — neither side should keep a
+        // raw pairing conn alive, because index.js short-circuits it before the
+        // firewall and Hyperswarm's remotePublicKey dedup would then block a
+        // REPLICATING vault-topic redial. A FakeConn in tests has no destroy() —
+        // the try/catch makes that a no-op. Confirm via the writer node already
+        // implies the redial happened, so this never races replication open.
+        try { if (conn && typeof conn.destroy === 'function') conn.destroy() } catch (_) {}
         if (confirmed) { try { ctx.emit('pair-join-confirmed', { deviceId }) } catch (_) {} }
         return
       }
