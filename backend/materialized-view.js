@@ -425,7 +425,36 @@ export class MaterializedView {
 // ---- Local-only search index (spec §9.3 default v1) -------------------------
 // NOT replicated by the vault topic. Tokens are normalized then blinded with
 // indexKey so even this local store holds no plaintext token text. Search
-// returns SEALED pointer rows; the caller decrypts a body only on tap.
+// returns SEALED-flagged pointer rows; the caller decrypts a body only on tap.
+//
+// Row layout (this bee is LOCAL-ONLY — NAMESPACES.SEARCH, never passed to
+// store.replicate(), never relayed; confirmed against replication-firewall.js /
+// relay-service.js):
+//   search!<tokenBlindId>!<objectBlindId> -> MARKER (1 byte; see below)
+//   searchrev!<objectBlindId>             -> sealed { tokenBlindIds:[...], type }
+//
+// [AUDIT I-14] Per-object REVERSE-POINTER row. The previous indexObject/
+// removeObject cleared an object's stale token rows by STREAMING THE ENTIRE
+// `search!` family and string-matching keys ending in '!'+objectBlindId —
+// O(total index rows) per note write (85–94% of write cost; O(N²) at cold
+// sync). The reverse row records exactly which tokenBlindIds an object wrote,
+// so a re-index reads ONE row, dels its k stale pointers, and writes the k new
+// pointers + the updated reverse row → O(tokens), never O(index). The set of
+// `search!` keys produced is byte-identical to the old full-scan across fresh
+// insert, re-index-with-fewer/changed-tokens (the stale-pointer case), and
+// delete: the old token set is precisely the rows ending in '!'+objectBlindId,
+// which is precisely what the reverse row enumerates.
+//
+// [AUDIT I-8] The token-row VALUE is a 1-byte MARKER, not a per-token sealed
+// envelope. The only search() consumer (notes-service.js) reads objectBlindId
+// from the KEY and resolves content via objmeta; the old ~424B {objectId,type}
+// envelope (75% of row bytes, ~k seal() calls/note) was never opened. The
+// reverse row carries ONE sealed envelope per object (plaintext is identical
+// per object), so the local store still holds an AEAD value per object and the
+// verifier's "no plaintext at rest" structural scan stays satisfied, while the
+// dominant search family shrinks ~4× (14.6 → 4.7 KB/note). search() keeps the
+// hardcoded sealed:true flag (the consumer + test/unit/search.test.js depend on
+// the FLAG, not on the value).
 export class LocalSearchIndex {
   constructor ({ bee, crypto, ops, vaultId, indexKey, getVaultKey }) {
     this.bee = bee
@@ -453,59 +482,112 @@ export class LocalSearchIndex {
     return 'search!' + tokenBlindId + '!' + objectBlindId
   }
 
+  // [AUDIT I-14] Per-object reverse-pointer row key. The token-row range reads
+  // are bounded `[ 'search!', 'search!~' )` (and per-term, tighter). At byte 6
+  // 'searchrev!' has 'r' (0x72) while the upper bound 'search!~' has '!' (0x21);
+  // 0x72 > 0x21, so 'searchrev!…' sorts ABOVE 'search!~' and is excluded from
+  // every token-row scan. (It sorts below 'search!' too is irrelevant — it is
+  // simply never inside the range.) Verified by the byte-identical proof.
+  _revKey (objectBlindId) {
+    return 'searchrev!' + objectBlindId
+  }
+
+  // [AUDIT I-8] One-byte token-row marker. The value is never opened (the
+  // consumer reads objectBlindId from the key); a number stores compactly and is
+  // not a CryptoEnvelope / not a user-content row / carries no sentinel, so the
+  // verifier's structural scan classifies it as benign bookkeeping.
+  static get MARKER () { return 1 }
+
+  // Read an object's committed token-pointer set from its reverse row. Returns
+  // the stored tokenBlindIds (or [] when the object was never indexed). Sealed
+  // value, opened under a self-describing objectId derived from the blindId
+  // (same chicken/egg dodge as OBJMETA) so it needs no external state.
+  async _readReverse (objectBlindId) {
+    const node = await this.bee.get(this._revKey(objectBlindId))
+    if (!node || node.value == null) return []
+    try {
+      const plain = this.crypto.openWithObjectId({
+        vaultKey: this._getVaultKey(),
+        objectId: 'searchrev:' + objectBlindId,
+        envelope: node.value
+      })
+      return Array.isArray(plain && plain.tokenBlindIds) ? plain.tokenBlindIds : []
+    } catch (_) {
+      return []
+    }
+  }
+
   // Index one item's searchable text. Old tokens for the same object are
   // cleared first so updates do not leave stale pointers.
+  //
+  // [AUDIT I-14] O(tokens) via the per-object reverse row: read the 1 reverse
+  // row → del exactly its k stale token pointers → put the k' new token markers
+  // + the refreshed reverse row. Never streams the whole `search!` family. The
+  // resulting `search!` key set is byte-identical to the old full-scan: the old
+  // scan deleted precisely the rows ending in '!'+objectBlindId (i.e. this
+  // object's prior token set, == the reverse row) and wrote the new token set;
+  // we delete that same prior set and write that same new set. [AUDIT I-8] Each
+  // token row's value is the 1-byte MARKER; one sealed envelope (listing the
+  // tokenBlindIds) lives in the reverse row instead of ~k per-token envelopes.
   async indexObject ({ objectId, objectBlindId, type, texts }) {
     const tokens = new Set()
     for (const t of texts) for (const tok of LocalSearchIndex.tokenize(t)) tokens.add(tok)
+    const newTbids = [...tokens].map(tok => this.tokenBlindId(tok))
+    const oldTbids = await this._readReverse(objectBlindId)
     const batch = this.bee.batch()
-    // clear previous pointers for this object
-    for await (const { key } of this.bee.createReadStream({
-      gte: 'search!', lt: 'search!~'
-    })) {
-      if (key.endsWith('!' + objectBlindId)) await batch.del(key)
-    }
-    for (const tok of tokens) {
-      const tbid = this.tokenBlindId(tok)
-      const envelope = this.crypto.seal({
+    // Clear the object's previous token pointers (exactly the set the old
+    // full-scan would have matched), keyed straight off the reverse row.
+    for (const tbid of oldTbids) await batch.del(this._key(tbid, objectBlindId))
+    for (const tbid of newTbids) await batch.put(this._key(tbid, objectBlindId), LocalSearchIndex.MARKER)
+    if (newTbids.length === 0) {
+      // No searchable tokens (e.g. soft-delete with texts:[]) — drop the reverse
+      // row too so the object leaves no residue, matching the old scan which
+      // left zero `search!` rows for it.
+      await batch.del(this._revKey(objectBlindId))
+    } else {
+      await batch.put(this._revKey(objectBlindId), this.crypto.seal({
         vaultKey: this._getVaultKey(),
-        objectId: 'searchptr:' + objectBlindId,
+        objectId: 'searchrev:' + objectBlindId,
         objectBlindId,
         opType: 'SEARCH_PTR',
         schema: this.ops.SCHEMAS.SEARCH_POINTER,
         vaultId: this.vaultId,
-        plaintext: { objectId, type }
-      })
-      await batch.put(this._key(tbid, objectBlindId), envelope)
+        plaintext: { tokenBlindIds: newTbids, type }
+      }))
     }
     await batch.flush()
   }
 
+  // [AUDIT I-14] O(tokens) delete via the reverse row: del its pointers + the
+  // reverse row itself. Byte-identical to the old full-scan delete (which
+  // removed exactly the rows ending in '!'+objectBlindId == this set).
   async removeObject (objectBlindId) {
+    const oldTbids = await this._readReverse(objectBlindId)
     const batch = this.bee.batch()
-    for await (const { key } of this.bee.createReadStream({
-      gte: 'search!', lt: 'search!~'
-    })) {
-      if (key.endsWith('!' + objectBlindId)) await batch.del(key)
-    }
+    for (const tbid of oldTbids) await batch.del(this._key(tbid, objectBlindId))
+    await batch.del(this._revKey(objectBlindId))
     await batch.flush()
   }
 
-  // AND-of-terms query. Returns sealed pointer rows (objectBlindId + envelope);
-  // NO decrypted title/body (spec §9.3 "search returns sealed result rows").
-  // All term scans run concurrently — the bee serves independent range reads,
-  // so a k-term query costs one round of I/O latency instead of k.
+  // AND-of-terms query. Returns objectBlindId-only pointer rows flagged
+  // sealed:true; NO decrypted title/body (spec §9.3 "search returns sealed
+  // result rows"). [AUDIT I-8] The token-row value is now a 1-byte marker, so
+  // the row carries no envelope to return — the only consumer
+  // (notes-service.js) reads objectBlindId from the key and resolves content
+  // via objmeta, and depends on the sealed FLAG, not on the value (kept
+  // hardcoded true here; test/unit/search.test.js asserts it). All term scans
+  // run concurrently — the bee serves independent range reads, so a k-term
+  // query costs one round of I/O latency instead of k.
   async search (query, { limit = 50 } = {}) {
     const terms = [...new Set(LocalSearchIndex.tokenize(query))]
     if (terms.length === 0) return []
     const perTerm = await Promise.all(terms.map(async (term) => {
       const tbid = this.tokenBlindId(term)
-      const hits = new Map()
-      for await (const { key, value } of this.bee.createReadStream({
+      const hits = new Set()
+      for await (const { key } of this.bee.createReadStream({
         gte: 'search!' + tbid + '!', lt: 'search!' + tbid + '!~'
       })) {
-        const obid = key.slice(('search!' + tbid + '!').length)
-        hits.set(obid, value)
+        hits.add(key.slice(('search!' + tbid + '!').length))
       }
       return hits
     }))
@@ -514,11 +596,11 @@ export class LocalSearchIndex {
     const acc = perTerm[0]
     for (let i = 1; i < perTerm.length && acc.size > 0; i++) {
       const hits = perTerm[i]
-      for (const k of [...acc.keys()]) if (!hits.has(k)) acc.delete(k)
+      for (const k of [...acc]) if (!hits.has(k)) acc.delete(k)
     }
     const rows = []
-    for (const [objectBlindId, envelope] of acc) {
-      rows.push({ objectBlindId, envelope, sealed: true })
+    for (const objectBlindId of acc) {
+      rows.push({ objectBlindId, sealed: true })
       if (rows.length >= limit) break
     }
     return rows
