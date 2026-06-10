@@ -8,8 +8,9 @@
 import test from 'brittle'
 import fs from 'fs'
 import path from 'path'
+import { fileURLToPath } from 'url'
 
-const ROOT = path.resolve(new URL('../..', import.meta.url).pathname)
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const ANDROID_APP_GRADLE = path.join(ROOT, 'mobile/PearPasteMobile/android/app/build.gradle')
 const ANDROID_MANIFEST = path.join(ROOT, 'mobile/PearPasteMobile/android/app/src/main/AndroidManifest.xml')
 
