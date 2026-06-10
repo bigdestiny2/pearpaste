@@ -1,70 +1,49 @@
-// Paste — macOS build orchestrator.
+// Paste — macOS build orchestrator (launcher model).
 //
-// Spec refs: §12 (desktop packaging: Pear binary-wrapper path for macOS),
-// §17 (release; sign + notarize macOS artifacts; preserve Pear P2P update path),
-// §21 Agent 3 (desktop distribution). Companion: docs/RELEASE.md §3 +
-// docs/SHIPPING.md §3. Sibling of scripts/build-windows.mjs.
+// Spec refs: §12 (desktop packaging), §17 (release; sign + notarize), §21
+// Agent 3 (desktop distribution). Sibling of scripts/build-windows.mjs.
 //
-// Verified against Pear v0.3243 (`pear --help`, `pear build --help`,
-// `pear stage --help`):
-//   - `pear stage <link> [dir]` syncs disk changes into a project link. It has
-//     NO platform-app flags. (`pear init`/`pear release` were removed.)
-//   - `pear build --darwin-arm64-app <app-dir> [--target <dir>]` packages an
-//     ALREADY-BUILT darwin-arm64 app dir into the deployment folder. Pear
-//     enforces `basename(app) === (package.json productName ?? name)`; here we
-//     pin `productName: "Paste"`, so the expected app basename is `Paste.app`.
-//     (`--darwin-x64-app` exists too; this script targets arm64 — the only Mac
-//     hardware Apple still ships — and documents x64 as a one-flag change.)
+// WHY A LAUNCHER (the hard-won lesson, 2026-06-10):
+//   pear-electron's shell is NOT a standalone app. Its boot entry does
+//     const state = JSON.parse(process.argv.slice(-1)[0])
+//   i.e. it REQUIRES the Pear runtime to spawn it with a boot-state JSON
+//   (`<shell> run --rti {checkout,mount,bridge,startId,…}`). The Pear runtime
+//   constructs that at launch (it even stands up a local bridge server). A
+//   static wrapper that just exec()s the shell binary passes the executable
+//   PATH as the last argv, so JSON.parse throws "Unexpected token '/'" — which
+//   boot.js's try/catch masks as a misleading "Cannot find module boot.js".
+//   Every embedded-runtime/dmg-tree/symlink layout hit this; none ever booted.
 //
-// Paste is a Pear app. There are two macOS distribution tiers:
+//   So macOS uses the SAME model as Windows (scripts/windows-launcher) and
+//   Linux: a thin launcher that locates the installed Pear runtime and runs the
+//   production pear:// link. `pear run pear://<key>` performs the full
+//   bootstrap and is the verified-working path. The launcher requires the Pear
+//   runtime (one-time `npm i -g pear`), and shows a friendly install dialog if
+//   it is absent.
 //
-//   Tier 1 (v1, P2P link — produced from ANY OS):
-//     `pear stage <link>` publishes the app to a pear:// link. A macOS user runs
-//     `pear run pear://<key>`. Pear fetches the darwin-arm64 runtime + the
-//     darwin-arm64 native prebuilds automatically (pear-electron/pre injects
-//     `pear.assets.ui` with `/by-arch/%%HOST%%` + `/prebuilds/%%HOST%%`, and
-//     sodium-native ships a darwin-arm64 prebuild). No cross-compile needed.
-//
-//   Tier 2 (v1.5, standalone signed + notarized .dmg):
-//     `pear build --darwin-arm64-app <app-dir>` (package the platform app) +
-//     `codesign` (Developer ID, hardened runtime) + `hdiutil` (the .dmg) +
-//     `xcrun notarytool submit --wait` + `xcrun stapler staple`. This REQUIRES a
-//     macOS host (or CI macos-latest) and a real Apple Developer ID identity +
-//     notarization credentials — out of repo scope per spec §17. The steps are
-//     scripted and gated here; signing FAILS CLOSED without the identity/auth.
-//
-// This script is safe to run from any OS for --preflight/--dry-run. The actual
-// `pear build`, `hdiutil`, codesign, and notarization steps only execute on
-// macOS (darwin). In --build mode it emits an UNSIGNED .dmg (clearly named, with
-// a console warning) for dev/CI before a Developer ID cert is purchased; in
-// --release mode it signs + notarizes and FAILS CLOSED without credentials.
+// Distribution tiers:
+//   Tier 1 (P2P link, any OS): `pear stage <link>` → users `pear run pear://…`.
+//   Tier 2 (.dmg): a double-clickable launcher .app wrapped in a .dmg. --build
+//     emits an UNSIGNED .dmg (dev/CI); --release codesigns (Developer ID,
+//     hardened runtime) + notarizes + staples, failing closed without creds.
 //
 // Usage:
-//   node scripts/build-macos.mjs --preflight       # readiness report (any OS)
-//   node scripts/build-macos.mjs --dry-run          # show the plan, no writes
-//   node scripts/build-macos.mjs --build            # UNSIGNED .dmg (dev/CI)
-//   node scripts/build-macos.mjs --release          # build + sign + notarize
+//   node scripts/build-macos.mjs --preflight   # readiness report (any OS)
+//   node scripts/build-macos.mjs --dry-run      # show the plan, no writes
+//   node scripts/build-macos.mjs --build        # UNSIGNED launcher .dmg
+//   node scripts/build-macos.mjs --release      # build + sign + notarize
 //
 // Env:
-//   PEARPASTE_LINK            pear:// link (or channel) — recorded into the .dmg
-//                             readme; the wrapper resolves it at runtime
-//   PEARPASTE_MAC_APP         path to a prebuilt darwin-arm64 pear-electron app
-//                             dir (its basename must be the product name
-//                             "Paste"/"Paste.app"). If unset, --build/--release
-//                             expect `pear build` to have produced it under the
-//                             target dir.
-//   PEARPASTE_MAC_IDENTITY    "Developer ID Application: <Name> (<TEAM>)"  (Tier 2)
-//   notarytool auth — EITHER PEARPASTE_NOTARY_PROFILE (a stored
-//     `xcrun notarytool store-credentials` keychain profile) OR
-//     APPLE_ID + APPLE_TEAM_ID + APP_SPECIFIC_PASSWORD
-//   PEARPASTE_MAC_TARGET      override the `pear build --target` dir
-//                             (default dist/macos)
-//   PEARPASTE_MAC_ARCH        darwin-arm64 (default) | darwin-x64
+//   PEARPASTE_LINK         pear:// link the launcher runs (default: production)
+//   PEARPASTE_MAC_IDENTITY "Developer ID Application: <Name> (<TEAM>)" (Tier 2)
+//   notarytool auth — EITHER PEARPASTE_NOTARY_PROFILE (a stored keychain
+//     profile) OR APPLE_ID + APPLE_TEAM_ID + APP_SPECIFIC_PASSWORD
+//   PEARPASTE_DIST_DIR     override the output dir (default dist/macos)
+//   PEARPASTE_MAC_ARCH     darwin-arm64 (default) | darwin-x64
 
 import { execFileSync } from 'child_process'
 import crypto from 'crypto'
 import fs from 'fs'
-import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -80,23 +59,19 @@ const val = (f, env) => {
 const MODE = has('--release')
   ? 'release'
   : has('--build') ? 'build' : has('--dry-run') ? 'dry-run' : 'preflight'
-// Explicit dev/CI escape hatch. --build is already unsigned; --unsigned is
-// accepted as an alias/intent marker but must NOT be combined with --release (a
-// signed release cannot be "unsigned" — it must fail closed without creds).
 const UNSIGNED = has('--unsigned')
-const LINK = val('--link', 'PEARPASTE_LINK')
-// Deliberate product/display name. `pear build` requires the platform app dir's
-// basename to equal (package.json) productName ?? name; we pin productName to
-// "Paste" so the darwin app dir + .app path are predictable for signing.
+
+// The production app link the launcher runs. Overridable for staging/dev.
+const PRODUCTION_LINK = 'pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy'
+const APP_LINK = val('--link', 'PEARPASTE_LINK') || PRODUCTION_LINK
+
 const PRODUCT_NAME = 'Paste'
-// Target arch flag. arm64 is the default (only Mac hardware Apple ships); x64 is
-// a single-flag change for older Intel Macs.
+const BUNDLE_ID = 'global.paste.app'
 const ARCH = (val('--arch', 'PEARPASTE_MAC_ARCH') || 'darwin-arm64').replace(/^--/, '')
 if (ARCH !== 'darwin-arm64' && ARCH !== 'darwin-x64') {
   console.error(`[mac:error] unsupported --arch "${ARCH}" (expected darwin-arm64 or darwin-x64)`)
   process.exit(1)
 }
-const BUILD_FLAG = `--${ARCH}-app`
 
 const C = { ok: '\x1b[32m', warn: '\x1b[33m', err: '\x1b[31m', dim: '\x1b[2m', x: '\x1b[0m' }
 const log = (m) => console.log(`[mac] ${m}`)
@@ -108,76 +83,195 @@ if (UNSIGNED && MODE === 'release') {
   die('--unsigned cannot be combined with --release (a signed release must fail closed without a Developer ID identity); use --build for an unsigned dev/CI .dmg')
 }
 
-function safeReaddir (p) { try { return fs.readdirSync(p) } catch (_) { return [] } }
-
 function sha256 (absPath) {
-  const hash = crypto.createHash('sha256')
-  hash.update(fs.readFileSync(absPath))
-  return hash.digest('hex')
+  return crypto.createHash('sha256').update(fs.readFileSync(absPath)).digest('hex')
 }
-
 function appVersion () {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version || '0.0.0' } catch (_) { return '0.0.0' }
 }
+function hasBin (cmd) {
+  try { execFileSync('command', ['-v', cmd], { stdio: 'ignore', shell: '/bin/sh' }); return true } catch (_) { return false }
+}
+function distDir () {
+  return process.env.PEARPASTE_DIST_DIR
+    ? path.join(ROOT, process.env.PEARPASTE_DIST_DIR)
+    : path.join(ROOT, 'dist', 'macos')
+}
 
-// ---- Preflight: everything verifiable from any OS --------------------------
+// ---- The launcher executable ----------------------------------------------
+// A POSIX sh script (the .app's CFBundleExecutable). When double-clicked,
+// LaunchServices runs it with a minimal environment (no user PATH), so the
+// Pear runtime is located via explicit candidate paths + a PATH fallback.
+// `exec`s `pear run <link>`, which performs the full Pear bootstrap (the only
+// thing that boots the pear-electron shell correctly — see the header).
+function launcherScript () {
+  // `\\n` here writes a literal \n into the file → AppleScript renders it as a
+  // newline in the install dialog.
+  return `#!/bin/sh
+# Paste launcher — locates the Pear runtime and runs the production app link.
+LINK="${APP_LINK}"
+
+find_pear() {
+  for c in \\
+    "$HOME/Library/Application Support/pear/bin/pear" \\
+    "/opt/homebrew/bin/pear" \\
+    "/usr/local/bin/pear" \\
+    "$(command -v pear 2>/dev/null)"; do
+    if [ -n "$c" ] && [ -x "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+PEAR="$(find_pear)"
+if [ -z "$PEAR" ]; then
+  osascript -e 'display dialog "Paste needs the Pear runtime (one-time setup).\\n\\nInstall it:\\n   npm i -g pear\\n   pear run pear://runtime\\n\\nThen open Paste again." buttons {"Get Pear at pears.com", "OK"} default button "OK" with title "Paste" with icon caution' \\
+    -e 'if button returned of result is "Get Pear at pears.com" then open location "https://pears.com"' >/dev/null 2>&1
+  exit 1
+fi
+
+exec "$PEAR" run "$LINK"
+`
+}
+
+// ---- Build the launcher .app ----------------------------------------------
+function buildLauncherApp (dry) {
+  const out = distDir()
+  const bundle = path.join(out, `${PRODUCT_NAME}.app`)
+  const ver = appVersion()
+  log(`assemble launcher ${path.relative(ROOT, bundle)} → runs ${APP_LINK.slice(0, 32)}…`)
+  if (dry) { ok('dry-run: launcher .app not written'); return bundle }
+
+  fs.rmSync(bundle, { recursive: true, force: true })
+  const macosDir = path.join(bundle, 'Contents', 'MacOS')
+  const resources = path.join(bundle, 'Contents', 'Resources')
+  fs.mkdirSync(macosDir, { recursive: true })
+  fs.mkdirSync(resources, { recursive: true })
+
+  const exe = path.join(macosDir, PRODUCT_NAME)
+  fs.writeFileSync(exe, launcherScript(), { mode: 0o755 })
+
+  const icns = path.join(ROOT, 'assets', `${PRODUCT_NAME}.icns`)
+  if (fs.existsSync(icns)) fs.copyFileSync(icns, path.join(resources, `${PRODUCT_NAME}.icns`))
+  else warn('assets/Paste.icns missing — launcher will use a default icon')
+
+  fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleName</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleDisplayName</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+  <key>CFBundleExecutable</key><string>${PRODUCT_NAME}</string>
+  <key>CFBundleIconFile</key><string>${PRODUCT_NAME}.icns</string>
+  <key>CFBundleVersion</key><string>${ver}</string>
+  <key>CFBundleShortVersionString</key><string>${ver}</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSUIElement</key><false/>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+`)
+  fs.writeFileSync(path.join(bundle, 'Contents', 'PkgInfo'), 'APPL????')
+
+  // Ad-hoc sign so the bundle is structurally consistent (real Developer ID
+  // signing is the --release lane). Best-effort; non-fatal on non-darwin.
+  if (process.platform === 'darwin') {
+    try { execFileSync('codesign', ['--force', '--sign', '-', bundle], { stdio: 'ignore' }) } catch (_) {
+      warn('ad-hoc codesign failed — Gatekeeper friction worse, app still runs via right-click → Open')
+    }
+  }
+  ok(`built launcher ${path.relative(ROOT, bundle)}`)
+  return bundle
+}
+
+// ---- Create the .dmg (hdiutil) --------------------------------------------
+function makeDmg (app, signed, dry) {
+  const ver = appVersion()
+  const out = distDir()
+  const dmgName = signed ? `${PRODUCT_NAME}-${ver}.dmg` : `${PRODUCT_NAME}-${ver}-unsigned.dmg`
+  const dmg = path.join(path.dirname(out), dmgName) // dist/<name>.dmg
+  log(`stage {${PRODUCT_NAME}.app, /Applications↗} → hdiutil → ${path.relative(ROOT, dmg)}`)
+  if (dry) { ok('dry-run: hdiutil not executed'); return dmg }
+
+  const stage = fs.mkdtempSync(path.join(distDir(), '.dmg-stage-'))
+  try {
+    fs.cpSync(app, path.join(stage, `${PRODUCT_NAME}.app`), { recursive: true, verbatimSymlinks: true })
+    fs.symlinkSync('/Applications', path.join(stage, 'Applications'))
+    fs.mkdirSync(path.dirname(dmg), { recursive: true })
+    fs.rmSync(dmg, { force: true })
+    execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', stage, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true })
+  }
+
+  const digest = sha256(dmg)
+  fs.writeFileSync(`${dmg}.sha256`, `${digest}  ${path.basename(dmg)}\n`)
+  fs.writeFileSync(path.join(path.dirname(dmg), `README-macos-${ver}.txt`), `Paste ${ver} macOS .dmg (${ARCH}${signed ? ', signed+notarized' : ', UNSIGNED dev/CI build'})
+
+Install: open the .dmg and drag Paste to Applications.
+
+Paste runs on the Pear runtime (by Holepunch). Install it once:
+  npm i -g pear
+  pear run pear://runtime
+
+Then open Paste. The launcher resolves the production app link:
+  ${APP_LINK}
+${signed ? '' : '\nUNSIGNED build: right-click Paste → Open the first time (Gatekeeper).\n'}App updates flow peer-to-peer over the link — this launcher rarely changes.
+`)
+  ok(`wrote ${path.relative(ROOT, dmg)}`)
+  ok(`wrote ${path.relative(ROOT, `${dmg}.sha256`)}`)
+  return dmg
+}
+
+// ---- Sign + notarize (Tier 2 — Developer ID) ------------------------------
+function signNotarize (app, dry) {
+  if (process.platform !== 'darwin') {
+    warn('macOS signing/notarization must run on macOS; skipping on ' + process.platform)
+    return null
+  }
+  const identity = process.env.PEARPASTE_MAC_IDENTITY
+  if (!identity) {
+    if (dry) { warn('(dry-run) --release would FAIL CLOSED without PEARPASTE_MAC_IDENTITY.') } else { die('release requires PEARPASTE_MAC_IDENTITY ("Developer ID Application: <Name> (<TEAM>)") — fail closed (spec §17). Use --build for an unsigned dev/CI .dmg.') }
+  }
+  let notaryAuth = null
+  if (process.env.PEARPASTE_NOTARY_PROFILE) {
+    notaryAuth = ['--keychain-profile', process.env.PEARPASTE_NOTARY_PROFILE]
+  } else if (process.env.APPLE_ID && process.env.APPLE_TEAM_ID && process.env.APP_SPECIFIC_PASSWORD) {
+    notaryAuth = ['--apple-id', process.env.APPLE_ID, '--team-id', process.env.APPLE_TEAM_ID, '--password', process.env.APP_SPECIFIC_PASSWORD]
+  } else if (dry) {
+    warn('(dry-run) --release would also need notarytool auth: PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD.')
+  } else {
+    die('macOS notarization requires PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD — fail closed (spec §17).')
+  }
+  log(`codesign --force --options runtime --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "${path.relative(ROOT, app)}"`)
+  if (dry) { ok('dry-run: codesign/notarytool/stapler not executed'); return makeDmg(app, true, true) }
+  execFileSync('codesign', ['--force', '--options', 'runtime', '--timestamp', '--sign', identity, app], { stdio: 'inherit' })
+  execFileSync('codesign', ['--verify', '--strict', '--verbose=2', app], { stdio: 'inherit' })
+  const dmg = makeDmg(app, true, false)
+  execFileSync('codesign', ['--force', '--timestamp', '--sign', identity, dmg], { stdio: 'inherit' })
+  log(`xcrun notarytool submit "${path.basename(dmg)}" <auth> --wait`)
+  execFileSync('xcrun', ['notarytool', 'submit', dmg, ...notaryAuth, '--wait'], { stdio: 'inherit' })
+  execFileSync('xcrun', ['stapler', 'staple', dmg], { stdio: 'inherit' })
+  ok(`notarized + stapled ${path.relative(ROOT, dmg)}`)
+  return dmg
+}
+
+// ---- Preflight -------------------------------------------------------------
 function preflight () {
-  log('macOS build preflight')
+  log('macOS build preflight (launcher model)')
   let fatal = 0
 
-  // 1. sodium-native is the only true native addon; needs a darwin prebuild.
-  const sodPre = path.join(ROOT, 'node_modules/sodium-native/prebuilds')
-  const arches = ARCH === 'darwin-x64' ? ['darwin-x64'] : ['darwin-arm64']
-  const darPb = safeReaddir(sodPre).filter(d => arches.includes(d))
-  if (darPb.length) ok(`sodium-native darwin prebuild(s): ${darPb.join(', ')}`)
-  else { die(`sodium-native has NO ${arches.join('/')} prebuild — macOS runtime would fail`); fatal++ }
+  const icns = path.join(ROOT, 'assets', `${PRODUCT_NAME}.icns`)
+  if (fs.existsSync(icns)) ok('assets/Paste.icns present (app icon)')
+  else warn('assets/Paste.icns missing — launcher will use a default icon')
 
-  // 2. Remaining deps must be pure-JS (no node-gyp on the user's Mac).
-  const nativeOther = []
-  for (const d of safeReaddir(path.join(ROOT, 'node_modules'))) {
-    if (d === 'sodium-native' || d.startsWith('.')) continue
-    if (fs.existsSync(path.join(ROOT, 'node_modules', d, 'binding.gyp'))) nativeOther.push(d)
-  }
-  if (nativeOther.length === 0) ok('no other native (node-gyp) deps — pure-JS + Bare')
-  else warn(`native deps to verify darwin prebuilds for: ${nativeOther.join(', ')}`)
+  if (/^pear:\/\/[a-z0-9]+$/i.test(APP_LINK)) ok(`app link well-formed (${APP_LINK.slice(0, 24)}…)`)
+  else { warn(`app link looks malformed: ${APP_LINK}`); fatal++ }
 
-  // 3. pear-electron runtime asset (the darwin UI binary source, fetched P2P).
-  let assets = null
-  try {
-    const pe = JSON.parse(fs.readFileSync(path.join(ROOT, 'node_modules/pear-electron/package.json'), 'utf8'))
-    assets = pe.pear && pe.pear.assets && pe.pear.assets.ui
-  } catch (_) {}
-  if (assets && assets.link) {
-    ok(`pear-electron UI asset link present (${assets.link.slice(0, 28)}…)`)
-    if (String(assets.only || '').includes('%%HOST%%') || JSON.stringify(assets.only).includes('%%HOST%%')) {
-      ok('asset `only` uses %%HOST%% → Pear fetches darwin runtime on the Mac')
-    }
-  } else { warn('pear-electron pear.assets.ui not found — macOS runtime fetch unverified'); fatal++ }
+  if (hasBin('pear')) ok('`pear` runtime on PATH (end users also need it installed)')
+  else warn('`pear` not on PATH here — end users must `npm i -g pear`; the launcher shows an install dialog if absent')
 
-  // 4. pre step is configured (auto-injects the assets at stage time).
-  let pre = null
-  try { pre = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).pear?.pre } catch (_) {}
-  if (pre === 'pear-electron/pre') ok('pear.pre = pear-electron/pre (injects darwin assets at stage)')
-  else warn(`pear.pre is ${JSON.stringify(pre)} — expected "pear-electron/pre"`)
-
-  // 5. macOS GUI icon present (.icns) — pear build embeds it into the .app.
-  const icns = path.join(ROOT, 'assets', 'Paste.icns')
-  if (fs.existsSync(icns)) ok('assets/Paste.icns present (macOS app icon)')
-  else warn('assets/Paste.icns missing — the .app will use a default icon')
-
-  // 6. Bare-safe code: no unguarded Node-only globals in worker-reachable code
-  //    (process/AbortController/Buffer) — these break on the Bare runtime.
-  const offenders = grepUnguarded()
-  if (offenders.length === 0) ok('no unguarded Node-only globals in backend (Bare-safe)')
-  else { warn(`unguarded Node-only globals (will fail on Bare):\n  ${offenders.join('\n  ')}`); fatal++ }
-
-  // 7. `pear` runtime available (needed to build; not to preflight).
-  try {
-    execFileSync('pear', ['--help'], { stdio: 'ignore' })
-    ok('`pear` runtime on PATH')
-  } catch (_) { warn('`pear` not on PATH — required for --build/--release') }
-
-  // 8. host tooling for the .dmg / signing (only matters on darwin).
   if (process.platform === 'darwin') {
     ok(`host platform darwin/${process.arch}`)
     if (hasBin('hdiutil')) ok('hdiutil present (for the .dmg)')
@@ -191,386 +285,28 @@ function preflight () {
   }
 
   console.log('')
-  if (fatal === 0) ok('PREFLIGHT PASS — app is macOS-capable; `pear stage` yields a mac-runnable pear:// link')
-  else die(`PREFLIGHT had ${fatal} blocking issue(s) — fix before a macOS build`)
-  console.log(`${C.dim}Tier 1 (P2P): pear stage <link> → macOS users 'pear run pear://<key>'.`)
-  console.log(`Tier 2 (.dmg): --build emits an UNSIGNED .dmg; --release needs Developer ID + notarytool auth (docs/RELEASE.md §3).${C.x}`)
+  if (fatal === 0) ok('PREFLIGHT PASS — launcher .dmg is buildable; users run it with the Pear runtime installed')
+  else die(`PREFLIGHT had ${fatal} blocking issue(s)`)
 }
 
-function hasBin (cmd) {
-  try { execFileSync('command', ['-v', cmd], { stdio: 'ignore', shell: '/bin/sh' }); return true } catch (_) {}
-  try { execFileSync(cmd, ['-h'], { stdio: 'ignore' }); return true } catch (_) { return false }
-}
-
-// Shared with build-windows.mjs by intent (kept in sync): flag the few real
-// Bare-incompatible global USAGES (not the bare word in a comment/string).
-function grepUnguarded () {
-  const files = [
-    'backend/index.js', 'backend/desktop-worker.mjs', 'backend/verifier.js',
-    'backend/relay-service.js', 'backend/notes-service.js', 'backend/autobase-sync.js',
-    'backend/materialized-view.js', 'backend/vault-store.js', 'backend/lifecycle-scope.js',
-    'backend/crypto-envelope.js', 'backend/identity.js', 'backend/pairing.js',
-    'backend/shared-ops.js', 'backend/rpc.js', 'backend/clipboard.js'
-  ]
-  const re = /(?:[^.\w]process\.)|(?:\bnew\s+AbortController\b)|(?:\bAbortController\s*\()|(?:[^.\w]Buffer\.)|(?:\bnew\s+Buffer\b)|(?:[^.\w]Buffer\s*\()|(?:\bsetImmediate\s*\()|(?:\b__dirname\b)|(?:\b__filename\b)/
-  const stripComments = (ln) => ln.replace(/\/\*.*?\*\//g, '').replace(/\/\/.*$/, '')
-  const guarded = (ctx) =>
-    /typeof\s+(process|AbortController|Buffer)\s*!==?\s*['"]undefined['"]/.test(ctx) ||
-    /globalThis\.(process|AbortController|Buffer)/.test(ctx)
-  const out = []
-  for (const rel of files) {
-    const fp = path.join(ROOT, rel)
-    if (!fs.existsSync(fp)) continue
-    const lines = fs.readFileSync(fp, 'utf8').split('\n')
-    const codeLines = lines.map(stripComments)
-    lines.forEach((ln, i) => {
-      const s = ln.trim()
-      if (s.startsWith('//') || s.startsWith('*') || s.startsWith('/*')) return
-      const code = codeLines[i]
-      if (!code.trim()) return
-      let ctx = code
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = codeLines[j].trimEnd()
-        if (!prev.trim()) break
-        ctx = prev + '\n' + ctx
-        if (!/(\|\||&&)\s*$/.test(prev)) break
-      }
-      if (guarded(ctx)) return
-      if (re.test(code)) out.push(`${rel}:${i + 1}: ${s.slice(0, 80)}`)
-    })
-  }
-  return out
-}
-
-// Locate the produced .app. `pear build --darwin-arm64-app <dir> --target <t>`
-// lays the packaged app out under <t>/by-arch/<arch>/app/<Product>.app (mirrors
-// the win32 by-arch layout). We glob by-arch/<arch>/app/*.app and require
-// exactly one match (fail closed otherwise). Falls back to the supplied wrapper.
-function findApp (target, wrapper) {
-  const packagedDir = path.join(target, 'by-arch', ARCH, 'app')
-  const search = fs.existsSync(packagedDir) ? packagedDir : wrapper
-  if (!search || !fs.existsSync(search)) {
-    die(`no packaged app dir found (looked in ${path.relative(ROOT, packagedDir)} and the wrapper) — did 'pear build ${BUILD_FLAG}' run?`)
-  }
-  // If the search path is itself the .app, use it directly.
-  if (search.endsWith('.app') && fs.existsSync(search)) return search
-  const candidates = safeReaddir(search)
-    .filter(f => f.endsWith('.app'))
-    .map(f => path.join(search, f))
-  if (candidates.length === 0) die(`no *.app found under ${search} — 'pear build ${BUILD_FLAG}' did not produce the app bundle`)
-  if (candidates.length > 1) die(`ambiguous .app (${candidates.length} matches): ${candidates.join(', ')} — point PEARPASTE_MAC_APP at a single bundle`)
-  return candidates[0]
-}
-
-// ---- Build the platform app dir via `pear build` --------------------------
-// Verified flag: `pear build --darwin-arm64-app <app-dir> --target <dir>`.
-// Pear enforces basename(app) === productName ("Paste"), so the supplied/produced
-// app bundle must be named "Paste.app". Returns the target dir.
-function pearBuild (dry) {
-  const wrapper = val('--app', 'PEARPASTE_MAC_APP')
-  const target = val('--target', 'PEARPASTE_MAC_TARGET') || path.join(ROOT, 'dist', 'macos')
-  // EMPIRICAL (Pear v0.3243, verified on-device 2026-06-10): `pear build`
-  // prints its help text and EXITS 0 — producing NOTHING — unless (a)
-  // `--package=` is passed explicitly (its cwd project detection fails
-  // silently) and (b) every flag uses the `--flag=value` form
-  // (space-separated values are parsed as positionals and rejected with
-  // "Unrecognized Argument"). This was the "finicky arg" that blocked all
-  // three platform installers; build-windows.mjs / package-linux.mjs need the
-  // same forms. Because pear exits 0 either way, the produced app is
-  // VERIFIED on disk below — never trust the exit code.
-  const buildArgs = ['build', `--package=${path.join(ROOT, 'package.json')}`]
-  if (wrapper) {
-    // Validate the basename matches productName BEFORE invoking pear (it enforces
-    // the same rule, but our message is friendlier and fails earlier).
-    if (!fs.existsSync(wrapper)) die(`darwin app dir not found: ${wrapper}`)
-    const base = path.basename(wrapper).replace(/\.app$/, '')
-    if (base !== PRODUCT_NAME) {
-      die(`darwin app dir basename must equal productName "${PRODUCT_NAME}" (pear build enforces this); got "${path.basename(wrapper)}"`)
-    }
-    buildArgs.push(`${BUILD_FLAG}=${wrapper}`)
-  } else {
-    // No prebuilt wrapper supplied. Build one by copying the pear-electron
-    // runtime shell ("Pear Runtime.app") to <target-parent>/macos-wrapper/
-    // Paste.app, then rebrand ONLY CFBundleDisplayName + the icon, and
-    // ad-hoc re-sign (`codesign --force --deep --sign -`). EMPIRICAL
-    // (2026-06-10): do NOT change CFBundleName or CFBundleIdentifier —
-    // Electron derives the helper-app paths from them, so the app dies
-    // instantly with "FATAL: Unable to find helper app" (it looks for
-    // "Paste Helper.app" while Frameworks/ ships "Pear Runtime Helper*.app").
-    // A full product rename requires rebranding all four helper bundles +
-    // their plists/executables, electron-packager-style — signed-release
-    // work, not dev-tier. Until automated here, require the path so we
-    // never package the wrong bundle.
-    if (!dry) die('set PEARPASTE_MAC_APP to the prebuilt darwin app dir (basename "Paste"); pear build requires the platform app-dir path argument')
-    buildArgs.push(`${BUILD_FLAG}=${path.join('<path-to>', `${PRODUCT_NAME}.app`)}`)
-  }
-  buildArgs.push(`--target=${target}`)
-  log(`$ pear ${buildArgs.join(' ')}`)
-  if (dry) { ok('dry-run: pear build not executed'); return target }
-  execFileSync('pear', buildArgs, { cwd: ROOT, stdio: 'inherit' })
-  const produced = path.join(target, 'by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
-  if (!fs.existsSync(produced)) {
-    die(`pear build produced no app at ${path.relative(ROOT, produced)} — pear prints help + exits 0 on arg-parse failure; check the --flag=value forms above`)
-  }
-  completeRuntimeTree(target)
-  ok(`packaged darwin app into ${path.relative(ROOT, target)}/by-arch/${ARCH}/app`)
-  return target
-}
-
-// EMPIRICAL (2026-06-10): the deployment tree `pear build` emits contains only
-// package.json + by-arch/ — but the pear-electron shell .app is NOT
-// standalone: its Contents/Resources/app/boot.js requires
-// `../../../../../../../boot.bundle`, i.e. `<tree-root>/boot.bundle`, SEVEN
-// directories up. Complete the tree from the local pear-electron runtime
-// asset (boot.bundle + prebuilds) so the wrapped app can actually boot; a
-// .dmg of the bare .app launches nothing.
-function completeRuntimeTree (target) {
-  if (fs.existsSync(path.join(target, 'boot.bundle'))) return
-  const assetsRoot = path.join(os.homedir(), 'Library', 'Application Support', 'pear', 'assets')
-  let src = null
-  try {
-    for (const d of fs.readdirSync(assetsRoot)) {
-      const cand = path.join(assetsRoot, d)
-      if (fs.existsSync(path.join(cand, 'boot.bundle')) && fs.existsSync(path.join(cand, 'by-arch', ARCH))) { src = cand; break }
-    }
-  } catch (_) {}
-  if (!src) {
-    warn('no local pear-electron asset found to complete the runtime tree (boot.bundle/prebuilds) — the wrapped app will NOT boot standalone; run the app once via `pear run --dev .` to fetch the asset')
-    return
-  }
-  fs.copyFileSync(path.join(src, 'boot.bundle'), path.join(target, 'boot.bundle'))
-  if (fs.existsSync(path.join(src, 'prebuilds')) && !fs.existsSync(path.join(target, 'prebuilds'))) {
-    fs.cpSync(path.join(src, 'prebuilds'), path.join(target, 'prebuilds'), { recursive: true })
-  }
-  ok('completed deployment tree (boot.bundle + prebuilds from the local pear-electron asset)')
-}
-
-// Assemble a SELF-CONTAINED, drag-installable Paste.app: the entire Pear
-// deployment tree lives INSIDE the bundle at Contents/Resources/runtime/, and
-// a tiny launcher script execs the embedded pear-electron shell binary.
-//
-// WHY: the shell's boot.js resolves `../../../../../../../boot.bundle` — seven
-// dirs up from <shell>.app/Contents/Resources/app. Embedded at
-// Contents/Resources/runtime/by-arch/<arch>/app/<shell>.app, those seven hops
-// land EXACTLY on Contents/Resources/runtime/ → boot.bundle resolves inside
-// the bundle. A dmg-root symlink (previous approach) worked only while the
-// volume was mounted: dragging the symlink (or the bare inner app) to
-// /Applications left boot.bundle/by-arch behind and the app died on launch
-// with MODULE_NOT_FOUND. Self-containment makes drag-install work because the
-// runtime tree travels inside the .app.
-function assembleSelfContainedApp (treeRoot) {
-  const required = ['boot.bundle', 'package.json', 'by-arch']
-  for (const name of required) {
-    if (!fs.existsSync(path.join(treeRoot, name))) {
-      die(`cannot assemble self-contained app: missing ${path.relative(ROOT, path.join(treeRoot, name))}`)
-    }
-  }
-  const innerAppRel = path.join('by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
-  const innerApp = path.join(treeRoot, innerAppRel)
-  if (!fs.existsSync(innerApp)) die(`cannot assemble self-contained app: missing ${innerAppRel}`)
-
-  // The embedded shell's executable name comes from ITS Info.plist — do not
-  // hardcode "Pear Runtime" (a rebrand or runtime update may change it).
-  let innerExec = 'Pear Runtime'
-  try {
-    innerExec = execFileSync('plutil',
-      ['-extract', 'CFBundleExecutable', 'raw', path.join(innerApp, 'Contents', 'Info.plist')],
-      { encoding: 'utf8' }).trim() || innerExec
-  } catch (_) {
-    warn(`could not read CFBundleExecutable from the embedded shell — assuming "${innerExec}"`)
-  }
-
-  const bundle = path.join(path.dirname(treeRoot), 'macos-selfcontained', `${PRODUCT_NAME}.app`)
-  fs.rmSync(path.dirname(bundle), { recursive: true, force: true })
-  const macosDir = path.join(bundle, 'Contents', 'MacOS')
-  const resources = path.join(bundle, 'Contents', 'Resources')
-  const runtime = path.join(resources, 'runtime')
-  fs.mkdirSync(macosDir, { recursive: true })
-  fs.mkdirSync(runtime, { recursive: true })
-
-  for (const name of [...required, 'prebuilds']) {
-    const src = path.join(treeRoot, name)
-    if (fs.existsSync(src)) fs.cpSync(src, path.join(runtime, name), { recursive: true })
-  }
-
-  const icns = path.join(ROOT, 'assets', `${PRODUCT_NAME}.icns`)
-  if (fs.existsSync(icns)) fs.copyFileSync(icns, path.join(resources, `${PRODUCT_NAME}.icns`))
-
-  // Launcher: exec the embedded shell binary. Relative paths inside the bundle
-  // survive both /Applications installs and Gatekeeper app translocation (the
-  // whole bundle is translocated together). Runtime state goes to the Pear
-  // platform dirs, never into the (possibly read-only) bundle.
-  const launcher = path.join(macosDir, PRODUCT_NAME)
-  fs.writeFileSync(launcher, `#!/bin/sh
-HERE="$(cd "$(dirname "$0")" && pwd)"
-exec "$HERE/../Resources/runtime/${innerAppRel}/Contents/MacOS/${innerExec}" "$@"
-`, { mode: 0o755 })
-
-  const ver = appVersion()
-  fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleName</key><string>${PRODUCT_NAME}</string>
-  <key>CFBundleDisplayName</key><string>${PRODUCT_NAME}</string>
-  <key>CFBundleIdentifier</key><string>global.paste.app</string>
-  <key>CFBundleExecutable</key><string>${PRODUCT_NAME}</string>
-  <key>CFBundleIconFile</key><string>${PRODUCT_NAME}.icns</string>
-  <key>CFBundleVersion</key><string>${ver}</string>
-  <key>CFBundleShortVersionString</key><string>${ver}</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
-  <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-`)
-
-  // Ad-hoc sign the assembled bundle so its structure is at least internally
-  // consistent (real signing/notarization is the --release lane's job).
-  try {
-    execFileSync('codesign', ['--force', '--deep', '--sign', '-', bundle], { stdio: 'ignore' })
-  } catch (_) {
-    warn('ad-hoc codesign of the assembled bundle failed — Gatekeeper friction will be worse, app still runs via right-click → Open')
-  }
-
-  ok(`assembled self-contained ${path.relative(ROOT, bundle)} (runtime tree embedded, launcher → ${innerExec})`)
-  return bundle
-}
-
-function stageDmgRoot (treeRoot) {
-  // The dmg carries exactly: one drag-installable Paste.app + an /Applications
-  // symlink (standard macOS install affordance). No loose plumbing.
-  const app = assembleSelfContainedApp(treeRoot)
-  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'pearpaste-macos-dmg-'))
-  fs.cpSync(app, path.join(stage, `${PRODUCT_NAME}.app`), { recursive: true, verbatimSymlinks: true })
-  fs.symlinkSync('/Applications', path.join(stage, 'Applications'))
-  return stage
-}
-
-// ---- Create the .dmg (hdiutil) --------------------------------------------
-// Produces <dist>/<name>.dmg from the .app. In --build mode the name carries an
-// explicit "-unsigned" marker; in --release mode it is signed + notarized.
-function makeDmg (app, signed, dry) {
-  const ver = appVersion()
-  const distDir = path.dirname(path.dirname(path.dirname(path.dirname(app)))) // .../dist/macos (best-effort)
-  // When the deployment tree exists (boot.bundle beside by-arch/), build the
-  // SELF-CONTAINED drag-installable bundle from it (see
-  // assembleSelfContainedApp) and image {Paste.app, Applications↗}. A .dmg of
-  // the bare shell .app cannot start (boot.js resolves boot.bundle seven dirs
-  // up), and a dmg-root symlink breaks on drag-install — both prior layouts.
-  const wrapTree = fs.existsSync(path.join(distDir, 'boot.bundle'))
-  let stagingDir = null
-  const src = wrapTree
-    ? (dry ? '<staged macOS dmg root>' : (stagingDir = stageDmgRoot(distDir)))
-    : app
-  // Never write the .dmg INSIDE the folder being imaged.
-  const outDir = process.env.PEARPASTE_DIST_DIR
-    ? path.join(ROOT, process.env.PEARPASTE_DIST_DIR)
-    : (wrapTree ? path.dirname(distDir) : (fs.existsSync(distDir) ? distDir : path.join(ROOT, 'dist', 'macos')))
-  const dmgName = signed ? `${PRODUCT_NAME}-${ver}.dmg` : `${PRODUCT_NAME}-${ver}-unsigned.dmg`
-  const dmg = path.join(outDir, dmgName)
-  log(`hdiutil create -volname "${PRODUCT_NAME}" -srcfolder "${src}" -ov -format UDZO "${dmg}"`)
-  if (dry) { ok('dry-run: hdiutil not executed'); return dmg }
-  try {
-    fs.mkdirSync(outDir, { recursive: true })
-    fs.rmSync(dmg, { force: true })
-    execFileSync('hdiutil', ['create', '-volname', PRODUCT_NAME, '-srcfolder', src, '-ov', '-format', 'UDZO', dmg], { stdio: 'inherit' })
-  } finally {
-    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true })
-  }
-  const digest = sha256(dmg)
-  fs.writeFileSync(`${dmg}.sha256`, `${digest}  ${path.basename(dmg)}\n`)
-  // Record which pear:// link this wrapper resolves (the .app embeds the runtime
-  // and resolves the link at launch; this is operator documentation only).
-  const link = LINK || 'pear://<production-key>'
-  fs.writeFileSync(path.join(outDir, `README-macos-${ver}.txt`), `Paste ${ver} macOS .dmg (${ARCH}${signed ? ', signed+notarized' : ', UNSIGNED dev/CI build'})
-
-Install: open the .dmg and drag Paste.app to Applications. The app is fully
-self-contained (Pear runtime embedded under Contents/Resources/runtime) and
-resolves the production link:
-  ${link}
-
-${signed ? 'Signed with a Developer ID identity and notarized + stapled.' : 'UNSIGNED: Gatekeeper will quarantine this build. Internal/dev use only.'}
-The Pear P2P update path stays intact: app content updates flow over the
-pear:// link, so this wrapper rarely needs to be rebuilt.
-`)
-  ok(`wrote ${path.relative(ROOT, dmg)}`)
-  ok(`wrote ${path.relative(ROOT, `${dmg}.sha256`)}`)
-  return dmg
-}
-
-// ---- Sign + notarize (Tier 2 — macOS + Developer ID) ----------------------
-// codesign the .app (hardened runtime) → build the .dmg → codesign the .dmg →
-// notarytool submit --wait → stapler staple. FAILS CLOSED without the identity
-// and notarytool auth. Returns the stapled .dmg path.
-function signNotarize (app, dry) {
-  if (process.platform !== 'darwin') {
-    warn('macOS signing/notarization must run on macOS; skipping on ' + process.platform + '. Tier 1 link is the cross-platform deliverable.')
-    return null
-  }
-  // In --dry-run we only PREVIEW the plan, so missing creds must NOT exit the
-  // process — they would in a real --release (fail closed). Surface what would
-  // be required and continue printing the plan.
-  const identity = process.env.PEARPASTE_MAC_IDENTITY
-  if (!identity) {
-    if (dry) { warn('(dry-run) --release would FAIL CLOSED here without PEARPASTE_MAC_IDENTITY ("Developer ID Application: <Name> (<TEAM>)").') } else { die('release requires PEARPASTE_MAC_IDENTITY ("Developer ID Application: <Name> (<TEAM>)") — fail closed (spec §17). Use --build for an unsigned dev/CI .dmg.') }
-  }
-  // notarytool auth: a stored keychain profile OR the Apple-ID triple. Fail closed.
-  let notaryAuth = null
-  if (process.env.PEARPASTE_NOTARY_PROFILE) {
-    notaryAuth = ['--keychain-profile', process.env.PEARPASTE_NOTARY_PROFILE]
-  } else if (process.env.APPLE_ID && process.env.APPLE_TEAM_ID && process.env.APP_SPECIFIC_PASSWORD) {
-    notaryAuth = ['--apple-id', process.env.APPLE_ID, '--team-id', process.env.APPLE_TEAM_ID, '--password', process.env.APP_SPECIFIC_PASSWORD]
-  } else if (dry) {
-    warn('(dry-run) --release would also need notarytool auth: PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD.')
-  } else {
-    die('macOS notarization requires PEARPASTE_NOTARY_PROFILE or APPLE_ID+APPLE_TEAM_ID+APP_SPECIFIC_PASSWORD — fail closed (spec §17).')
-  }
-  log(`codesign --deep --force --options runtime --timestamp --sign "$PEARPASTE_MAC_IDENTITY" "${app}"`)
-  log('codesign --verify --deep --strict --verbose=2 <app>')
-  if (dry) { ok('dry-run: codesign/notarytool/stapler not executed'); return makeDmg(app, true, true) }
-  // 1. Sign the .app with hardened runtime + secure timestamp.
-  execFileSync('codesign', ['--deep', '--force', '--options', 'runtime', '--timestamp', '--sign', identity, app], { stdio: 'inherit' })
-  execFileSync('codesign', ['--verify', '--deep', '--strict', '--verbose=2', app], { stdio: 'inherit' })
-  // 2. Build the .dmg around the signed .app.
-  const dmg = makeDmg(app, true, false)
-  // 3. Sign the .dmg itself.
-  execFileSync('codesign', ['--force', '--timestamp', '--sign', identity, dmg], { stdio: 'inherit' })
-  // 4. Notarize + staple.
-  log(`xcrun notarytool submit "${dmg}" <auth> --wait`)
-  execFileSync('xcrun', ['notarytool', 'submit', dmg, ...notaryAuth, '--wait'], { stdio: 'inherit' })
-  execFileSync('xcrun', ['stapler', 'staple', dmg], { stdio: 'inherit' })
-  ok(`notarized + stapled ${path.relative(ROOT, dmg)}`)
-  warn('A notarized+stapled .dmg is a release artifact — the CI release-guard still expects a detached signature sidecar (.sig/.asc/.minisig/.p7s) next to it; produce one in the release lane.')
-  return dmg
-}
-
-// ---- main -----------------------------------------------------------------
+// ---- main ------------------------------------------------------------------
 log(`mode=${MODE} platform=${process.platform} arch=${process.arch} target-arch=${ARCH}`)
 if (MODE === 'preflight') {
   preflight()
 } else if (MODE === 'dry-run') {
   preflight()
   console.log('')
-  const target = pearBuild(true)
-  const app = path.join(target, 'by-arch', ARCH, 'app', `${PRODUCT_NAME}.app`)
+  const app = buildLauncherApp(true)
+  log('--build would then:'); makeDmg(app, false, true)
   console.log('')
-  // Show both the unsigned (--build) and signed (--release) tails of the plan.
-  log('--build would then:')
-  makeDmg(app, false, true)
-  console.log('')
-  log('--release would instead:')
-  signNotarize(app, true)
+  log('--release would instead:'); signNotarize(app, true)
 } else if (MODE === 'build') {
-  // Dev/CI: produce an UNSIGNED .dmg. No identity required.
   if (process.platform !== 'darwin') die('--build (the .dmg step) must run on macOS (or CI macos-latest)')
-  warn('UNSIGNED build: emitting a dev/CI .dmg WITHOUT codesign/notarization — Gatekeeper will quarantine it. Do NOT distribute as a release; use --release for a signed, notarized, fail-closed build.')
-  const target = pearBuild(false)
-  const app = findApp(target, val('--app', 'PEARPASTE_MAC_APP'))
+  warn('UNSIGNED build: emitting a dev/CI .dmg WITHOUT codesign/notarization — Gatekeeper will quarantine it. Use --release for a signed, notarized build.')
+  const app = buildLauncherApp(false)
   makeDmg(app, false, false)
 } else if (MODE === 'release') {
   if (process.platform !== 'darwin') die('--release (sign + notarize) must run on macOS (or CI macos-latest)')
-  const target = pearBuild(false)
-  const app = findApp(target, val('--app', 'PEARPASTE_MAC_APP'))
+  const app = buildLauncherApp(false)
   signNotarize(app, false)
 }
