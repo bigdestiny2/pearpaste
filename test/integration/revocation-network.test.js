@@ -141,11 +141,20 @@ async function convergeStep (engines) {
   }
 }
 
-async function pumpUntil (engines, pred, { timeoutMs = 45000, every = 150 } = {}) {
+async function pumpUntil (engines, pred, { timeoutMs = 45000, every = 150, onTick = null, tickEvery = 5000 } = {}) {
   const deadline = Date.now() + timeoutMs
   let val = false
+  let lastTick = Date.now()
   while (Date.now() < deadline) {
     await convergeStep(engines)
+    // Periodic re-nudge for DHT-reconnect-bound waits: the full integration
+    // suite can starve @hyperswarm/testnet discovery on a constrained CI runner,
+    // so a one-shot join/flush before the wait isn't enough — re-announce while
+    // we poll. No-op for ordinary (all-online) convergence waits (onTick null).
+    if (onTick && Date.now() - lastTick >= tickEvery) {
+      lastTick = Date.now()
+      try { await onTick() } catch (_) {}
+    }
     await sleep(every)
     try { val = await pred() } catch (_) { val = false }
     if (val) return val
@@ -332,7 +341,7 @@ test('SB2 firewall: destroys existing + refuses new revoked-peer streams; topic_
 // unwraps epochKey_1, and derives the new topic — while the revoked device's
 // follow topic is never announced again.
 // ---------------------------------------------------------------------------
-test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', { timeout: 240000 }, async (t) => {
+test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', { timeout: 480000 }, async (t) => {
   const vaultKey = crypto.randomBytes(crypto.KEY_BYTES)
   const indexKey = crypto.randomBytes(32)
   const vaultId = 'revnet-follow'
@@ -423,14 +432,23 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   // both peers have joined/refreshed the correct follow topic. Nudge the
   // already-known peer keys so this assertion stays focused on the firewall +
   // epoch catch-up path rather than DHT scheduler timing.
-  try { B.swarm.joinPeer(A.swarm.keyPair.publicKey) } catch (_) {}
-  try { A.swarm.joinPeer(B.swarm.keyPair.publicKey) } catch (_) {}
-  await A.swarm.flush().catch(() => {})
-  await B.swarm.flush().catch(() => {})
+  // Re-announce the known peer keys + re-flush both swarms — once now, then
+  // again periodically during the catch-up wait (onTick), because the full
+  // integration suite can starve @hyperswarm/testnet discovery on a constrained
+  // CI runner and a single up-front nudge can't recover a dropped reconnect.
+  const renudgeFollow = async () => {
+    try { B.swarm.joinPeer(A.swarm.keyPair.publicKey) } catch (_) {}
+    try { A.swarm.joinPeer(B.swarm.keyPair.publicKey) } catch (_) {}
+    try { await discFollowB.refresh() } catch (_) {}
+    try { await discOwn.refresh() } catch (_) {}
+    await A.swarm.flush().catch(() => {})
+    await B.swarm.flush().catch(() => {})
+  }
+  await renudgeFollow()
 
   const caughtKey = await pumpUntil([A.engine, B.engine], async () =>
     B.engine.epochKeys.has(epochTag1) && B.engine.activeEpochTag === epochTag1,
-  { timeoutMs: 90000 })
+  { timeoutMs: 180000, onTick: renudgeFollow, tickEvery: 8000 })
   if (!caughtKey) {
     // Flake forensics (from the windows-launcher CI hardening): dump the live
     // connection/auth/epoch state so a CI failure here is diagnosable.
@@ -464,8 +482,15 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   const discTopic1B = B.swarm.join(topic1OnB, { server: true, client: true })
   await discTopic1B.flushed().catch(() => {})
   await B.swarm.flush().catch(() => {})
+  const renudgeTopic1 = async () => {
+    try { B.swarm.joinPeer(A.swarm.keyPair.publicKey) } catch (_) {}
+    try { A.swarm.joinPeer(B.swarm.keyPair.publicKey) } catch (_) {}
+    try { await discTopic1B.refresh() } catch (_) {}
+    await A.swarm.flush().catch(() => {})
+    await B.swarm.flush().catch(() => {})
+  }
   const caughtContent = await pumpUntil([A.engine, B.engine], async () =>
     await openNote(B.engine, 'note:n1'),
-  { timeoutMs: 90000 })
+  { timeoutMs: 180000, onTick: renudgeTopic1, tickEvery: 8000 })
   t.ok(caughtContent, 'B caught post-rotation content after walking forward onto topic_1')
 })
