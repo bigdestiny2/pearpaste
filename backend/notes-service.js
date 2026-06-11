@@ -86,6 +86,42 @@ export async function attach (ctx) {
     return null
   }
 
+  // RAW-ROW READ FALLBACK (OFFLINE-WINDOW INVISIBLE-CONTENT fix, read half).
+  // A row stored by the lacks-epoch-key reducer path (putNoteSealedRaw /
+  // putClipSealedRaw) is the content op's OWN envelope verbatim — sealed under
+  // epochKey_N with objectId 'opbody:'+objectBlindId — so the vault-key
+  // view.openRecord can NEVER read it, even once this device holds the key.
+  // The engine's raw-op re-materializer upgrades such rows from its pending
+  // records, but rows persisted BEFORE that machinery existed have no pending
+  // record (they stay raw forever), and a row is also transiently raw between
+  // key recovery and the next apply pass. This fallback opens the envelope as
+  // an op body under the epochTag named in its OWN AUTHENTICATED AAD, using
+  // only keys this device already holds (engine.epochKeys): a revoked device
+  // never obtains a post-revocation epoch key, so the fallback FAILS CLOSED
+  // exactly like the reducer path — forward secrecy is untouched. Read-only:
+  // the stored row stays raw (the re-materializer owns durable upgrades).
+  // `objectId` may be null (raw rows skip objmeta, so list paths can't always
+  // resolve one) — the op-body objectId is derived from the AAD instead.
+  function openSealedRowSafe (s, objectId, envelope) {
+    if (objectId != null) {
+      try { return s.view.openRecord({ objectId, envelope }) } catch (_) { /* raw fallback below */ }
+    }
+    const aad = envelope && envelope.aad
+    const tag = aad ? String(aad.epochTag || '') : ''
+    // A vault-key row (no epochTag in its AAD) that failed to open has no
+    // fallback, and epoch-0 raw rows cannot exist (epochKey_0 == vaultKey).
+    if (!tag) return null
+    const key = s.epochKeys ? s.epochKeys.get(tag) : null
+    if (!key) return null // key not held — fail closed (revoked / still behind)
+    try {
+      return crypto.openWithObjectId({
+        epochKey: key,
+        objectId: 'opbody:' + String(aad.objectBlindId || ''),
+        envelope
+      })
+    } catch (_) { return null }
+  }
+
   // ---- NOTE_LIST (sealed rows only) -------------------------------------
   ctx.dispatcher.register(COMMANDS.NOTE_LIST, async ({ limit = 200 }) => {
     const s = await awaitSync()
@@ -106,34 +142,36 @@ export async function attach (ctx) {
       // already pay for sort metadata.
       let meta = { sealed: true }
       const objectId = await resolveObjectId(s, objectBlindId)
-      if (objectId) {
-        try {
-          const note = s.view.openRecord({ objectId, envelope })
-          if (note.deletedAt) continue
-          // Lazy filter: a temporary note past its expiresAt is treated as
-          // deleted from the moment expiry passes, even if the sweeper
-          // hasn't yet emitted the hard-delete op. Keeps the user-visible
-          // contract honest while delete replication catches up.
-          if (note.expiresAt && note.expiresAt <= now) continue
-          meta = {
-            id: note.noteId,
-            type: 'note',
-            bodyFormat: note.bodyFormat || 'plain',
-            pinned: !!note.pinned,
-            updatedBucket: ops.timeBucket(note.updatedAt || note.createdAt || Date.now()),
-            // Notes are now identified by `label` only. For legacy records
-            // that still carry a `title` (written before the title field
-            // was dropped), fall back to title so they don't appear as
-            // "Sealed" placeholders. Saving a legacy note re-writes
-            // without the title field.
-            label: String(note.label || note.title || ''),
-            // expiresAt > 0 = temporary; UI renders a countdown chip.
-            // Absolute timestamp so paired devices agree on expiry even
-            // without clock-skew correction (within reasonable bounds).
-            expiresAt: note.expiresAt || null,
-            sealed: true // body intentionally absent
-          }
-        } catch (_) { /* keep sealed */ }
+      // openSealedRowSafe: vault-key open, then the raw-row epoch fallback —
+      // a raw row has no objmeta (objectId null) yet still opens off its AAD,
+      // so an offline-window note renders real metadata instead of a
+      // permanent "Sealed" placeholder. Unreadable rows keep the placeholder.
+      const note = openSealedRowSafe(s, objectId, envelope)
+      if (note) {
+        if (note.deletedAt) continue
+        // Lazy filter: a temporary note past its expiresAt is treated as
+        // deleted from the moment expiry passes, even if the sweeper
+        // hasn't yet emitted the hard-delete op. Keeps the user-visible
+        // contract honest while delete replication catches up.
+        if (note.expiresAt && note.expiresAt <= now) continue
+        meta = {
+          id: note.noteId,
+          type: 'note',
+          bodyFormat: note.bodyFormat || 'plain',
+          pinned: !!note.pinned,
+          updatedBucket: ops.timeBucket(note.updatedAt || note.createdAt || Date.now()),
+          // Notes are now identified by `label` only. For legacy records
+          // that still carry a `title` (written before the title field
+          // was dropped), fall back to title so they don't appear as
+          // "Sealed" placeholders. Saving a legacy note re-writes
+          // without the title field.
+          label: String(note.label || note.title || ''),
+          // expiresAt > 0 = temporary; UI renders a countdown chip.
+          // Absolute timestamp so paired devices agree on expiry even
+          // without clock-skew correction (within reasonable bounds).
+          expiresAt: note.expiresAt || null,
+          sealed: true // body intentionally absent
+        }
       }
       rows.push({ objectBlindId, ...meta })
     }
@@ -149,7 +187,16 @@ export async function attach (ctx) {
     const obid = crypto.blindId(s.indexKey, objectId)
     const env = await s.view.getNoteSealed(obid)
     if (!env) { const e = new Error('note not found'); e.code = 'NOT_FOUND'; throw e }
-    const note = s.view.openRecord({ objectId, envelope: env })
+    let note
+    try {
+      note = s.view.openRecord({ objectId, envelope: env })
+    } catch (err) {
+      // Raw-row epoch fallback (objectId null skips the redundant vault-key
+      // retry). Holding no key for the row rethrows the original AEAD_FAIL —
+      // a revoked device sees exactly the pre-fix failure (fails closed).
+      note = openSealedRowSafe(s, null, env)
+      if (!note) throw err
+    }
     if (note.deletedAt) { const e = new Error('note deleted'); e.code = 'NOT_FOUND'; throw e }
     // Same lazy-expiry treatment as the list. Refusing to open an expired
     // note is the user-facing half of the temporary-note guarantee — the
@@ -186,7 +233,10 @@ export async function attach (ctx) {
     let createdAt = now
     const existing = await s.view.getNoteSealed(obid)
     if (existing) {
-      try { createdAt = s.view.openRecord({ objectId, envelope: existing }).createdAt || now } catch (_) {}
+      // Fallback-aware so editing a still-raw offline-window note preserves
+      // its original createdAt instead of minting a new one.
+      const prev = openSealedRowSafe(s, objectId, existing)
+      if (prev && prev.createdAt) createdAt = prev.createdAt
     }
     const full = {
       noteId,
@@ -239,18 +289,17 @@ export async function attach (ctx) {
     for (const { bucket, objectBlindId, envelope } of sealed) {
       let meta = { sealed: true, bucket }
       const objectId = await resolveObjectId(s, objectBlindId)
-      if (objectId) {
-        try {
-          const clip = s.view.openRecord({ objectId, envelope })
-          if (clip.expiresAt && clip.expiresAt < now) continue // expired
-          meta = {
-            id: clip.clipId,
-            type: 'clip',
-            kind: clip.kind || 'text',
-            bucket,
-            sealed: true // body intentionally absent
-          }
-        } catch (_) {}
+      // Same raw-row epoch fallback as NOTE_LIST (clip raw rows skip objmeta).
+      const clip = openSealedRowSafe(s, objectId, envelope)
+      if (clip) {
+        if (clip.expiresAt && clip.expiresAt < now) continue // expired
+        meta = {
+          id: clip.clipId,
+          type: 'clip',
+          kind: clip.kind || 'text',
+          bucket,
+          sealed: true // body intentionally absent
+        }
       }
       rows.push({ objectBlindId, ...meta })
     }
@@ -265,7 +314,13 @@ export async function attach (ctx) {
     const sealed = await s.view.scanClips()
     const hit = sealed.find(r => r.objectBlindId === obid)
     if (!hit) { const e = new Error('clip not found'); e.code = 'NOT_FOUND'; throw e }
-    const clip = s.view.openRecord({ objectId, envelope: hit.envelope })
+    let clip
+    try {
+      clip = s.view.openRecord({ objectId, envelope: hit.envelope })
+    } catch (err) {
+      clip = openSealedRowSafe(s, null, hit.envelope) // raw-row epoch fallback
+      if (!clip) throw err
+    }
     const { __lww, ...clean } = clip
     openItem(objectId, clean, ctx.state.visibilityMs)
     return { clip: clean }
@@ -313,7 +368,13 @@ export async function attach (ctx) {
     const sealed = await s.view.scanClips()
     const hit = sealed.find(r => r.objectBlindId === obid)
     if (!hit) { const e = new Error('clip not found'); e.code = 'NOT_FOUND'; throw e }
-    const clip = s.view.openRecord({ objectId, envelope: hit.envelope })
+    let clip
+    try {
+      clip = s.view.openRecord({ objectId, envelope: hit.envelope })
+    } catch (err) {
+      clip = openSealedRowSafe(s, null, hit.envelope) // raw-row epoch fallback
+      if (!clip) throw err
+    }
     const body = String(clip.body)
     // app-held plaintext is NOT cached — return for OS clipboard then drop.
     closeItem(objectId)
@@ -355,10 +416,15 @@ export async function attach (ctx) {
         try {
           const env = await s.view.getNoteSealed(objectBlindId)
           if (env) {
-            const note = s.view.openRecord({ objectId, envelope: env })
-            if (note.deletedAt) continue
-            if (note.expiresAt && note.expiresAt <= now) continue
-            expiresAt = note.expiresAt || null
+            // Fallback-aware: an indexed row that was later downgraded raw
+            // (pre-guard sessions) stays filterable/clickable when this
+            // device holds its epoch key; unreadable rows keep sealed.
+            const note = openSealedRowSafe(s, objectId, env)
+            if (note) {
+              if (note.deletedAt) continue
+              if (note.expiresAt && note.expiresAt <= now) continue
+              expiresAt = note.expiresAt || null
+            }
           }
         } catch (_) { /* keep sealed if decrypt fails */ }
       }
@@ -393,15 +459,22 @@ export async function attach (ctx) {
         scanned++
         try {
           const objectId = await resolveObjectId(s, objectBlindId)
-          if (!objectId) continue
-          const note = s.view.openRecord({ objectId, envelope })
+          // Fallback-aware (objectId may be null for raw rows): a raw row we
+          // cannot open is skipped silently — pre-fix it warned on every
+          // sweep — and a raw temporary note whose key we DO hold now
+          // expires on schedule instead of lingering unreadable.
+          const note = openSealedRowSafe(s, objectId, envelope)
+          if (!note) continue
           if (note.deletedAt) continue
           if (!note.expiresAt || note.expiresAt > now) continue
+          // A raw row has no objmeta (objectId null) — the decrypted body
+          // carries noteId, so the delete still addresses the right object.
+          const targetId = objectId || ('note:' + note.noteId)
           // Past expiry — emit a hard delete. This is idempotent on the
           // reducer side (already-deleted envelopes are a no-op) so a
           // double-sweep across devices is harmless.
-          closeItem(objectId)
-          await s.appendOp(ops.OP_TYPES.NOTE_DELETE, ops.SCHEMAS.NOTE, objectId, { noteId: note.noteId, hard: true })
+          closeItem(targetId)
+          await s.appendOp(ops.OP_TYPES.NOTE_DELETE, ops.SCHEMAS.NOTE, targetId, { noteId: note.noteId, hard: true })
           swept++
         } catch (err) {
           ctx.log.warn('sweep-note-failed', { err: String((err && err.message) || err) })

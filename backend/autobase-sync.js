@@ -94,7 +94,7 @@ class SyncEngine {
     // the durability-reconciliation window (FRESH-WRITER ORPHAN fix).
     this._lastWriterAddedAt = 0
     // Pending durability set (FRESH-WRITER ORPHAN / SILENT NOTE-LOSS fix). Maps
-    // objectBlindId -> { type, schema, objectId, payload, tries } for every
+    // objectBlindId -> { type, bucket, epochTag, op, tries } for every
     // additive content op THIS device appended whose row must stay materialized
     // in the committed view. Adding a paired device as an indexer makes Autobase
     // migrate/reboot the apply state (re-checkout the view at indexedLength),
@@ -103,11 +103,38 @@ class SyncEngine {
     // the op is in the log + re-applied, but its view row vanishes on ALL
     // devices). A point-in-time confirm at append time can't catch a rollback
     // that lands later, so the background convergence loop reconciles this set:
-    // any pending op whose row is missing is re-appended (idempotent upsert with
-    // a fresh Lamport) until it sticks. Non-indexer paired writers (which would
-    // avoid the migration) crash this Autobase version, so this app-layer
-    // reconciliation is the correct closure. Cleared on lock/close.
+    // any pending op whose row is missing is re-appended VERBATIM — `op` is the
+    // exact signed op appendOp minted, re-appended byte-identical under its
+    // ORIGINAL (lamport, deviceId) identity — until it sticks. The original
+    // identity is sufficient to re-materialize (the LWW gate compares against
+    // the CURRENT row; a rolled-back row is absent or older, so the replay
+    // re-wins exactly what the original op won) and, unlike the earlier
+    // fresh-Lamport re-append, it can never out-rank a CONCURRENT newer edit
+    // or a remote tombstone it did not genuinely beat — the re-append is
+    // semantically invisible: every device resolves it exactly as the original
+    // op. Non-indexer paired writers (which would avoid the migration) crash
+    // this Autobase version, so this app-layer reconciliation is the correct
+    // closure. Cleared on lock/close.
     this._pendingDurable = new Map()
+    // Raw-op re-materialization state (OFFLINE-WINDOW INVISIBLE-CONTENT fix).
+    // When the reducer applies a content op whose epochTag key this device does
+    // not (yet) hold, the row is persisted as the op's sealed envelope verbatim
+    // (putNoteSealedRaw / putClipSealedRaw) — unreadable by the vault-key read
+    // path. The op is ALSO recorded in the LOCAL-ONLY search-namespace bee
+    // under `rawop!` so that once the key arrives (same session via
+    // KEY_ROTATE/_rebuildAuthFromView, or any later session — the marker is
+    // persistent), _rematerializePendingRawOps re-dispatches it through the
+    // normal reducer handler and the row is re-sealed readable + search-indexed.
+    // Distinct from [AUDIT I-16] _seenAdditiveOps below: that set replays ops
+    // whose ROWS a fresh-writer migration rolled back (in-memory, bounded to
+    // the migration window); this family covers ops UNDECRYPTABLE at apply
+    // time (persistent across reopen, keyed by epoch-key arrival).
+    // `_rawOpsMaybePending` is a cheap gate: starts true (unknown until the
+    // first scan), set true on every raw record, set false when a scan finds
+    // the family empty. Nudge fields rate-limit/cap the idle-heal ACK appends.
+    this._rawOpsMaybePending = true
+    this._lastRematNudgeAt = 0
+    this._rematNudgeCount = 0
     // [AUDIT I-16] RECEIVER-side materialization set (fresh-joiner pairing-window
     // note loss). Maps objectBlindId -> { type, bucket, ops:[op,...], presentStreak }
     // collecting EVERY additive content op (NOTE_UPSERT / CLIP_ADD) this device has
@@ -180,6 +207,11 @@ class SyncEngine {
     this._appendChain = Promise.resolve() // fresh chain per open (lock->unlock)
     this._pendingDurable.clear()
     this._seenAdditiveOps.clear()
+    // Re-arm the raw-op re-materializer: pending markers are persistent (local
+    // bee), so a reopen must re-scan and gets a fresh idle-nudge budget.
+    this._rawOpsMaybePending = true
+    this._rematNudgeCount = 0
+    this._lastRematNudgeAt = 0
     const { ctx } = this
     const crypto = ctx.crypto
     const ops = ctx.ops
@@ -255,6 +287,12 @@ class SyncEngine {
     // small lamport, so the max is taken over ALL nodes, never the tail alone.
     await this.base.update()
     ctx.state.lamport.observe(await this._maxDurableLamport())
+
+    // [RAW-REMAT] Autobase resumes from the persisted view on reopen — no
+    // apply pass runs while the log is quiet, so raw rows pending from a prior
+    // session would stay raw even though their epoch key is now recoverable
+    // from the committed wraps. Force one pass if anything is pending.
+    try { await this._nudgeRematerialize() } catch (_) {}
 
     // [AUDIT I-14/I-8] v2 search-index rebuild. The search core name was bumped
     // (v1 -> v2), so a vault that already has committed notes opens with an
@@ -379,7 +417,7 @@ class SyncEngine {
   // --- op construction -----------------------------------------------------
   // Build a signed ReplicatedOp (spec §7.5). Header is PUBLIC-only; body is a
   // CryptoEnvelope. Signature = Ed25519(canonical(header||ct||nonce||aadHash)).
-  _makeOp ({ type, schema, objectId, payload, signer, epochTag: forcedEpochTag = null, epoch: forcedEpoch = null }) {
+  _makeOp ({ type, schema, objectId, payload, signer }) {
     const ctx = this.ctx
     const crypto = ctx.crypto
     const ops = ctx.ops
@@ -388,10 +426,10 @@ class SyncEngine {
     // Active epoch stamping (design §5.4). Phase 1: activeEpoch is 0 and
     // activeEpochTag is "" for every vault, so `epoch:"0"`/`epochTag:""` and the
     // seal below resolve to vaultKey + the legacy keyId/AAD bytes — byte-identical
-    // to the pre-epoch op. (Re-append by _reconcileDurability also flows through
-    // here; for Phase 1 the active tag == the only tag "", so re-seal is faithful.
-    // Phase 5 will thread the pending entry's ORIGINAL epochTag for cross-epoch
-    // re-append per §3.9.)
+    // to the pre-epoch op. (The durability reconciler does NOT flow through here:
+    // it re-appends the pending entry's ORIGINAL signed op verbatim — original
+    // lamport, epochTag, keyId, ciphertext — which is epoch-faithful per §3.9/B4
+    // by construction and never mints a fresh LWW competitor.)
     // DEVICE LIFECYCLE ops seal under EPOCH 0 (vaultKey, tag ""), NOT the
     // active epoch (Phase 4, enables design §5.8 selective-chain): membership
     // and admit-policy state is the AUTHORITY every member's reducer and the
@@ -403,23 +441,20 @@ class SyncEngine {
     // never user content; KEY_ROTATE is NOT in this set — its body stays
     // sealed under the NEW epoch key (B3/B10, the roster-blind requirement).
     const opsK = ctx.ops.OP_TYPES
-    const lifecycle = type === opsK.DEVICE_ADD || type === opsK.DEVICE_REVOKE || type === opsK.ADMIT_POLICY_SET
-    // EPOCH-FAITHFUL override (design §3.9, RT-FIX B4 — Phase 5): the
-    // durability reconciler re-appends a rolled-back row under the row's
-    // ORIGINAL epochTag, never the active one — re-sealing pre-rotation
-    // content under the new key would pull it forward into the new epoch
-    // (survivors gain nothing: they hold every key) and, combined with any
-    // keyId linkage, manufacture a known-plaintext correlate for a revoked
-    // device still replicating via the L2 channel. Lifecycle ops remain
-    // pinned to epoch 0 regardless (Phase 4 — membership must be universally
-    // applyable). A forced tag whose key this device does not hold is a hard
-    // error, not a silent fallback to the wrong key.
-    const epochTag = lifecycle ? '' : (forcedEpochTag != null ? String(forcedEpochTag) : (this.activeEpochTag || ''))
-    if (!lifecycle && forcedEpochTag != null && forcedEpochTag !== '' && !this.epochKeys.has(epochTag)) {
-      const e = new Error('cannot seal under epoch ' + epochTag + ': key not held')
-      e.code = 'NO_EPOCH_KEY'
-      throw e
-    }
+    // ACK rides with the lifecycle set: it carries no user content, every
+    // reducer ignores it by type, and its one minter (the raw-remat idle
+    // nudge) runs precisely when this device may NOT hold the active epoch
+    // key — epoch-0 keeps the header honest (claimed tag == sealing key)
+    // instead of stamping the active tag over a vaultKey-sealed body.
+    const lifecycle = type === opsK.DEVICE_ADD || type === opsK.DEVICE_REVOKE || type === opsK.ADMIT_POLICY_SET || type === opsK.ACK
+    // Lifecycle ops remain pinned to epoch 0 (Phase 4 — membership must be
+    // universally applyable); everything else seals under the ACTIVE epoch.
+    // Epoch-faithful durability re-append (design §3.9, RT-FIX B4) no longer
+    // needs a forced-tag override here: the reconciler re-appends the original
+    // signed op verbatim, so pre-rotation content is never re-sealed at all —
+    // no cross-epoch pull-forward, no known-plaintext correlate for a revoked
+    // device still replicating via the L2 channel.
+    const epochTag = lifecycle ? '' : (this.activeEpochTag || '')
     const epochKey = this.epochKeys.get(epochTag) || this.vaultKey
     const header = {
       version: 1,
@@ -431,11 +466,10 @@ class SyncEngine {
       lamport: String(lamport),
       createdAtBucket: ops.timeBucket(),
       // The integer mirrors the tag: lifecycle ops are epoch-0 by construction
-      // (see above), a forced (re-append) tag carries its original integer,
-      // and everything else stamps the active epoch (strict binding, §5.5).
-      epoch: lifecycle
-        ? '0'
-        : (forcedEpochTag != null ? String(Number(forcedEpoch) || 0) : String(this.activeEpoch || 0)),
+      // (see above); everything else stamps the active epoch (strict binding,
+      // §5.5). Durability re-appends never mint a header — they replay the
+      // original op verbatim, original integer included.
+      epoch: lifecycle ? '0' : String(this.activeEpoch || 0),
       epochTag
     }
     ops.assertHeaderPublicOnly(header) // §22: classify every replicated field
@@ -468,6 +502,231 @@ class SyncEngine {
 
   _opBodyObjectId (objectBlindId) {
     return 'opbody:' + String(objectBlindId || '')
+  }
+
+  // ---- raw-op re-materialization (OFFLINE-WINDOW INVISIBLE-CONTENT fix) ----
+  // A device that applies a content op BEFORE holding its epochTag key stores
+  // the row raw (sealed op envelope) — and autobase will NOT re-apply that op
+  // on a later session (it resumes from the persisted view), so without this
+  // machinery the content stays invisible on this device forever, even after
+  // the key is recovered from the committed `epochkeys!` wraps. Verified on a
+  // real testnet: the terminal stored form of an offline-window note raced
+  // between sealed and raw across catch-up re-apply passes, and a cold reopen
+  // never healed a raw terminal state.
+  //
+  // The pending record lives in the LOCAL-ONLY search-namespace bee (NOT the
+  // autobase view): it is per-device bookkeeping, must survive reopen, must
+  // never replicate, and the reducer already writes that bee in-pass
+  // (localSearch.indexObject), so this adds no new determinism class. The
+  // record stores the op verbatim — public header + sealed envelope — i.e.
+  // nothing beyond what the replicated log already carries ("no plaintext at
+  // rest" holds; the envelope stays ciphertext until the key exists).
+
+  _rawOpPendingKey (header) {
+    // (blindId, lamport, deviceId): lexicographic bee order == per-object op
+    // order, so re-dispatch replays each object's ops in log order.
+    const lam = String(Number(header.lamport) || 0).padStart(16, '0')
+    return 'rawop!' + String(header.objectBlindId) + '!' + lam + '!' + String(header.deviceId || '')
+  }
+
+  async _recordRawPendingOp (op) {
+    if (!this._searchBee || !op || !op.header) return
+    this._rawOpsMaybePending = true
+    try {
+      await this._searchBee.put(this._rawOpPendingKey(op.header), {
+        header: op.header,
+        envelope: op.envelope,
+        signerPubkey: op.signerPubkey
+      })
+    } catch (_) { /* best-effort: a failed record degrades to today's behavior */ }
+  }
+
+  async _listRawPendingOps () {
+    const out = []
+    if (!this._searchBee) return out
+    for await (const { key, value } of this._searchBee.createReadStream({
+      gte: 'rawop!', lt: 'rawop!~'
+    })) {
+      out.push({ key, value })
+    }
+    return out
+  }
+
+  // Re-dispatch every pending raw op whose epochTag key is NOW held through
+  // the normal reducer handler, inside the CURRENT apply batch. Runs after the
+  // node loop (and after the I-16 orphan replay) so a key unwrapped by a
+  // KEY_ROTATE in this very pass counts and the readable upgrade is the
+  // pass's final word. Returns the pending keys that reached a terminal
+  // state — the caller deletes them from the local bee only AFTER
+  // batch.flush() succeeds, so a failed flush retries on the next pass.
+  // Signer authorization is NOT re-checked at dispatch: each op already
+  // passed _signerAuthorized when it was first applied and recorded, and
+  // re-running the B12 strict gate now would wrongly drop a pre-revoke op
+  // whose signer was revoked AFTER it committed.
+
+  // True iff the committed view ALREADY shows this op's effect (or a newer
+  // one that supersedes it): for upserts/clip-adds, a vault-key-readable row
+  // whose __lww is not beaten by the op's own (lamport, deviceId); for
+  // deletes, a durable tombstone the op's identity does not beat. Consulted
+  // by the sweep's CONFIRM-THEN-RETIRE step.
+  async _rawOpEffectPresent (op) {
+    const T = this.ctx.ops.OP_TYPES
+    const h = op.header
+    const obid = h.objectBlindId
+    const mine = { lamport: Number(h.lamport) || 0, deviceId: String(h.deviceId || '') }
+    try {
+      if (h.type === T.NOTE_DELETE || h.type === T.CLIP_DELETE) {
+        const tomb = await this.view.getTombstone(obid)
+        if (!tomb) return false
+        return !this.ctx.ops.Lamport.beats(mine, { lamport: Number(tomb.lamport) || 0, deviceId: String(tomb.deviceId || '') })
+      }
+      const env = h.type === T.CLIP_ADD
+        ? await this.view.getSealedRaw(this.view.clipsKey(h.createdAtBucket, obid))
+        : await this.view.getNoteSealed(obid)
+      if (!env) {
+        // No row but a durable tombstone that beats the op == superseded by a
+        // delete — the effect is settled, never re-dispatch (B9).
+        const tomb = await this.view.getTombstone(obid)
+        return !!(tomb && !this.ctx.ops.Lamport.beats(mine, { lamport: Number(tomb.lamport) || 0, deviceId: String(tomb.deviceId || '') }))
+      }
+      const meta = await this.view.resolveObjMeta(obid)
+      if (!meta || !meta.objectId) return false
+      const cur = this.view.openRecord({ objectId: meta.objectId, envelope: env })
+      if (!cur || !cur.__lww) return false
+      return !this.ctx.ops.Lamport.beats(mine, cur.__lww)
+    } catch (_) { return false }
+  }
+
+  async _rematerializePendingRawOps (batch) {
+    if (this._rawOpsMaybePending === false || !this._searchBee || !this.view) return []
+    let rows = []
+    try { rows = await this._listRawPendingOps() } catch (_) { return [] }
+    if (rows.length === 0) {
+      this._rawOpsMaybePending = false
+      return []
+    }
+    const T = this.ctx.ops.OP_TYPES
+    const done = []
+    for (const { key, value } of rows) {
+      const op = value
+      const h = op && op.header
+      if (!h || !op.envelope) { done.push(key); continue } // malformed record
+      if (!this.epochKeys.has(String(h.epochTag || ''))) continue // key still missing — stays pending
+      // CONFIRM-THEN-RETIRE (the same lesson _pendingDurable/I-16 encode with
+      // presentStreak: "a single transient presence must not retire the
+      // entry"). A batch this sweep flushes into can be DISCARDED wholesale
+      // by an autobase truncation/fast-forward replacing the view core,
+      // while a marker deleted from the (separate, durable) local bee stays
+      // deleted — retiring on dispatch alone can strand the row stale with
+      // no marker left to heal it (observed on a real testnet). So a marker
+      // is retired ONLY once a sweep OBSERVES the op's effect (or a newer
+      // superseding one) in the committed view; dispatch is idempotent
+      // (LWW/tombstone-gated), so re-dispatching until confirmed is safe.
+      // STREAK-CONFIRMED RETIRE (the full _pendingDurable/I-16 lesson — a
+      // SINGLE observation is not durability): the effect this sweep observes
+      // can itself sit in view state a later truncation/fast-forward
+      // discards, so the marker is retired only after the effect has been
+      // seen across several consecutive sweeps. The streak rides in the
+      // marker (reset to 0 whenever the effect is missing again).
+      if (await this._rawOpEffectPresent(op)) {
+        const streak = (Number(value.confirmStreak) || 0) + 1
+        if (streak >= 4) { done.push(key); continue }
+        try { await this._searchBee.put(key, { ...value, confirmStreak: streak }) } catch (_) {}
+        continue
+      }
+      if (Number(value.confirmStreak) > 0) {
+        try { await this._searchBee.put(key, { ...value, confirmStreak: 0 }) } catch (_) {}
+      }
+      // The tries budget exists ONLY for records that are CORRUPT — i.e. the
+      // key is held and the envelope still does not decrypt. A HEALTHY op's
+      // dispatch must never burn budget: during a reorg/fast-forward churn
+      // phase every flushed batch can be truncated away, and a per-dispatch
+      // cap would convert that transient churn into PERMANENT content loss
+      // (observed: a pending newer edit capped out and was retired while the
+      // view still carried the older body). Dispatch is idempotent
+      // (LWW/tombstone-gated), so retrying until the effect CONFIRMS is safe
+      // and terminates as soon as the base settles.
+      if (this._bodyOrNull(op) === null) {
+        const tries = Number(value.tries) || 0
+        if (tries >= 20) { done.push(key); continue } // corrupt forever — stop rescanning
+        try { await this._searchBee.put(key, { ...value, tries: tries + 1 }) } catch (_) {}
+        continue
+      }
+      try {
+        if (h.type === T.NOTE_UPSERT) await this._applyNoteUpsert(op, batch)
+        else if (h.type === T.NOTE_DELETE) await this._applyNoteDelete(op, batch)
+        else if (h.type === T.CLIP_ADD) await this._applyClipAdd(op, batch)
+        else if (h.type === T.CLIP_DELETE) await this._applyClipDelete(op, batch)
+        this._viewDirty = true // [AUDIT I-9] re-materialized content -> live refresh
+        this.ctx.log.debug('raw-op-rematerialized', { type: h.type, epochTag: String(h.epochTag || '') })
+      } catch (err) {
+        // Never abort the apply pass for a single bad record.
+        this.ctx.log.warn('raw-op-remat-failed', { err: String((err && err.message) || err) })
+      }
+    }
+    return done
+  }
+
+  // Idle-heal trigger. Re-materialization can only WRITE inside an apply pass
+  // (the view core is autobase-managed), and after a cold reopen autobase
+  // resumes from the persisted view — no pass ever runs while the log is
+  // quiet, so pending raw rows would stay raw despite the key being
+  // recoverable. Appending a tiny ACK op (every reducer ignores ACK by
+  // design) forces exactly one pass, whose _rebuildAuthFromView recovers the
+  // keys and whose re-mat sweep upgrades the rows. Rate-limited and capped:
+  // a device that NEVER gains the key (a revoked device's own pendings) must
+  // not spam its log forever — organic passes remain the primary heal path.
+  async _nudgeRematerialize () {
+    if (this._rawOpsMaybePending === false) return
+    if (!this._searchBee || !this.base || this._closing) return
+    let rows = []
+    try { rows = await this._listRawPendingOps() } catch (_) { return }
+    if (rows.length === 0) {
+      this._rawOpsMaybePending = false
+      return
+    }
+    // Nudge ONLY when the sweep could actually succeed. A device that is
+    // REVOKED in its own committed view can never heal (no wrap will ever
+    // address it), and — because removeWriter is decoupled (SB1) — its
+    // appends still extend the DAG on every peer, so each pointless ACK
+    // injects a reorg pass (and that pass's transient row-rollback window)
+    // into the SURVIVORS' views. Same for a pending tag with no committed
+    // wrap addressed to this device and no locally-held key (the
+    // pairing-delivered chain): nudging cannot recover a key that does not
+    // exist yet — the organic pass that commits the wrap heals it instead.
+    const me = this.myDeviceId ? this.devices.get(this.myDeviceId) : null
+    if (me && me.revokedAtLamport != null) return
+    let wrapTags = new Set()
+    try {
+      const wraps = this.view ? await this.view.listEpochKeyWrapsFor(this.myDeviceId) : []
+      wrapTags = new Set(wraps.map((w) => String(w.epochTag)))
+    } catch (_) { wrapTags = new Set() }
+    const coverable = rows.some((r) => {
+      const tag = String((r.value && r.value.header && r.value.header.epochTag) || '')
+      return wrapTags.has(tag) || this.epochKeys.has(tag)
+    })
+    if (!coverable) return
+    const now = Date.now()
+    if (now - (this._lastRematNudgeAt || 0) < 10000) return
+    if ((this._rematNudgeCount || 0) >= 8) return
+    if (!this.base.writable) return
+    this._lastRematNudgeAt = now
+    this._rematNudgeCount = (this._rematNudgeCount || 0) + 1
+    try {
+      const ops = this.ctx.ops
+      // Epoch 0 by construction (ACK is in _makeOp's lifecycle set): honest
+      // header, vaultKey-sealed body, reducer-ignored — mintable even while
+      // this device does not hold the active epoch key.
+      const ack = this._makeOp({
+        type: ops.OP_TYPES.ACK,
+        schema: ops.SCHEMAS.SETTING,
+        objectId: 'ack:raw-remat',
+        payload: { reason: 'raw-remat' },
+        signer: this._localSigner()
+      })
+      await this._append(ack)
+      await this.base.update()
+    } catch (_) { /* not writable / closing — the next organic pass heals */ }
   }
 
   // The surviving entitled set for a rotation that revokes `revokedDeviceId`
@@ -1200,7 +1459,19 @@ class SyncEngine {
       if (this._seenAdditiveOps.size > 0) {
         await this._reMaterializeOrphanedRows(batch)
       }
+      // Raw-op re-materialization sweep — AFTER the node loop AND the I-16
+      // orphan replay, so an epoch key unwrapped by a KEY_ROTATE in THIS pass
+      // counts and a key-less I-16 replay cannot leave the row raw behind the
+      // sweep's upgrade. INSIDE the batch so the upgraded rows commit
+      // atomically with the pass.
+      let rematDone = []
+      try { rematDone = await this._rematerializePendingRawOps(batch) } catch (_) { rematDone = [] }
       await batch.flush()
+      // Retire pending markers only now that the upgraded rows are flushed; a
+      // throw above leaves them pending and the next pass retries.
+      for (const k of rematDone) {
+        try { await this._searchBee.del(k) } catch (_) {}
+      }
       // Wake pending-peer verdicts in the replication firewall: an apply pass
       // is the ONLY place the committed device set changes, so this event (not
       // a poll) drives the 'unknown device' recheck. Emitted AFTER the flush so
@@ -1252,8 +1523,9 @@ class SyncEngine {
   // writes through the same committed-view path as a first apply: NO fresh op, NO
   // Lamport bump, NO extra base node (which would perturb the indexer and could
   // roll OTHER rows back). Idempotent — the LWW + tombstone guards inside
-  // _applyNoteUpsert / _applyClipAdd make a re-write of an already-present or
-  // superseded row a no-op.
+  // _applyNoteUpsert / _applyClipAdd drop a superseded replay outright and turn
+  // an equal-identity replay into a same-content re-write (a deliberate refresh
+  // into the live batch, not a skip — see the strict-loss gate note there).
   //
   // DETERMINISM (I-16 convergence regression fix): we replay EVERY tracked op for
   // the object — not a single per-engine op — so the per-field LWW + Lamport.beats
@@ -1767,8 +2039,21 @@ class SyncEngine {
     if (body === null) {
       // This device lacks the op's epoch key (revoked, or transiently behind).
       // Store the op's OWN sealed envelope verbatim so the op linearizes,
-      // replicates, and persists sealed (a key-holder reads it later); we cannot
-      // build the plaintext row or local search entry, so skip both. Never throw.
+      // replicates, and persists sealed; record it as PENDING so the
+      // re-materializer upgrades the row once the key arrives. Never throw.
+      await this._recordRawPendingOp(op)
+      // DOWNGRADE GUARD: write the raw placeholder ONLY when no row exists at
+      // all. Catch-up re-applies this op across reorg passes (and the I-16
+      // orphan replay re-dispatches it too); a key-less pass must never
+      // clobber a row an earlier key-holding pass sealed readable. Checking
+      // EXISTENCE (not readability) makes the guard independent of OBJMETA —
+      // which a truncated/FF-replaced view snapshot can transiently lose —
+      // and is sufficient: if the existing row is readable, preserving it is
+      // the point; if it is some op's raw envelope, both forms are equally
+      // unreadable and the pending family carries every op for the sweep to
+      // re-materialize in Lamport order once the key arrives.
+      const existing = await this.view.getNoteSealed(obid)
+      if (existing) return
       await this.view.putNoteSealedRaw(batch, { objectBlindId: obid, envelope: op.envelope })
       return
     }
@@ -1792,8 +2077,20 @@ class SyncEngine {
       let cur
       try { cur = this.view.openRecord({ objectId, envelope: existingEnv }) } catch (_) { cur = null }
       if (cur && cur.__lww) {
-        const winner = ops.Lamport.beats(incoming, cur.__lww)
-        if (!winner) return // existing record wins (spec §9.5)
+        // LWW gate, STRICT-LOSS form: drop the op only when the existing row
+        // STRICTLY beats it; EQUAL identity falls through to an idempotent
+        // same-content re-write. (lamport, deviceId) is unique per op, so
+        // equality means THIS op replayed — by an autobase catch-up re-apply,
+        // the I-16 orphan replay, or a verbatim durability re-append. The
+        // refresh matters during a writer-migration re-checkout: the replay
+        // can observe the row "present" in a view tail the migration is about
+        // to DROP — a skip would strand the effect in the discarded tail
+        // (observed: n0 unreadable for a full pump window under a frozen
+        // C-offline migration), while the re-write lands it in the surviving
+        // post-migration view through the same path as a first apply. For
+        // DISTINCT ops Lamport.beats is a total order, so winner selection is
+        // unchanged (spec §9.5).
+        if (ops.Lamport.beats(cur.__lww, incoming)) return // existing record strictly wins
       }
     }
     const stored = { ...body, __lww: incoming }
@@ -1812,7 +2109,13 @@ class SyncEngine {
     const h = op.header
     const obid = h.objectBlindId
     const body = this._bodyOrNull(op) // { noteId, hard?:bool }
-    if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
+    if (body === null) {
+      // Cannot read the delete (no epoch key) — skip the local mutation but
+      // record it PENDING so the tombstone lands once the key arrives
+      // (otherwise the deleted note would stay visible here forever).
+      await this._recordRawPendingOp(op)
+      return
+    }
     const objectId = 'note:' + body.noteId
     // [RT-FIX B9] Durable tombstone — written UNCONDITIONALLY (even when this
     // device holds no row yet, so an out-of-order upsert arriving later still
@@ -1843,7 +2146,12 @@ class SyncEngine {
     if (body === null) {
       // No epoch key for this clip: persist the op's sealed envelope verbatim
       // keyed by (createdAtBucket, blindId) so it linearizes + replicates, and
-      // skip the unreadable plaintext row / objmeta. Never throw out of _apply.
+      // record it PENDING for re-materialization (mirror of the note branch,
+      // including the downgrade guard). Never throw out of _apply.
+      await this._recordRawPendingOp(op)
+      // Existence-only downgrade guard — mirror of the note branch.
+      const existing = await this.view.getSealedRaw(this.view.clipsKey(h.createdAtBucket, obid))
+      if (existing) return
       await this.view.putClipSealedRaw(batch, { bucket: h.createdAtBucket, objectBlindId: obid, envelope: op.envelope })
       return
     }
@@ -1869,7 +2177,12 @@ class SyncEngine {
   async _applyClipDelete (op, batch) {
     const h = op.header
     const body = this._bodyOrNull(op) // { clipId, bucket }
-    if (body === null) return // cannot read the delete (no epoch key) — skip local mutation, never throw
+    if (body === null) {
+      // Mirror of the note-delete branch: record PENDING so the tombstone
+      // lands once the epoch key arrives. Never throw out of _apply.
+      await this._recordRawPendingOp(op)
+      return
+    }
     const obid = h.objectBlindId
     // [RT-FIX B9] Durable tombstone, mirroring _applyNoteDelete.
     await this.view.putTombstone(batch, { objectBlindId: obid, lamport: Number(h.lamport), deviceId: h.deviceId })
@@ -1927,18 +2240,21 @@ class SyncEngine {
     // Track additive content BEFORE the append so the durability reconciler
     // (FRESH-WRITER ORPHAN fix) owns it even if a migration rolls its view row
     // back milliseconds later. Re-keyed by objectBlindId so a same-object
-    // re-upsert just refreshes the pending payload (no duplicate tracking).
+    // re-upsert just refreshes the pending op (no duplicate tracking). The
+    // entry holds the SIGNED OP VERBATIM: a durability re-append replays these
+    // exact bytes — original (lamport, deviceId) identity, original epochTag /
+    // keyId / ciphertext (design §3.9, B4) — so it re-materializes over
+    // rolled-back state (absent row ⇒ the LWW gate writes; an older restored
+    // row ⇒ the original identity re-beats what it already beat) without ever
+    // becoming a fresh LWW competitor to a concurrent newer edit or tombstone.
     if (this._isAdditiveContentOp(type)) {
       this._pendingDurable.set(op.header.objectBlindId, {
         type,
-        schema,
-        objectId,
-        payload,
         bucket: op.header.createdAtBucket,
-        // The op's ORIGINAL epoch identity (design §3.9, B4): a later
-        // durability re-append re-seals under THIS tag, not the active one.
+        // Original epoch identity, kept denormalized for the §3.9-step-4
+        // migration-window suppression check (and asserted by the B4 test).
         epochTag: op.header.epochTag || '',
-        epoch: op.header.epoch || '0',
+        op,
         tries: 0
       })
     } else if (this._isDeleteContentOp(type)) {
@@ -1986,9 +2302,11 @@ class SyncEngine {
     try {
       // [RT-FIX B9] A TOMBSTONED object counts as present/settled: its absence
       // from the live rows is the result of a durable cross-device DELETE, not
-      // a migration rollback. Without this check a remote device's reconciler
-      // would re-append (with a fresh, winning Lamport) a row some other
-      // device deleted — resurrecting it vault-wide.
+      // a migration rollback. This retires the pending entry instead of
+      // re-appending a row some other device deleted. (Defense-in-depth since
+      // re-appends replay the ORIGINAL Lamport identity: even a re-append
+      // raced past this check cannot beat a tombstone the original op did not
+      // genuinely beat — the reducer's tombstone gate drops it everywhere.)
       if (await this.view.isTombstoned(objectBlindId)) return true
       if (type === T.NOTE_UPSERT) {
         return !!(await this.view.getNoteSealed(objectBlindId))
@@ -2012,16 +2330,42 @@ class SyncEngine {
   // Durability reconciler (FRESH-WRITER ORPHAN / SILENT NOTE-LOSS fix). Called
   // from the background convergence loop. For each additive content op this
   // device appended whose view row is currently MISSING from the committed
-  // view, re-append it (idempotent upsert with a fresh Lamport so it
-  // deterministically re-materializes over the rolled-back state). Rows that are
-  // present are retired from the pending set. This runs continuously, so it
-  // closes the gap even when the indexer-migration rollback lands asynchronously
-  // — long after appendOp returned — which a point-in-time confirm cannot catch.
-  // Bounded re-appends per op (so a genuinely un-converging base can't churn
-  // unbounded) but the cap only advances when we ACT, and is generous; once the
-  // migration settles the very next pass observes the row and retires it.
+  // view, re-append the ORIGINAL SIGNED OP VERBATIM — same (lamport, deviceId)
+  // identity, same epochTag/keyId/ciphertext — as a new log node. Why the
+  // original identity still re-materializes: the rollback left the row absent
+  // (the LWW gate writes unconditionally into absence) or restored an OLDER
+  // version (which the original identity beat the first time and re-beats on
+  // replay); there is no reachable stale state a fresh Lamport was needed to
+  // out-rank. And why it MUST be the original identity: a fresh winning stamp
+  // made every re-append an LWW competitor to anything CONCURRENT — on a
+  // device that could not yet decrypt the rotation epoch, a pre-edit
+  // re-append could out-rank a genuinely newer edit (whose copy sat as a
+  // pending raw op) until key recovery, and a re-append racing a remote
+  // delete could out-rank its tombstone. Replaying the original identity is
+  // semantically invisible: every device resolves the duplicate exactly as it
+  // resolved (or would resolve) the original op, so the view stays a pure
+  // function of the op set. Idempotence is structural — an equal-identity
+  // replay re-writes the SAME content under the SAME __lww (the strict-loss
+  // LWW gate lets equality fall through on purpose: the refresh must land in
+  // the CURRENT view tail during migration churn, see _applyNoteUpsert), the
+  // I-16 tracker dedups by opId, and the `rawop!` pending family is keyed by
+  // (blindId, lamport, deviceId) so duplicate replays collapse onto one
+  // record. Verbatim bytes
+  // also keep the original createdAtBucket, so a clip re-append can never
+  // drift into a different hour bucket than the one _rowPresentFor watches.
+  // Rows that are present are retired from the pending set. This runs
+  // continuously, so it closes the gap even when the indexer-migration
+  // rollback lands asynchronously — long after appendOp returned — which a
+  // point-in-time confirm cannot catch. Bounded re-appends per op (so a
+  // genuinely un-converging base can't churn unbounded) but the cap only
+  // advances when we ACT, and is generous; once the migration settles the
+  // very next pass observes the row and retires it.
   async _reconcileDurability () {
     if (!this.base || this._closing || !this.view) return
+    // [RAW-REMAT] Belt-and-suspenders for a quiet log: if raw ops are pending
+    // and no organic apply pass is coming, nudge one (rate-limited + capped;
+    // a no-op when `_rawOpsMaybePending` is false, which is the steady state).
+    try { await this._nudgeRematerialize() } catch (_) {}
     if (this._pendingDurable.size === 0) return
     const stable = !this._inFreshWriterWindow()
     for (const [obid, rec] of [...this._pendingDurable]) {
@@ -2042,8 +2386,8 @@ class SyncEngine {
         continue
       }
       // Missing -> rolled back (or not yet flushed). Reset the streak and
-      // re-append (idempotent upsert, fresh Lamport) while writable. The attempt
-      // cap is generous and only advances when we actually re-append, so a
+      // re-append the original op verbatim while writable. The attempt cap is
+      // generous and only advances when we actually re-append, so a
       // long-running migration can't exhaust it before settling; once the
       // migration finishes the very next pass sees the row and retires it.
       rec.presentStreak = 0
@@ -2056,19 +2400,25 @@ class SyncEngine {
       // churn is exactly the B4-shaped surface. Once the window passes they
       // re-append normally (epoch-faithfully, below).
       if (!stable && (rec.epochTag || '') !== (this.activeEpochTag || '')) continue
+      // STALE-SNAPSHOT GUARD (silent edit-loss regression, kept): this loop
+      // iterates a SNAPSHOT of _pendingDurable and awaits between entries, so
+      // a user append for the same object can land mid-pass and REPLACE the
+      // live entry with a newer op. Under the verbatim re-append the old op
+      // carries its old (losing) Lamport, so replaying it could no longer
+      // shadow the newer edit — but it would still be a wasted log node for a
+      // superseded payload, and the replacing entry owns the object's fresh
+      // presence/tries state. Re-fetch the LIVE entry; if it was replaced or
+      // retired meanwhile, defer to the next pass.
+      const live = this._pendingDurable.get(obid)
+      if (!live) continue // retired mid-pass
+      if (live !== rec) continue // replaced by a newer append — next pass owns it
       rec.tries = (rec.tries || 0) + 1
       try {
-        const reop = this._makeOp({
-          type: rec.type,
-          schema: rec.schema,
-          objectId: rec.objectId,
-          payload: rec.payload,
-          signer: this._localSigner(),
-          // EPOCH-FAITHFUL re-append (B4): re-seal under the row's ORIGINAL
-          // epoch, never the active one (see _makeOp).
-          epochTag: rec.epochTag != null ? rec.epochTag : '',
-          epoch: rec.epoch != null ? rec.epoch : '0'
-        })
+        // EPOCH-FAITHFUL + IDENTITY-FAITHFUL re-append (B4, §3.9): replay the
+        // exact signed op bytes — original epochTag/keyId (no re-seal, no
+        // cross-epoch pull-forward, no key needed at re-append time) and
+        // original (lamport, deviceId) (no fresh LWW competitor).
+        //
         // Re-append through the serialized chain but do NOT await base.update()
         // here: update() can block for the full duration of an in-flight
         // migration, which would stall the whole reconcile pass after a single
@@ -2077,7 +2427,7 @@ class SyncEngine {
         // a base wedged mid-migration (base.append can block until it resolves)
         // can never freeze the convergence loop — we just retry on the next pass.
         await Promise.race([
-          this._append(reop),
+          this._append(rec.op),
           new Promise((resolve) => { const t = setTimeout(resolve, 1500); if (t.unref) t.unref() })
         ])
       } catch (_) { /* not writable mid-migration / closing — next pass re-checks */ }

@@ -141,20 +141,51 @@ async function convergeStep (engines) {
   }
 }
 
-async function pumpUntil (engines, pred, { timeoutMs = 45000, every = 150, onTick = null, tickEvery = 5000 } = {}) {
+async function pumpUntil (engines, pred, { timeoutMs = 45000, every = 150 } = {}) {
   const deadline = Date.now() + timeoutMs
   let val = false
-  let lastTick = Date.now()
   while (Date.now() < deadline) {
     await convergeStep(engines)
-    // Periodic re-nudge for DHT-reconnect-bound waits: the full integration
-    // suite can starve @hyperswarm/testnet discovery on a constrained CI runner,
-    // so a one-shot join/flush before the wait isn't enough — re-announce while
-    // we poll. No-op for ordinary (all-online) convergence waits (onTick null).
-    if (onTick && Date.now() - lastTick >= tickEvery) {
-      lastTick = Date.now()
-      try { await onTick() } catch (_) {}
+    await sleep(every)
+    try { val = await pred() } catch (_) { val = false }
+    if (val) return val
+  }
+  return val
+}
+
+// Bounded poll for a plain (non-engine) condition — e.g. a swarm connection
+// going away. Used instead of a fixed sleep so a slow CI runner that takes
+// longer than a hard-coded wait to notice a close doesn't flake the assertion.
+async function waitFor (pred, { timeoutMs = 30000, every = 150 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let val = false
+  while (Date.now() < deadline) {
+    try { val = await pred() } catch (_) { val = false }
+    if (val) return val
+    await sleep(every)
+  }
+  return val
+}
+
+// Like pumpUntil, but ALSO re-issues a swarm-reconnect `nudge` on a widening
+// backoff (immediately, then ~every 4s growing toward ~every 15s) while it pumps
+// the engines toward `pred`. CI's shared runners can silently drop a one-shot
+// @hyperswarm/testnet announce right as a peer (re)joins a topic; a passive
+// convergeStep loop can never recover a lost announce or a dropped stream, so we
+// actively re-announce/re-query/re-dial the known peers until the engines
+// converge or the (CI-generous) deadline expires.
+async function pumpReconnect ({ engines, pred, nudge, timeoutMs = 150000, every = 250 }) {
+  const deadline = Date.now() + timeoutMs
+  let val = false
+  let nextNudge = 0
+  let backoff = 4000
+  while (Date.now() < deadline) {
+    if (nudge && Date.now() >= nextNudge) {
+      try { await nudge() } catch (_) {}
+      nextNudge = Date.now() + backoff
+      backoff = Math.min(Math.floor(backoff * 1.5), 15000)
     }
+    await convergeStep(engines)
     await sleep(every)
     try { val = await pred() } catch (_) { val = false }
     if (val) return val
@@ -341,7 +372,7 @@ test('SB2 firewall: destroys existing + refuses new revoked-peer streams; topic_
 // unwraps epochKey_1, and derives the new topic — while the revoked device's
 // follow topic is never announced again.
 // ---------------------------------------------------------------------------
-test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', { timeout: 480000 }, async (t) => {
+test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', { timeout: 360000 }, async (t) => {
   const vaultKey = crypto.randomBytes(crypto.KEY_BYTES)
   const indexKey = crypto.randomBytes(32)
   const vaultId = 'revnet-follow'
@@ -384,8 +415,14 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   }, 200)
   if (offlineGuard.unref) offlineGuard.unref()
   t.teardown(() => clearInterval(offlineGuard))
-  await sleep(1500)
-  t.is(connsTo(A, swarmPubHex(B)).filter((c) => !c.destroyed).length, 0, 'A holds no live connection to the offline B')
+  // Bounded poll (not a fixed sleep): a loaded CI runner can take longer than a
+  // hard-coded wait to notice the close, and the offlineGuard keeps tearing B's
+  // side down in the meantime, so converge to zero live conns rather than
+  // sampling once after an arbitrary delay.
+  const bWentOffline = await waitFor(async () =>
+    connsTo(A, swarmPubHex(B)).filter((c) => !c.destroyed).length === 0,
+  { timeoutMs: 30000 })
+  t.ok(bWentOffline, 'A holds no live connection to the offline B')
 
   // ---- A revokes C → epoch 1 while B is offline ----------------------------
   const rot = await revoke(A.engine, C.device.deviceId)
@@ -426,29 +463,26 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   clearInterval(offlineGuard)
   const discOwn = B.swarm.join(pairing.followTopic(fseed, B.device.deviceId), { server: true, client: true })
   await discOwn.flushed().catch(() => {})
-  await discFollowB.refresh().catch(() => {})
-  await discOwn.refresh().catch(() => {})
-  // The full integration suite can starve @hyperswarm/testnet discovery after
-  // both peers have joined/refreshed the correct follow topic. Nudge the
-  // already-known peer keys so this assertion stays focused on the firewall +
-  // epoch catch-up path rather than DHT scheduler timing.
-  // Re-announce the known peer keys + re-flush both swarms — once now, then
-  // again periodically during the catch-up wait (onTick), because the full
-  // integration suite can starve @hyperswarm/testnet discovery on a constrained
-  // CI runner and a single up-front nudge can't recover a dropped reconnect.
-  const renudgeFollow = async () => {
+
+  // The full integration suite can starve @hyperswarm/testnet discovery right as
+  // both peers (re)join the follow topic. Re-announce/re-query the given
+  // discovery handles and re-dial the already-known peer keys; pumpReconnect
+  // re-issues this on a bounded backoff (a single one-shot announce can be
+  // silently dropped on a loaded CI runner), keeping the assertion on the
+  // firewall + epoch catch-up path rather than DHT scheduler timing.
+  const nudgeReconnect = async (discs) => {
+    for (const d of discs) { try { await d.refresh().catch(() => {}) } catch (_) {} }
     try { B.swarm.joinPeer(A.swarm.keyPair.publicKey) } catch (_) {}
     try { A.swarm.joinPeer(B.swarm.keyPair.publicKey) } catch (_) {}
-    try { await discFollowB.refresh() } catch (_) {}
-    try { await discOwn.refresh() } catch (_) {}
-    await A.swarm.flush().catch(() => {})
-    await B.swarm.flush().catch(() => {})
+    await Promise.all([A.swarm.flush().catch(() => {}), B.swarm.flush().catch(() => {})])
   }
-  await renudgeFollow()
 
-  const caughtKey = await pumpUntil([A.engine, B.engine], async () =>
-    B.engine.epochKeys.has(epochTag1) && B.engine.activeEpochTag === epochTag1,
-  { timeoutMs: 180000, onTick: renudgeFollow, tickEvery: 8000 })
+  const caughtKey = await pumpReconnect({
+    engines: [A.engine, B.engine],
+    pred: async () => B.engine.epochKeys.has(epochTag1) && B.engine.activeEpochTag === epochTag1,
+    nudge: () => nudgeReconnect([discOwn, discFollowB]),
+    timeoutMs: 150000
+  })
   if (!caughtKey) {
     // Flake forensics (from the windows-launcher CI hardening): dump the live
     // connection/auth/epoch state so a CI failure here is diagnosable.
@@ -482,15 +516,41 @@ test('follow-topic: an OFFLINE survivor catches up after a rotation it missed', 
   const discTopic1B = B.swarm.join(topic1OnB, { server: true, client: true })
   await discTopic1B.flushed().catch(() => {})
   await B.swarm.flush().catch(() => {})
-  const renudgeTopic1 = async () => {
-    try { B.swarm.joinPeer(A.swarm.keyPair.publicKey) } catch (_) {}
-    try { A.swarm.joinPeer(B.swarm.keyPair.publicKey) } catch (_) {}
-    try { await discTopic1B.refresh() } catch (_) {}
-    await A.swarm.flush().catch(() => {})
-    await B.swarm.flush().catch(() => {})
-  }
-  const caughtContent = await pumpUntil([A.engine, B.engine], async () =>
-    await openNote(B.engine, 'note:n1'),
-  { timeoutMs: 180000, onTick: renudgeTopic1, tickEvery: 8000 })
-  t.ok(caughtContent, 'B caught post-rotation content after walking forward onto topic_1')
+
+  // n2 = NORMAL post-rotation content, created AFTER B rejoined and unwrapped
+  // epochKey_1. B reduces it with the key already in its map, so the reducer
+  // re-seals it under the vault key (view.openRecord-readable) deterministically
+  // — exactly the "topic_1 carries normal post-rotation content" path the
+  // comment above describes, and now genuinely exercised OVER topic_1 (A is on
+  // topic_1, B walked onto the identical topic_1OnB). Same reconnect hardening
+  // as the key leg: the stream can churn before n2's blocks land, so keep
+  // re-announcing/re-dialing while we pump rather than trusting one flush.
+  await A.engine.appendOp(ops.OP_TYPES.NOTE_UPSERT, ops.SCHEMAS.NOTE, 'note:n2',
+    { noteId: 'n2', label: 'n2', body: 'n2-post-rejoin', createdAt: 3, updatedAt: 3 })
+  const caughtContent = await pumpReconnect({
+    engines: [A.engine, B.engine],
+    pred: async () => await openNote(B.engine, 'note:n2'),
+    nudge: () => nudgeReconnect([discOwn, discFollowB, discTopic1B]),
+    timeoutMs: 120000
+  })
+  t.ok(caughtContent, 'B caught post-rotation content (n2, created after B rejoined) over topic_1')
+
+  // The note created DURING B's offline window (n1) is reduced bundled with
+  // the KEY_ROTATE on catch-up, and the terminal apply can land in a pass
+  // whose (truncated-view) rebuild has not recovered epochKey_1 — persisting
+  // n1 epoch-sealed verbatim (putNoteSealedRaw), unreadable by the vault-key
+  // read path. The raw-op RE-MATERIALIZER (autobase-sync) records that op
+  // pending and re-dispatches it once the key is held, so the offline-window
+  // note MUST become readable in-session — gated here end-to-end over the
+  // real network (deterministic-harness coverage: revocation-remat.test.js).
+  const offlineNoteHealed = await pumpReconnect({
+    engines: [A.engine, B.engine],
+    pred: async () => {
+      const n1 = await openNote(B.engine, 'note:n1')
+      return n1 && n1.body === 'n1-while-B-offline'
+    },
+    nudge: () => nudgeReconnect([discOwn, discFollowB, discTopic1B]),
+    timeoutMs: 90000
+  })
+  t.ok(offlineNoteHealed, 'offline-window note n1 readable on B IN-SESSION (raw-op re-materialization)')
 })
