@@ -108,6 +108,39 @@ class SyncEngine {
     // avoid the migration) crash this Autobase version, so this app-layer
     // reconciliation is the correct closure. Cleared on lock/close.
     this._pendingDurable = new Map()
+    // [AUDIT I-16] RECEIVER-side materialization set (fresh-joiner pairing-window
+    // note loss). Maps objectBlindId -> { type, bucket, ops:[op,...], presentStreak }
+    // collecting EVERY additive content op (NOTE_UPSERT / CLIP_ADD) this device has
+    // applied for that object — both remotely-authored ops AND this device's own
+    // writes. THE BUG (proven over a real testnet): when a fresh joiner is added as
+    // an indexer, Autobase re-checks-out the view at the new indexedLength and rolls
+    // a content row this device materialized in the not-yet-indexed tail BACK OUT;
+    // the op is now below indexedLength so the normal _apply pass never revisits it,
+    // and the row stays gone forever — NOTE_LIST reads 0 even though the op IS in
+    // the converged base. The cure re-materializes the rolled-back row directly INTO
+    // THE VIEW (via _applyNoteUpsert/_applyClipAdd in the live apply batch) — it
+    // appends NO new base op, so it cannot perturb the indexer / destabilize other
+    // rows (a re-append would).
+    //
+    // DETERMINISM (I-16 convergence regression fix — this is why we keep a LIST,
+    // not a single last-received op, and why we INCLUDE this device's own writes):
+    // when two writers concurrently upsert the SAME object, the rollback drops the
+    // row on every device and re-materialization must rebuild it into an EMPTY row.
+    // If each engine replayed only ONE op (the last one it RECEIVED — i.e. the
+    // OTHER device's, since own writes were skipped), engine A would re-materialize
+    // B's value and engine B would re-materialize A's value, and the two views
+    // DIVERGE on the LWW winner. By replaying ALL of the object's additive ops
+    // (every engine has replicated the full base, so every engine holds the SAME
+    // set), the per-field LWW + Lamport.beats tie-break in _applyNoteUpsert /
+    // _applyClipAdd resolves to the SAME winner an ordinary full apply would pick —
+    // identical on every device. Re-materialization is gated PER OP by a fresh
+    // _signerAuthorized check (committed-revoked signers rejected) and inherits the
+    // tombstone-beat drop, so it never resurrects a delete or re-admits revoked
+    // content. MEMORY is bounded: the rollback only happens during the fresh-writer
+    // indexer-migration window, so an object's op list is cleared once its row is
+    // confirmed continuously present + stable (mirrors _pendingDurable), and the
+    // whole map is cleared on lock/close — never an unbounded per-op map (cf. I-18).
+    this._seenAdditiveOps = new Map()
     // Pairing-phantom cleanup window (Fix B). Generous by default (bias toward
     // NOT revoking); tests/wiring may shorten it. A ctx.config override wins so
     // production can tune it without a code change.
@@ -133,6 +166,7 @@ class SyncEngine {
     this._closing = false
     this._appendChain = Promise.resolve() // fresh chain per open (lock->unlock)
     this._pendingDurable.clear()
+    this._seenAdditiveOps.clear()
     const { ctx } = this
     const crypto = ctx.crypto
     const ops = ctx.ops
@@ -312,6 +346,7 @@ class SyncEngine {
     this.writerToDevice.clear()
     this._appliedOps.clear()
     this._pendingDurable.clear()
+    this._seenAdditiveOps.clear()
     // Drop epoch content-key state so no buffer reference survives teardown.
     // index.js wipes state.vaultKeys.vaultKey IN PLACE on lock; the epoch-0
     // anchor (epochKeys.set("", vaultKey)) aliases that very buffer, so a stale
@@ -1111,17 +1146,38 @@ class SyncEngine {
         if (h.type === ops.OP_TYPES.NOTE_UPSERT) {
           await this._applyNoteUpsert(op, batch)
           this._rememberOp(op, true)
+          this._trackSeenAdditive(op)
         } else if (h.type === ops.OP_TYPES.NOTE_DELETE) {
           await this._applyNoteDelete(op, batch)
           this._rememberOp(op, true)
+          // A delete supersedes any pending receiver re-materialization for this
+          // object (the durable tombstone keeps the delete authoritative on reorg).
+          this._seenAdditiveOps.delete(h.objectBlindId)
         } else if (h.type === ops.OP_TYPES.CLIP_ADD) {
           await this._applyClipAdd(op, batch)
           this._rememberOp(op, true)
+          this._trackSeenAdditive(op)
         } else if (h.type === ops.OP_TYPES.CLIP_DELETE) {
           await this._applyClipDelete(op, batch)
           this._rememberOp(op, true)
+          this._seenAdditiveOps.delete(h.objectBlindId)
         }
         // ACK and unknown types are intentionally ignored.
+      }
+      // [AUDIT I-16] RECEIVER-side re-materialization of rows a fresh-writer
+      // indexer migration rolled out of the view. The migration's view
+      // re-checkout drops a content row this device materialized in the
+      // not-yet-indexed tail, and the normal apply loop never revisits that
+      // now-already-linearized op — so without this the row is lost forever
+      // (the fresh-joiner pairing-window note loss). We re-write any RECEIVED
+      // additive op whose row is currently absent straight INTO THIS BATCH, so
+      // it lands in the post-migration committed view through the exact same
+      // path as a first apply. Appends NO new base op (a re-append would perturb
+      // the indexer and destabilize OTHER rows). Runs on every pass that has
+      // tracked received ops, so a rollback finalized on a LATER apply (a remote
+      // ack landing after this device's seat settles) is caught by that pass.
+      if (this._seenAdditiveOps.size > 0) {
+        await this._reMaterializeOrphanedRows(batch)
       }
       await batch.flush()
       // Wake pending-peer verdicts in the replication firewall: an apply pass
@@ -1134,6 +1190,121 @@ class SyncEngine {
       // Surface but never crash the linearizer; ctx.log is redacted.
       ctx.log.error('reducer-error', { err: String((err && err.message) || err) })
       throw err
+    }
+  }
+
+  // [AUDIT I-16] Record an ACCEPTED additive content op (NOTE_UPSERT / CLIP_ADD)
+  // so a later apply pass can re-write its view row if the fresh-writer indexer
+  // migration rolled it back out. We accumulate EVERY op for the object into a
+  // per-objectBlindId LIST — INCLUDING this device's own writes (NOT just remote
+  // ones) — because re-materialization must replay the FULL op set to reach the
+  // same LWW winner on every device (see _seenAdditiveOps doc / I-16 determinism).
+  // Tracking own writes here is harmless overlap with _pendingDurable: that set
+  // owns the RE-APPEND recovery (a fresh base op); this set only RE-MATERIALIZES
+  // into the live batch (no new op) and needs the local op present so a concurrent
+  // edit's winner is computed identically on the author's own device too.
+  // De-duplicated by opId so a reorg that re-linearizes the same op (apply runs
+  // again over the replayed tail) cannot grow the list unbounded; the snapshot is
+  // the op itself, so re-materialization replays the exact same envelope (no
+  // re-seal, no new base op).
+  _trackSeenAdditive (op) {
+    const h = op && op.header
+    if (!h || !h.objectBlindId) return
+    const obid = h.objectBlindId
+    let rec = this._seenAdditiveOps.get(obid)
+    if (!rec) {
+      rec = { type: h.type, bucket: h.createdAtBucket, ops: [], presentStreak: 0 }
+      this._seenAdditiveOps.set(obid, rec)
+    }
+    const opId = h.opId
+    if (opId && rec.ops.some(o => o.header && o.header.opId === opId)) return // already tracked
+    rec.ops.push(op)
+    rec.presentStreak = 0 // a fresh op for this object — re-arm presence tracking
+  }
+
+  // [AUDIT I-16] Receiver-side log-vs-view re-materialization. For each object
+  // whose additive content row is now MISSING — the fresh-writer indexer migration
+  // rolled it back and the normal apply loop will never revisit the already-
+  // linearized ops — re-run the materialization of ALL of the object's tracked
+  // additive ops INTO THE CURRENT BATCH so the post-migration view regains the row.
+  // Runs inside _apply where `batch` is the live view checkout Autobase owns, so it
+  // writes through the same committed-view path as a first apply: NO fresh op, NO
+  // Lamport bump, NO extra base node (which would perturb the indexer and could
+  // roll OTHER rows back). Idempotent — the LWW + tombstone guards inside
+  // _applyNoteUpsert / _applyClipAdd make a re-write of an already-present or
+  // superseded row a no-op.
+  //
+  // DETERMINISM (I-16 convergence regression fix): we replay EVERY tracked op for
+  // the object — not a single per-engine op — so the per-field LWW + Lamport.beats
+  // tie-break resolves the rebuilt row to the SAME winner an ordinary full apply
+  // would pick. Every engine has replicated the full base, so every engine holds
+  // and replays the SAME op set into the empty row and converges identically. (The
+  // pre-fix code stored one op — the last RECEIVED, with own writes skipped — so
+  // two concurrent writers each re-materialized the OTHER's value and diverged.)
+  // Replay order does not affect the result: Lamport.beats is a total order on
+  // (lamport, deviceId), so the winning op survives regardless of the order the
+  // ops are applied in.
+  //
+  // SECURITY (audit MANDATORY do-NOT-do, both honored):
+  //   (1) NEVER resurrect a deleted row. _applyNoteUpsert / _applyClipAdd consult
+  //       the durable tombstone (getTombstone + Lamport.beats) and DROP any op
+  //       that does not beat a committed delete marker — so re-materializing an
+  //       upsert for an object some device deleted is a no-op. We also drop the
+  //       seen entry on any NOTE_DELETE / CLIP_DELETE in the apply loop.
+  //   (2) NEVER re-admit a committed-revoked signer's content (forward secrecy /
+  //       firewall). We re-check _signerAuthorized PER OP against the FRESHLY
+  //       rebuilt auth cache (this pass already ran _rebuildAuthFromView): any op
+  //       whose signer's DEVICE_REVOKE is now committed (committedRevoked) is
+  //       dropped from the list and never re-written, exactly as a newly-arriving
+  //       op would be rejected. A surviving signer's op in the same object's list
+  //       is still replayed, so a revoked co-author cannot suppress a legitimate
+  //       writer's row.
+  //
+  // MEMORY (bounded — cf. I-18 unbounded-per-op concern): an object whose row is
+  // confirmed CONTINUOUSLY present past the fresh-writer window is retired from the
+  // map (its op list dropped), mirroring _reconcileDurability's present-streak
+  // retirement; no rollback can land once the migration has settled, so retained
+  // ops past that point would be dead weight. The whole map is also cleared on
+  // lock/close.
+  async _reMaterializeOrphanedRows (batch) {
+    const T = this.ctx.ops.OP_TYPES
+    const stable = !this._inFreshWriterWindow()
+    for (const [obid, rec] of [...this._seenAdditiveOps]) {
+      // (2) Forward-secrecy / firewall guard, applied PER OP. Drop any op whose
+      // signer was revoked since we accepted it; keep surviving signers' ops.
+      rec.ops = rec.ops.filter(op => this._signerAuthorized(op, Number(op.header && op.header.lamport)))
+      if (rec.ops.length === 0) { this._seenAdditiveOps.delete(obid); continue }
+
+      let present = false
+      try { present = await this._rowPresentFor(rec.type, obid, rec.bucket) } catch (_) { present = false }
+      if (present) {
+        // Row intact (or tombstoned-as-present). Retire once it has stayed present
+        // long enough to outlast an in-flight migration AND we are past the
+        // fresh-writer window — at which point no further rollback can occur, so
+        // the tracked ops are no longer needed (bounds memory). A single transient
+        // presence must not retire the entry (the rollback is asynchronous).
+        rec.presentStreak = (rec.presentStreak || 0) + 1
+        if (stable && rec.presentStreak >= 6) this._seenAdditiveOps.delete(obid)
+        continue
+      }
+      // Missing -> rolled back by the migration. Reset the streak and re-run the
+      // materialization of ALL tracked ops (their tombstone-beat (1) + LWW guards
+      // keep it safe + idempotent, and replaying the full set makes the rebuilt
+      // winner deterministic across devices). Never throw out of the reducer.
+      rec.presentStreak = 0
+      for (const op of rec.ops) {
+        try {
+          if (rec.type === T.NOTE_UPSERT) {
+            await this._applyNoteUpsert(op, batch)
+          } else if (rec.type === T.CLIP_ADD) {
+            await this._applyClipAdd(op, batch)
+          }
+        } catch (err) {
+          this.ctx.log.debug('receiver-rematerialize-skip', {
+            type: rec.type, err: String((err && err.message) || err)
+          })
+        }
+      }
     }
   }
 
