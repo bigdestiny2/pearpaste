@@ -7,9 +7,10 @@ Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (`.deb`
 ---
 
 ## 0. What you're testing (current state)
-`main` is green across the board — **unit 45 · integration 37 · e2e 3 · security 27 · mobile 4** (Node 22). Recently shipped and worth exercising on real Linux:
+`main` is green across the board — **unit 45 · integration 41 · e2e 3 · security 27 · mobile 4** (Node 22). Recently shipped and worth exercising on real Linux:
 - **Real device revocation + forward secrecy** — a revoked device cannot decrypt content created after its revoke.
 - **Pairing-window data-loss fixes** (I-15 conn-teardown + I-16 receiver re-materialization) — a note written *right after pairing* now reliably appears on the new device. **This is the #1 thing to confirm cross-device with the Mac.**
+- **Offline-window content heal** (raw-op re-materializer + read fallback) — a device that was OFFLINE across a device-revocation key rotation can now READ the notes/clips written while it was away (in-session and after an app restart), and they show up in search. Cross-device check: revoke a third device from the Mac while the Linux box is closed, write a note on the Mac, reopen the Linux box → the note must appear readable.
 - **Live cross-device refresh** (I-9) — remote changes appear without a manual Refresh.
 - **Search/write perf** (I-14/I-8) — large vaults stay fast.
 
@@ -42,7 +43,7 @@ Checks the lockfile, Pear stage entrypoints, `pear-electron/pre`, the linux `sod
 ```sh
 npm run test:all
 ```
-Node 22, outside any socket sandbox (an `EPERM` at UDX bind is a sandbox artifact — rerun, don't treat as a failure). Expect **unit 45 · integration 37 · e2e 3 · security 27 · mobile 4**.
+Node 22, outside any socket sandbox (an `EPERM` at UDX bind is a sandbox artifact — rerun, don't treat as a failure). Expect **unit 45 · integration 41 · e2e 3 · security 27 · mobile 4**.
 > If `follow-topic: an OFFLINE survivor catches up…` (in `revocation-network`) times out, **re-run it** — it's a DHT-reconnect timing test (hardened, but a constrained box can still need a retry). A real failure **anywhere else** = capture the output and report.
 
 ## 5. Build the package(s)

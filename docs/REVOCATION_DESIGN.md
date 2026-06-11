@@ -599,9 +599,11 @@ rotation = new vault + re-key (the cryptographic-erasure path), not device
 revocation.** Stated in §7.2.
 
 ### 3.9 Durability reconciler — epoch-faithful re-append + durable tombstones `[RT-FIX B4, B9]`
-The reconciler re-appends additive rows via `_makeOp`. The prior design stamped
-`header.epoch = activeEpoch` on re-append, pulling pre-rotation content **forward
-into the new epoch**. The red-team showed two problems:
+The reconciler re-appends rolled-back additive rows. The prior design re-made the
+op via `_makeOp`, stamping `header.epoch = activeEpoch` (and a fresh Lamport) on
+re-append, pulling pre-rotation content **forward into the new epoch**. The
+red-team showed two problems (and live testing later showed a third — the fresh
+Lamport itself; see the locked handling):
 
 - **B4 (known-plaintext correlate).** Re-sealing an old object under
   `epochKey_{N+1}` right after revoke, while `keyId` was epoch-independent, hands
@@ -612,11 +614,35 @@ into the new epoch**. The red-team showed two problems:
   **device-local** — resurrecting deleted content under the new epoch.
 
 **Locked handling:**
-1. **Re-append epoch-FAITHFULLY.** The pending-durable entry carries the row's
-   **original `epochTag`**; `_makeOp` re-seals under that original key (survivors
-   already hold every epoch key, so they open it — pulling forward gives them
-   nothing). This removes the B4 correlate entirely and keeps LWW/tombstone
-   ordering intact.
+1. **Re-append epoch-FAITHFULLY — and identity-faithfully.** The pending-durable
+   entry carries the **original signed op verbatim**; the reconciler re-appends
+   those exact bytes (original `epochTag`/`keyId`/ciphertext — no re-seal at all,
+   which is strictly stronger B4 compliance than re-sealing under the original
+   key: no fresh ciphertext of known plaintext is ever minted) under the op's
+   **original `(lamport, deviceId)` identity** rather than a fresh stamp.
+   *Why the original identity still re-materializes:* the LWW gate compares the
+   incoming op against the CURRENT row; a rolled-back row is absent (gate
+   writes) or restored to an older version the original op already beat (gate
+   re-writes). There is no reachable stale state a fresh Lamport was needed to
+   out-rank. *Why it must not be a fresh stamp:* a fresh winning Lamport made
+   every re-append an LWW competitor to anything concurrent — observed as a
+   pre-edit re-append out-ranking a genuinely newer edit on a device that could
+   not yet decrypt the rotation epoch (its copy of the edit pending as a raw
+   op) until key recovery, and as a resurrection window against a concurrent
+   remote delete's tombstone. An original-identity replay is semantically
+   invisible: every device resolves the duplicate exactly as the original op,
+   so the view remains a pure function of the op set. Idempotence is
+   structural: the upsert LWW gate is **strict-loss** (drop only when the
+   existing row *strictly* beats the op; equal identity — i.e. this exact op
+   replayed — falls through to a same-content re-write, deliberately, so the
+   replay refreshes the row into the CURRENT view tail during a writer-
+   migration re-checkout instead of stranding its effect in a dropped tail);
+   the I-16 tracker dedups by `opId`; the `rawop!` pending family is keyed by
+   `(blindId, lamport, deviceId)` so replays collapse onto one record. (Verbatim bytes also pin `createdAtBucket`, closing a latent
+   hour-boundary drift for clip re-appends.) Note: the author-side re-append
+   must remain a real `base.append` — the receiver-side I-16 replay writes only
+   the local view batch, is in-memory, and cannot heal a loss whose op fell
+   below `indexedLength` fleet-wide or across reopen.
 2. **Epoch-bound `keyId` (§2.2).** Even for any row that legitimately changes
    epoch, the same object in different epochs is now **unlinkable** to anyone
    lacking the epoch key.
@@ -806,8 +832,9 @@ activeEpochTag })` -> `putEpochKeyWrap` per wrap (keyed by `epochTag`) -> set
     envelope: op.envelope
   })
   ```
-- **Durability re-append (B4):** `_makeOp` used by `_reconcileDurability` must use
-  the **pending entry's original `epochTag`**, not `activeEpochTag` (§3.9).
+- **Durability re-append (B4):** `_reconcileDurability` re-appends the pending
+  entry's **original signed op verbatim** — original `epochTag`/`keyId` and
+  original `(lamport, deviceId)`; it never re-seals via `_makeOp` (§3.9).
 
 ### 5.5 `backend/autobase-sync.js` + `shared-ops.js` + `verifier.js` — `epoch`/`epochTag` as public header fields; epoch in AAD
 - `shared-ops.js`: add `'epoch'` and `'epochTag'` to `HEADER_PUBLIC_FIELDS`
@@ -919,10 +946,11 @@ activeEpochTag })` -> `putEpochKeyWrap` per wrap (keyed by `epochTag`) -> set
   `epochkeys!` rows. Because a device opens its lockbox from the op's own public
   wrap using only its box secret key (§3.4), a **single** rotation op is
   self-contained and replay across batch boundaries cannot wedge it (closes B11).
-- **Durability reconciler.** `_reconcileDurability` re-appends additive rows via
-  `_makeOp`, but now **epoch-faithfully**: the pending entry carries the row's
-  original `epochTag` and re-append re-seals under *that* key, not the active one
-  (closes B4). Cross-device deletes are honored via the durable `tombstone!`
+- **Durability reconciler.** `_reconcileDurability` re-appends additive rows
+  **verbatim**: the pending entry carries the original signed op and the
+  re-append replays those exact bytes — original `epochTag`/`keyId` (no re-seal;
+  closes B4) and original `(lamport, deviceId)` (no fresh LWW competitor to
+  concurrent edits or tombstones; see §3.9). Cross-device deletes are honored via the durable `tombstone!`
   family: `_rowPresentFor` treats a tombstoned object as present, retiring its
   pending entry; the reducer checks `isTombstoned` before applying any
   `*_UPSERT` (closes B9). The fresh-writer migration window
@@ -1195,10 +1223,11 @@ the revocation feature.**
 
 ### Phase 5 — Durability reconciler (epoch-faithful) + tombstones + reorg interaction `[B4, B9]`
 **Files:** `autobase-sync.js`, `materialized-view.js`.
-- `_reconcileDurability` re-appends under the pending entry's **original
-  `epochTag`** (B4); durable `tombstone!` honored by `_rowPresentFor` and the
-  reducer (B9); suppress re-append for epoch ≤ revoked-epoch during the migration
-  window.
+- `_reconcileDurability` re-appends the pending entry's **original signed op
+  verbatim** — original `epochTag` (B4) **and original `(lamport, deviceId)`**
+  (no fresh LWW competitor; §3.9); durable `tombstone!` honored by
+  `_rowPresentFor` and the reducer (B9); suppress re-append for epoch ≤
+  revoked-epoch during the migration window.
 - **Tests:** force a fresh-writer migration rollback after a rotation; the
   reconciler re-appends the orphaned row under its **original** epoch (NOT the new
   one) and a survivor opens it; **cross-device delete is NOT resurrected** by a
