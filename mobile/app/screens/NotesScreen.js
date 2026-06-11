@@ -17,6 +17,7 @@ import {
 import { COPY, errorText } from '../lib/copy'
 import { theme } from '../lib/theme'
 import { Eyebrow, H1, Lede, Hint, Banner, Button, SealedRow, Card, inputStyle } from '../lib/ui'
+import { getMobilePearEnd } from '../lib/MobilePearEnd'
 
 // `title` was removed — notes now identify themselves via `label` alone.
 // Legacy stored notes that still carry a title get migrated to label on read
@@ -70,6 +71,19 @@ export function NotesScreen ({ rpc }) {
   }, [rpc])
 
   useEffect(() => { refresh() }, [refresh])
+
+  // [AUDIT I-9] Live-refresh on sync. The backend emits a debounced, payload-less
+  // 'view-changed' whenever a remote NOTE_UPSERT/NOTE_DELETE materializes into the
+  // view (mirrors DevicesScreen's 'sync-ready' subscription). Re-fetch the sealed
+  // list so a note synced from another device appears without a manual Refresh.
+  // This screen mounts only while unlocked, so no `unlocked` gate is needed.
+  useEffect(() => {
+    const engine = getMobilePearEnd()
+    const off = engine.on('event', (msg) => {
+      if (msg && msg.event === 'view-changed') refresh()
+    })
+    return off
+  }, [refresh])
 
   const openNote = useCallback(async (row) => {
     if (!row.id) return // still sealed/unresolved

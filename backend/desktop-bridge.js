@@ -25,7 +25,10 @@ export function createBridge (pearEnd) {
     'pair-admitted', 'paired',
     'clip-captured', 'clip-written', 'verifier-ran', 'device-revoked',
     'relay-enabled-changed', 'clipboard-mode-changed', 'clipboard-pause-changed',
-    'backgrounded', 'foregrounded'
+    'backgrounded', 'foregrounded',
+    // [AUDIT I-9] payload-less live-refresh signal — sanitizeEvent strips its
+    // opaque {seq} down to a scalar; carries no content (see autobase-sync.js).
+    'view-changed'
   ]
   for (const ev of RELAY_EVENTS) {
     pearEnd.ctx.on(ev, (payload) => {
