@@ -147,6 +147,19 @@ class SyncEngine {
     this.pairJoinConfirmMs = (ctx.config && Number(ctx.config.pairJoinConfirmMs) > 0)
       ? Number(ctx.config.pairJoinConfirmMs)
       : PAIR_JOIN_CONFIRM_DEFAULT_MS
+    // [AUDIT I-9] Live-refresh on sync. An apply pass that MATERIALIZES content
+    // (a NOTE_UPSERT/NOTE_DELETE/CLIP_ADD/CLIP_DELETE the reducer accepts, or a
+    // receiver re-materialization) sets this flag; the background convergence
+    // loop reads-and-clears it after refresh() and emits a DEBOUNCED, PAYLOAD-
+    // LESS `view-changed` ctx event so the desktop/mobile UI re-queries the
+    // active tab. The event carries NO plaintext — only an opaque monotonic
+    // counter (`seq`) so a UI can dedup — so it never widens the renderer-safe
+    // surface and is byte-identical for a one-char note and a megabyte one.
+    // Debounced at the same 250ms cadence as the converge loop's wake debounce
+    // so a burst of remote ops coalesces to a SINGLE event.
+    this._viewDirty = false
+    this._viewChangedSeq = 0
+    this._viewChangedTimer = null
   }
 
   get vaultKey () { return this.ctx.state.vaultKeys && this.ctx.state.vaultKeys.vaultKey }
@@ -347,6 +360,10 @@ class SyncEngine {
     this._appliedOps.clear()
     this._pendingDurable.clear()
     this._seenAdditiveOps.clear()
+    // [AUDIT I-9] Cancel any open view-changed debounce so a closing engine
+    // emits nothing post-teardown and leaks no timer across a lock/unlock cycle.
+    if (this._viewChangedTimer) { try { clearTimeout(this._viewChangedTimer) } catch (_) {} this._viewChangedTimer = null }
+    this._viewDirty = false
     // Drop epoch content-key state so no buffer reference survives teardown.
     // index.js wipes state.vaultKeys.vaultKey IN PLACE on lock; the epoch-0
     // anchor (epochKeys.set("", vaultKey)) aliases that very buffer, so a stale
@@ -1147,20 +1164,24 @@ class SyncEngine {
           await this._applyNoteUpsert(op, batch)
           this._rememberOp(op, true)
           this._trackSeenAdditive(op)
+          this._viewDirty = true // [AUDIT I-9] content touched -> live-refresh signal
         } else if (h.type === ops.OP_TYPES.NOTE_DELETE) {
           await this._applyNoteDelete(op, batch)
           this._rememberOp(op, true)
           // A delete supersedes any pending receiver re-materialization for this
           // object (the durable tombstone keeps the delete authoritative on reorg).
           this._seenAdditiveOps.delete(h.objectBlindId)
+          this._viewDirty = true // [AUDIT I-9]
         } else if (h.type === ops.OP_TYPES.CLIP_ADD) {
           await this._applyClipAdd(op, batch)
           this._rememberOp(op, true)
           this._trackSeenAdditive(op)
+          this._viewDirty = true // [AUDIT I-9]
         } else if (h.type === ops.OP_TYPES.CLIP_DELETE) {
           await this._applyClipDelete(op, batch)
           this._rememberOp(op, true)
           this._seenAdditiveOps.delete(h.objectBlindId)
+          this._viewDirty = true // [AUDIT I-9]
         }
         // ACK and unknown types are intentionally ignored.
       }
@@ -1292,6 +1313,7 @@ class SyncEngine {
       // keep it safe + idempotent, and replaying the full set makes the rebuilt
       // winner deterministic across devices). Never throw out of the reducer.
       rec.presentStreak = 0
+      this._viewDirty = true // [AUDIT I-9] a rolled-back row is coming back into the view
       for (const op of rec.ops) {
         try {
           if (rec.type === T.NOTE_UPSERT) {
@@ -2085,6 +2107,31 @@ class SyncEngine {
     return this._refreshing
   }
 
+  // [AUDIT I-9] Live-refresh on sync. Called from the background convergence
+  // loop after refresh() when an apply pass MATERIALIZED content. Coalesces a
+  // burst of applies into a SINGLE debounced, PAYLOAD-LESS `view-changed` ctx
+  // event (matching the loop's 250ms wake debounce) so the UI re-queries the
+  // active tab once per burst instead of once per op. The ONLY payload is an
+  // opaque monotonic counter (`seq`) — no objectIds, titles, bodies, or any
+  // plaintext — so the event widens no renderer-safe surface and is byte-
+  // identical regardless of what changed. The 'view-changed' name is forwarded
+  // verbatim by the desktop-bridge / mobile-worklet allowlists; the timer is
+  // unref'd so it never holds the process open and is cancelled on close().
+  _scheduleViewChanged (debounceMs = 250) {
+    if (!this._viewDirty) return
+    this._viewDirty = false
+    if (this._viewChangedTimer) return // a debounce window is already open
+    const fire = () => {
+      this._viewChangedTimer = null
+      this._viewChangedSeq += 1
+      // PAYLOAD-LESS by contract: only an opaque monotonic counter, no content.
+      try { this.ctx.emit('view-changed', { seq: this._viewChangedSeq }) } catch (_) {}
+    }
+    const t = setTimeout(fire, debounceMs)
+    if (t && t.unref) t.unref()
+    this._viewChangedTimer = t
+  }
+
   verifierDeviceSet () {
     const out = new Map()
     if (this.rootPubkey) {
@@ -2254,6 +2301,12 @@ export async function attach (ctx) {
           dirty = false // events during OUR pass re-mark it
           await engine.refresh()
           await engine._reconcileDurability()
+          // [AUDIT I-9] If this pass (refresh's reducer apply, or the durability
+          // reconciler re-materializing a rolled-back row) materialized content,
+          // emit a DEBOUNCED, PAYLOAD-LESS `view-changed` so the UI live-refreshes
+          // the active tab. Read-and-clear is inside _scheduleViewChanged; the
+          // debounce coalesces a multi-op burst into one event.
+          engine._scheduleViewChanged(WAKE_DEBOUNCE_MS)
           pending = engine._pendingDurable ? engine._pendingDurable.size : 0
         }
       } catch (_) {}

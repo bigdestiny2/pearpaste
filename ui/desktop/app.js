@@ -168,6 +168,14 @@ bridge.onEvent((event, payload) => {
     }
   } else if (event === 'clip-captured') {
     if (S.view === 'clips') refreshClips()
+  } else if (event === 'view-changed') {
+    // [AUDIT I-9] Live-refresh on sync: a remote note/clip just materialized in
+    // the view. The backend already debounced this (one event per burst), so we
+    // simply re-query the ACTIVE content tab — guarded to notes/clips so a sync
+    // while on Devices/Relay/Settings does no needless work. The payload is an
+    // opaque {seq} only (no content); we ignore it.
+    if (S.view === 'notes') refreshNotes()
+    else if (S.view === 'clips') refreshClips()
   }
   render()
 })

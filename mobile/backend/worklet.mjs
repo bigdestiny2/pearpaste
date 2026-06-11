@@ -41,7 +41,10 @@ const FORWARD_EVENTS = [
   'verifier-ran', 'device-revoked', 'relay-available', 'relay-enabled-changed',
   'relay-connected-changed',
   'pair-invite-created', 'pair-approval-needed', 'pair-approval-cleared',
-  'pair-rejected', 'pair-admitted', 'paired', 'sync-ready'
+  'pair-rejected', 'pair-admitted', 'paired', 'sync-ready',
+  // [AUDIT I-9] payload-less live-refresh signal — sanitize() strips its opaque
+  // {seq} to a scalar; carries no content. NotesScreen/ClipsScreen subscribe.
+  'view-changed'
 ]
 
 // Handlers registered SYNC so the RN side never hangs on a dead IPC; they gate

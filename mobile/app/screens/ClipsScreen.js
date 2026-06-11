@@ -17,6 +17,7 @@ import {
 import { COPY, errorText } from '../lib/copy'
 import { theme } from '../lib/theme'
 import { Eyebrow, H1, Lede, Banner, Button, SealedRow, Chip, Hint, inputStyle } from '../lib/ui'
+import { getMobilePearEnd } from '../lib/MobilePearEnd'
 
 // @react-native-clipboard/clipboard is the maintained module (installed).
 // RN core's Clipboard was removed and is a no-op under the New Architecture,
@@ -44,6 +45,20 @@ export function ClipsScreen ({ rpc }) {
   }, [rpc])
 
   useEffect(() => { refresh() }, [refresh])
+
+  // [AUDIT I-9] Live-refresh on sync. 'clip-captured' fires ONLY from the local
+  // OS-clipboard monitor, so a clip synced from ANOTHER device never refreshed
+  // this list without a manual pull. The backend's debounced, payload-less
+  // 'view-changed' (emitted when a remote CLIP_ADD/CLIP_DELETE materializes)
+  // closes that gap; mirrors DevicesScreen's sync subscription. Mounts only
+  // while unlocked, so no `unlocked` gate is needed.
+  useEffect(() => {
+    const engine = getMobilePearEnd()
+    const off = engine.on('event', (msg) => {
+      if (msg && msg.event === 'view-changed') refresh()
+    })
+    return off
+  }, [refresh])
 
   // Capture: read the OS clipboard ONCE on explicit user tap (foreground,
   // user-initiated — not a poll loop). Or capture the in-app paste field.
