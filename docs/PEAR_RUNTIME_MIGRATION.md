@@ -1,7 +1,28 @@
 # RFC: Migrate Paste to the `pear-runtime` + Electron-Forge boilerplate
 
-**Status:** DRAFT — for review. **No code changes in this PR.** This document only proposes a plan.
-**Author:** (migration planning) · **Date:** 2026-06-12 · **Branch:** `docs/pear-runtime-migration-plan`
+**Status:** APPROVED — full adoption of the new conventions ("we adopt all of the
+new conventions and standards for the refactor", 2026-06-12). Implementation in
+progress on `feat/pear-runtime-electron-forge`.
+**Author:** (migration planning) · **Date:** 2026-06-12 · **Plan branch:** `docs/pear-runtime-migration-plan`
+
+## Implementation status (updated as phases land)
+
+| Phase | Status | Notes |
+|---|---|---|
+| 0 Spike | ✅ DONE | Boilerplate sources studied; toolchain validated directly in-repo |
+| 1 Dual-boot entry | ✅ DONE | `electron/main.js` + `workers/{main,paste}.js`; `index.js` is the single runtime-detected entry (NOTE: Pear ignores `pear.main` and reads root `main` — both runtimes share it). Electron app boots, vault create/unlock/note/devices all work over the new FramedStream(Bare.IPC) transport; `verify-encryption` exits 0 on the new conventional store; legacy `pear run --dev .` boots unchanged |
+| 2 Renderer re-wire | ✅ DONE | Third transport (window.bridge adapter) added to `ui/shared/bridge-client.js`; bespoke renderer kept (decision); tray = pear-electron-only for now (Electron `Tray` in Phase 5 polish) |
+| 3 Build layer | 🟡 PARTIAL | `forge.config.js` (ESM) + `build/` assets + `pear.json` scaffold + `upgrade` link minted (`pear://zf4nh8ck…`). `make` validated on macOS only — **Windows (msix) + Linux (appimage/flatpak/snap) validation pending on the handoff boxes** |
+| 4 Release + OTA | ⬜ TODO | Updater worker runs and syncs; the apply-update UI contract + stage→provision→multisig pipeline + cross-version OTA test remain |
+| 5 Docs + cutover | ⬜ TODO | Legacy pear-electron path still the default-shippable; cutover after 3+4 |
+
+**Decisions resolved (per the full-adoption call):** repo stays ESM (Electron ≥28
+ESM main; `preload.cjs` is the one CJS boundary file — sandboxed preloads must be
+CJS); bespoke `ui/desktop/app.js` renderer kept (pear-interface is a demo
+toolkit, not a convention); fresh release-line links minted rather than reusing
+`pear://u6oyh38…` (existing installs are pre-beta/throwaway); `pear.json`
+multisig scaffolded with placeholder signer keys — real signers/quorum are
+maintainer-owned and block only the production-release step.
 
 ---
 
