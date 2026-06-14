@@ -11,7 +11,10 @@ coverage/
 artifacts/
 !artifacts/.gitkeep
 dist/
-build/
+# /build is TRACKED (Electron-Forge maker inputs: entitlements, AppxManifest,
+# icons, metainfo, snapcraft — hello-pear-electron conventions); platform build
+# scratch dirs elsewhere stay ignored via the patterns below.
+mobile/**/build/
 *.tsbuildinfo
 .idea/
 .vscode/
@@ -50,3 +53,4 @@ scripts/windows-launcher/obj/
 
 # Internal launch/marketing drafts — keep out of the public tree.
 docs/launch/
+out/

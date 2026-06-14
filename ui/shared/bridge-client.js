@@ -3,12 +3,16 @@
 // {id, command, params} -> {id, ok, result|error} protocol the root index.js
 // bridge exposes.
 //
-// Two transports, auto-detected:
+// Three transports, auto-detected:
 //   1. Pear desktop: a newline-JSON pipe surfaced by pear-electron. The
 //      renderer receives it via window.__pearBridgePipe (wired by the shell)
 //      or, in the simplest pear-electron setup, the renderer is same-process
 //      with the entry and window.__pearpaste is the in-process bridge object.
-//   2. Dev / e2e harness: an in-process bridge object set on globalThis
+//   2. Electron (pear-runtime + Forge path): the sandboxed preload exposes
+//      window.bridge (worker IPC relay per the hello-pear-electron
+//      boilerplate). Adapted below to the same pipe interface — the worker
+//      (/workers/paste.js) speaks the identical newline-JSON protocol.
+//   3. Dev / e2e harness: an in-process bridge object set on globalThis
 //      (window.__pearpaste). Used so screens can be driven without a GUI.
 //
 // The client adds NOTHING that could leak — it forwards opaque params and
@@ -54,6 +58,39 @@ export function createBridgeClient () {
     } catch (_) {}
     try {
       pipe = globalThis.Pear.worker.run(workerLink)
+    } catch (_) {
+      pipe = null
+    }
+  }
+
+  // Electron (pear-runtime + Forge path, hello-pear-electron conventions):
+  // electron/preload.cjs exposes window.bridge. Start the Paste Pear-end
+  // worker plus the OTA updater worker, and adapt the preload relay to the
+  // pipe interface so the newline-JSON branch below is reused verbatim.
+  if (!inproc && !pipe &&
+      typeof globalThis !== 'undefined' && globalThis.bridge &&
+      typeof globalThis.bridge.startWorker === 'function') {
+    const eb = globalThis.bridge
+    const spec = '/workers/paste.js'
+    try {
+      eb.startWorker(spec)
+      eb.startWorker('/workers/main.js') // OTA updater (no-op under --no-updates)
+      const dataListeners = new Set()
+      const crashListeners = new Set()
+      eb.onWorkerIPC(spec, (data) => { for (const fn of dataListeners) { try { fn(data) } catch (_) {} } })
+      eb.onWorkerExit(spec, (code) => { for (const fn of crashListeners) { try { fn({ exitCode: code }) } catch (_) {} } })
+      // Surface worker logs in the renderer console (parity with `pear run`).
+      const dec = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null
+      if (dec && typeof eb.onWorkerStderr === 'function') {
+        eb.onWorkerStderr(spec, (d) => { try { console.error('[paste-worker]', dec.decode(d)) } catch (_) {} })
+      }
+      pipe = {
+        write (s) { eb.writeWorkerIPC(spec, s); return true },
+        on (ev, fn) {
+          if (ev === 'data') dataListeners.add(fn)
+          else if (ev === 'crash') crashListeners.add(fn)
+        }
+      }
     } catch (_) {
       pipe = null
     }
