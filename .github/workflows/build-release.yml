@@ -46,6 +46,19 @@ on:
   push:
     tags:
       - "v*"
+  # Build on PRs that touch the desktop build surface, so cross-platform
+  # packaging regressions are caught before merge (not just at release/tag time).
+  # Path-filtered to keep the 5-runner matrix off doc/backend-only PRs.
+  pull_request:
+    paths:
+      - "forge.config.js"
+      - "electron/**"
+      - "workers/**"
+      - "build/**"
+      - "index.js"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/build-release.yml"
 
 permissions:
   contents: read
