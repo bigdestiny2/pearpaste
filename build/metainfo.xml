@@ -23,21 +23,23 @@
   <developer id="global.paste">
     <name>Paste</name>
   </developer>
-  <url type="homepage">https://www.paste.global</url>
+  <url type="homepage">https://github.com/bigdestiny2/pearpaste</url>
   <url type="bugtracker">https://github.com/bigdestiny2/pearpaste/issues</url>
   <url type="vcs-browser">https://github.com/bigdestiny2/pearpaste</url>
   <content_rating type="oars-1.1" />
   <categories>
     <category>Utility</category>
-    <category>Office</category>
   </categories>
   <provides>
-    <binary>paste</binary>
+    <!-- Must match the Forge flatpak maker's generated binary (appName "Paste"). -->
+    <binary>Paste</binary>
   </provides>
+  <!-- NOTE: the Forge flatpak maker copies this file verbatim — the release
+       version below is NOT auto-stamped from package.json, so bump it per release. -->
   <releases>
-    <release version="0.1.0" date="2026-06-09">
+    <release version="0.1.0" date="2026-06-12">
       <description>
-        <p>Initial Flatpak spike — bundles its own glibc to run on older Linux.</p>
+        <p>End-to-end encrypted notes + clipboard, synced peer-to-peer. Flatpak bundles its own runtime to run on older Linux.</p>
       </description>
     </release>
   </releases>

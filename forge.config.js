@@ -40,6 +40,13 @@ let packagerConfig = {
   icon: 'build/icon',
   protocols: [{ name: appName, schemes: [pkg.name] }],
   derefSymlinks: true,
+  // asar MUST stay off: the Bare workers (workers/*.js, launched by
+  // PearRuntime.run with a real fs path) and sodium-native's `.node` prebuild
+  // cannot load from inside an app.asar archive (Bare uses bare-fs, not
+  // Electron's asar VFS; native addons can't dlopen from an archive). The mac
+  // build was verified to ship a plain Resources/app/ dir and spawn both
+  // workers — pin that so a future default flip can't silently break win/linux.
+  asar: false,
   // Paste-specific addition to the boilerplate config: the repo carries large
   // non-app trees (mobile/ RN project, dist/ legacy build outputs, .pear-stage
   // mirror, docs/tests). Without these ignores the packaged .app swept in

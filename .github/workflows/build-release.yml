@@ -1,0 +1,185 @@
+# PearPaste — native installer build (pear-runtime + Electron-Forge path).
+#
+# This is the CURRENT release-build workflow. It builds the Forge installers on
+# every native runner by running `npm run make` (= electron-forge make) directly,
+# so it produces UNSIGNED artifacts out of the box (no certs required) and SIGNS
+# automatically once the signing secrets/env are wired in (forge.config.js gates
+# signing on MAC_CODESIGN_IDENTITY / WINDOWS_SIGN_HOOK).
+#
+# WHY NOT holepunchto/actions/make-pear-app@v1: that composite action validates
+# signing credentials UNCONDITIONALLY per-OS — it `exit 1`s on macOS/Windows when
+# the cert inputs are absent, and the macOS path cannot take an empty
+# notarization method. So it cannot produce the unsigned dev/CI builds we need
+# right now. We call the same underlying `npm run make` the action would, minus
+# the hard signing gate. (When real certs exist, either add the cert-import +
+# notarytool/​signtool steps here, or introduce a separate signed-release
+# workflow that uses make-pear-app with the secrets present.)
+#
+# It SUPERSEDES the legacy .github/workflows/release.yml build path (the old
+# scripts/build-{macos,windows}.mjs + package-linux.mjs + `pear build`
+# pear-electron flow), which is kept DEPRECATED for the dual-boot window.
+# ci.yml still owns lint/tests/security/sentinel/supply-chain and is unchanged.
+#
+# Triggers:
+#   workflow_dispatch — manual; optional `upgrade_key` overrides package.json#upgrade.
+#   push tags v*      — builds all platforms for a tagged release.
+#
+# Artifacts (out/make/, uploaded per job):
+#   macOS   — .dmg + .zip   (arm64 on macos-latest, x64 on macos-13)
+#   Windows — .msix          (x64 on windows-latest)
+#   Linux   — .AppImage + flatpak staging tarball (always)  +  .snap (best-effort)
+#
+# Signing (all optional; absent => UNSIGNED, build still succeeds):
+#   macOS   set MAC_CODESIGN_IDENTITY (+ a notarytool keychain profile) to sign.
+#   Windows set WINDOWS_SIGN_HOOK to a signtool hook module to sign the .msix.
+# These are intentionally NOT wired to fail-closed here — see the WHY NOT note.
+
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upgrade_key:
+        description: "Optional pear:// upgrade link (overrides package.json#upgrade). Blank = use the committed link."
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  # Empty on tag pushes (no inputs context) -> forge.config readPackageJson hook
+  # falls back to the committed package.json#upgrade. Non-empty via dispatch.
+  UPGRADE_KEY: ${{ github.event.inputs.upgrade_key }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build gate — lint + full test suite. Every build job needs: this, so a red
+  # tree never produces a release artifact. Deep security/sentinel/supply-chain
+  # jobs live in ci.yml and are intentionally not duplicated here.
+  # ---------------------------------------------------------------------------
+  test-gate:
+    name: build gate (lint + test:all)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test:all
+
+  # ---------------------------------------------------------------------------
+  # macOS — .dmg + .zip. arm64 (macos-latest) + x64 (macos-13, Intel).
+  # Unsigned unless MAC_CODESIGN_IDENTITY (+ notary profile) is provided.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: build macOS (${{ matrix.runner }})
+    needs: test-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-13]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Make (electron-forge)
+        run: npm run make
+        env:
+          # Blank => forge.config skips osxSign/osxNotarize entirely (unsigned).
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          KEYCHAIN_PROFILE: ${{ secrets.KEYCHAIN_PROFILE }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-macos-${{ matrix.runner }}
+          path: out/make/**
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Windows — .msix (x64). Unsigned unless WINDOWS_SIGN_HOOK is provided.
+  # maker-msix uses the Windows SDK/Kits preinstalled on windows-latest
+  # (forge.config getWindowsKitVersion() resolves it).
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: build Windows (windows-latest)
+    needs: test-gate
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Make (electron-forge)
+        run: npm run make
+        env:
+          # Blank => forge.config omits windowsSignOptions (unsigned .msix).
+          WINDOWS_SIGN_HOOK: ${{ secrets.WINDOWS_SIGN_HOOK }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-windows-x64
+          path: out/make/**
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Linux — AppImage + flatpak staging tarball (always), .snap (best-effort).
+  # x64 (ubuntu-latest) + arm64 (ubuntu-24.04-arm).
+  #   * AppImage maker builds via app-builder-lib's bundled tooling (no apt deps).
+  #   * flatpak maker only `tar`s a staging bundle (downstream finishes the
+  #     .flatpak on a box) — no flatpak-builder needed here.
+  #   * snap maker needs snapcraft; run as a separate continue-on-error step so a
+  #     snap hiccup never blocks the AppImage/flatpak artifacts. The reliable
+  #     Linux formats are guaranteed; snap is opportunistic in CI.
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: build Linux (${{ matrix.runner }})
+    needs: test-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Make AppImage + Flatpak tarball (required)
+        run: npm run make -- --targets pear-electron-forge-maker-appimage,pear-electron-forge-maker-flatpak
+      - name: Make Snap (best-effort)
+        continue-on-error: true
+        run: |
+          sudo snap install snapcraft --classic || true
+          npm run make -- --targets pear-electron-forge-maker-snap
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paste-linux-${{ matrix.runner }}
+          path: out/make/**
+          if-no-files-found: error
+          retention-days: 14

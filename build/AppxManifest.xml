@@ -11,6 +11,10 @@
     <DisplayName>Paste</DisplayName>
     <PublisherDisplayName>Paste</PublisherDisplayName>
     <Description>Personal, end-to-end encrypted note and clipboard sync over the Pear / Holepunch P2P stack.</Description>
+    <!-- TODO(verify on first Windows `npm run make`): the msix maker copies the
+         packaged app into an `app\` subfolder; if the logo is reported missing,
+         the assets live at `app\build\icon.png` relative to the package root.
+         See docs/handover/BUILD_WINDOWS.md troubleshooting. -->
     <Logo>build\icon.png</Logo>
     <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
   </Properties>
@@ -18,7 +22,7 @@
     <Resource Language="en-US" />
   </Resources>
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19045.0" MaxVersionTested="10.0.19045.0" />
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22631.0" />
   </Dependencies>
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />

@@ -1,8 +1,10 @@
 # PearPaste — Linux Box Handoff (build + E2E)
 
-**Date:** 2026-06-11 · **Repo:** `bigdestiny2/pearpaste` (branch `main`) · **Your role:** produce the Linux package(s) and run the Linux + cross-device E2E, then report back.
+**Date:** 2026-06-14 · **Repo:** `bigdestiny2/pearpaste` · **Your role:** produce the Linux package(s) via the Electron Forge path and run the Linux + cross-device E2E, then report back.
 
-Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (`.deb`/AppImage/tarball) and [`BUILD_FLATPAK.md`](BUILD_FLATPAK.md). Full scenario catalog: [`../E2E_TEST_PLAN.md`](../E2E_TEST_PLAN.md). Your **pairing partner** for the multi-device scenarios is the maintainer's **macOS / M3 Ultra** box on the same testnet/LAN.
+> **Build model: Electron Forge + pear-runtime.** Paste is now a standard Electron app that embeds `pear-runtime`, packaged with **Electron Forge**. Build with `npm ci` then `npm run make` → `out/make/`: `Paste-*.AppImage`, `*_flatpak.tar.gz` (Flatpak staging tarball), `*.snap`. The old `npm run build:linux` / `scripts/package-linux.mjs` (`.deb`/AppImage launcher) and `scripts/build-flatpak.mjs` are the **deprecated legacy pear-electron path**, kept only for dual-boot until cutover.
+
+Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (AppImage/Flatpak tarball/Snap) and [`BUILD_FLATPAK.md`](BUILD_FLATPAK.md) (finishing the Flatpak). CI (recommended build path): [`README.md`](README.md). Full scenario catalog: [`../E2E_TEST_PLAN.md`](../E2E_TEST_PLAN.md). Your **pairing partner** for the multi-device scenarios is the maintainer's **macOS / M3 Ultra** box on the same testnet/LAN.
 
 ---
 
@@ -15,29 +17,28 @@ Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (`.deb`
 - **Search/write perf** (I-14/I-8) — large vaults stay fast.
 
 ## 1. Box prereqs (one-time)
-- **Ubuntu 22.04+ / Debian 12+ x64**, **glibc ≥ 2.32** (`ldd --version`) — the sodium-native prebuild + Pear runtime need it; older distros (e.g. Ubuntu 20.04 / glibc 2.31) will not launch the runtime.
+- **Ubuntu 22.04+ / Debian 12+ x64**, **glibc ≥ 2.32** (`ldd --version`) — the sodium-native prebuild + bundled Electron need it; older distros (e.g. Ubuntu 20.04 / glibc 2.31) need the Flatpak path instead.
 - **Node.js 22 LTS**.
 - Git.
-- Pear CLI: `npm i -g pear` (`pear -v`).
-- `dpkg-deb` (from `dpkg`, usually preinstalled) — for the `.deb`.
-- *(optional)* `appimagetool` on `PATH` — to also emit an `.AppImage`.
-- *(Flatpak path)* `flatpak` + `flatpak-builder` + the Freedesktop runtime/SDK — see `BUILD_FLATPAK.md`.
-- *(release/signing)* `minisign` or `gpg` — the release gate requires a detached signature.
+- Per-maker native prereqs:
+  - **AppImage** (`pear-electron-forge-maker-appimage`): **nothing** beyond npm deps — no `libfuse2`/`appimagetool` at build time.
+  - **Flatpak** (`pear-electron-forge-maker-flatpak`): **`tar` only**; `make` emits a `*_flatpak.tar.gz` staging tarball, **not** a finished `.flatpak`. Finishing it needs `flatpak` + `flatpak-builder` + runtimes — see `BUILD_FLATPAK.md`.
+  - **Snap** (`pear-electron-forge-maker-snap`): **`snapcraft` + `lxd`** — `sudo snap install snapcraft --classic`, `sudo snap install lxd`, `sudo usermod -a -G lxd $USER`, `sudo lxd init --auto`. (CI installs these automatically.)
 
 ## 2. Get the code
 ```sh
 git clone https://github.com/bigdestiny2/pearpaste.git
 cd pearpaste
-git checkout main
+git checkout <branch-or-tag>
 npm ci
 ```
-`npm ci` pulls the linux-x64 `sodium-native` prebuild (the only native addon).
+`npm ci` pulls the linux-x64 `sodium-native` prebuild (the only native addon) — no C++ toolchain required for the app.
 
-## 3. Preflight (must pass before building)
+## 3. Confirm the app boots (optional, before packaging)
 ```sh
-npm run preflight:linux
+npm start
 ```
-Checks the lockfile, Pear stage entrypoints, `pear-electron/pre`, the linux `sodium-native` prebuild, `tar`, and optional distro tooling (`dpkg-deb`, `appimagetool`, `rpmbuild`, `desktop-file-validate`).
+`electron-forge start -- --no-updates` launches the Electron host, spawns the two Bare workers (`workers/main.js` updater + `workers/paste.js` vault over FramedStream(Bare.IPC)), and opens to the **unlock screen**. If it fails to spawn the workers or open the store, **STOP and report**. Close it once confirmed.
 
 ## 4. Run the automated gate (proves the core works on Linux)
 ```sh
@@ -47,28 +48,25 @@ Node 22, outside any socket sandbox (an `EPERM` at UDX bind is a sandbox artifac
 > If `follow-topic: an OFFLINE survivor catches up…` (in `revocation-network`) times out, **re-run it** — it's a DHT-reconnect timing test (hardened, but a constrained box can still need a retry). A real failure **anywhere else** = capture the output and report.
 
 ## 5. Build the package(s)
-The maintainer hands you the current production link:
 ```sh
-export PEARPASTE_LINK="pear://<fork>.<length>.<key>"
+npm run make
 ```
-**`.deb` + tarball (+ AppImage if `appimagetool` is present):**
-```sh
-npm run build:linux        # or build:linux:unsigned to force the unsigned dev path
-```
-→ `dist/linux/paste_<version>_amd64.deb` (gated on `dpkg-deb`; skips gracefully if absent), `pearpaste-<version>-linux-x64.tar.gz` (+ `.sha256`), and an `.AppImage` when tooling is present.
+`electron-forge make` runs every linux maker → under `out/make/`:
+- `**/Paste-*.AppImage`
+- `**/*_flatpak.tar.gz` (Flatpak **staging tarball** — finish into a `.flatpak` per `BUILD_FLATPAK.md`)
+- `**/*.snap`
 
-**Flatpak (alternative, wide-distro reach below the glibc floor):** follow `BUILD_FLATPAK.md` (`node scripts/build-flatpak.mjs`).
+To build one maker only: `npm run make -- --targets pear-electron-forge-maker-appimage`. AppImage and the Flatpak tarball are unsigned by nature; Snap signing/review is a Snap-Store-side step at upload, not at `make`.
 
-> Note: the `.deb`/tarball are **launchers** — they run `pear run pear://<link>` through the Pear runtime, so the target box needs the Pear runtime **and** the production link must be staged+seeded by the maintainer. They *build* fine regardless, but only *launch* once the link is live.
+> **Recommended: build in CI instead.** The CI building block installs snapcraft + LXD automatically and needs no apt/flatpak/appimage setup. See [`README.md`](README.md) → "CI: the recommended build path". Local `npm run make` is the fallback.
 
 ## 6. Smoke test the package
-1. Install + launch:
+1. Run the AppImage:
    ```sh
-   npm i -g pear                                   # target needs the Pear runtime
-   sudo dpkg -i dist/linux/paste_<version>_amd64.deb
-   paste                                            # or the .desktop entry
+   chmod +x out/make/**/Paste-*.AppImage
+   ./out/make/**/Paste-*.AppImage
    ```
-   → opens to the **unlock screen**.
+   → opens to the **unlock screen**. (Snap: `sudo snap install --dangerous out/make/**/*.snap` then run; Flatpak: finish the tarball first per `BUILD_FLATPAK.md`.)
 2. **Create a vault** (24-word phrase shown **exactly once** — record it), write a note, **lock**, **unlock**, re-open (plaintext returns).
 3. Independent storage check:
    ```sh
@@ -80,7 +78,7 @@ npm run build:linux        # or build:linux:unsigned to force the unsigned dev p
 From `E2E_TEST_PLAN.md`. Single-box items you can do alone; **MULTI** items need the Mac on the same `@hyperswarm/testnet` bootstrap or an isolated LAN DHT.
 
 **Linux platform gate (§5 Linux):**
-- [ ] `npm run preflight:linux` passes; the `.deb`/AppImage/Flatpak **wrap and launch** on the target distro.
+- [ ] `npm run make` produces the AppImage / Flatpak tarball / Snap; the **AppImage launches** on the target distro (and Snap/finished Flatpak if you exercised them).
 - [ ] **Clipboard backend behaves on BOTH X11 and Wayland** — this is the Linux-specific risk. Test copy/paste + the 60s auto-clear under each session type.
 - [ ] Tray / global paste (if enabled).
 
@@ -92,7 +90,7 @@ From `E2E_TEST_PLAN.md`. Single-box items you can do alone; **MULTI** items need
 - [ ] `verify-encryption.js` exits 0 on the Linux store throughout.
 
 ## 8. Report back
-- `dist/linux/paste_<version>_amd64.deb` (+ `.AppImage`, `.tar.gz`, and Flatpak if built) and the `.sha256` (+ `.minisig`/`.sig` if you signed).
+- The `out/make/` artifacts (`.AppImage`, `*_flatpak.tar.gz`, `.snap`, and the finished `.flatpak` if you built it) each with a `.sha256` (`sha256sum <file> > <file>.sha256`).
 - The `npm run test:all` tallies + any non-flaky failure (full output).
 - The §7 checklist with **P/F + notes** per item (note the X11 vs Wayland clipboard result explicitly).
 - Any worker-log error (especially `Not writable`, an unhandled reducer exception, or a wedge where one bad op halts a batch).
