@@ -182,17 +182,16 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      # --targets matches the maker NAME (appImage/flatpak/snap), not the package
-      # name. Snap is excluded from forge.config by default (needs snapcraft+LXD).
-      - name: Make AppImage + Flatpak tarball (required)
-        run: npm run make -- --targets appImage,flatpak
-      - name: Make Snap (best-effort)
-        continue-on-error: true
-        env:
-          PEARPASTE_BUILD_SNAP: "1"
-        run: |
-          sudo snap install snapcraft --classic || true
-          npm run make -- --targets snap
+      # Bare `npm run make` builds every maker enabled in forge.config for this
+      # platform = AppImage + Flatpak tarball. Snap is gated OUT of the config by
+      # default (PEARPASTE_BUILD_SNAP) because it needs snapcraft+LXD that is
+      # flaky on hosted runners and was the sole cause of Linux CI failures. We
+      # do NOT use electron-forge `--targets` — it resolves the value as a maker
+      # MODULE to require, not a name filter, so it cannot subset the makers here.
+      # Build a `.snap` out-of-band on a Linux box / snapcraft.io remote-build:
+      #   PEARPASTE_BUILD_SNAP=1 npm run make   (see docs/handover/BUILD_LINUX.md)
+      - name: Make (AppImage + Flatpak tarball)
+        run: npm run make
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

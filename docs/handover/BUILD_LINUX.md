@@ -73,12 +73,20 @@ step done at upload, not at `make`. To build a single maker only, use
 ## 4. CI is the recommended path
 For repeatable builds prefer the GitHub-hosted CI workflow
 (`.github/workflows/build-release.yml`) — see **`docs/handover/README.md` → CI
-section**. It runs `npm run make` directly on `ubuntu-latest` + `ubuntu-24.04-arm`:
-AppImage + the Flatpak tarball are built as the required step (no native deps),
-and `.snap` runs as a separate **best-effort** step that does
-`sudo snap install snapcraft --classic` first (so a snap failure never blocks the
-AppImage/Flatpak artifacts). Local `npm run make` is the manual fallback; for a
-local snap you likewise need `snapcraft` (+ `lxd` if it builds in a container).
+section**. It runs a bare `npm run make` on `ubuntu-latest` + `ubuntu-24.04-arm`,
+producing **AppImage + the Flatpak tarball** (no native deps needed).
+
+**Snap is NOT built in CI** — it needs `snapcraft` + LXD that is flaky on hosted
+runners, and `electron-forge --targets` can't subset the makers (it resolves the
+value as a module to require). Snap is therefore gated out of `forge.config.js`
+by default and built **out-of-band** on a Linux box (or snapcraft.io remote-build):
+
+```sh
+sudo snap install snapcraft --classic     # + lxd if it builds in a container
+PEARPASTE_BUILD_SNAP=1 npm run make        # adds the snap maker, builds .snap
+```
+Local `npm run make` (without the env var) is the manual fallback for AppImage +
+Flatpak, matching CI.
 
 ## 5. Sanity-check before sending back
 - **AppImage:** `chmod +x` it and run it → confirm it opens to the unlock screen
