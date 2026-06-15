@@ -133,21 +133,29 @@ export default {
         categories: ['Utility']
       }
     },
-    {
-      name: 'pear-electron-forge-maker-snap',
-      platforms: ['linux'],
-      config: {
-        snapcraftYamlPath: 'build/snapcraft.yaml',
-        summary: 'Private, end-to-end encrypted note + clipboard sync over P2P',
-        description:
-          'Personal, end-to-end encrypted note and clipboard sync over the Pear / Holepunch P2P stack. No accounts, no servers — your devices hold the keys.',
-        contact: 'defidon@protonmail.com',
-        license: 'Apache-2.0',
-        issues: 'https://github.com/bigdestiny2/pearpaste/issues',
-        website: 'https://github.com/bigdestiny2/pearpaste',
-        icon: `${packagerConfig.icon}.png`
-      }
-    }
+    // Snap is OFF by default: a bare `npm run make` must NOT build snap, because
+    // it needs snapcraft + LXD that isn't present on every runner/box. Opt in
+    // with PEARPASTE_BUILD_SNAP=1 (the CI best-effort step sets it). NOTE: Forge
+    // `--targets` matches the maker NAME ('appImage' / 'flatpak' / 'snap'), NOT
+    // the npm package name — so the reliable Linux build uses
+    // `npm run make -- --targets appImage,flatpak`.
+    ...(process.env.PEARPASTE_BUILD_SNAP === '1'
+      ? [{
+          name: 'pear-electron-forge-maker-snap',
+          platforms: ['linux'],
+          config: {
+            snapcraftYamlPath: 'build/snapcraft.yaml',
+            summary: 'Private, end-to-end encrypted note + clipboard sync over P2P',
+            description:
+              'Personal, end-to-end encrypted note and clipboard sync over the Pear / Holepunch P2P stack. No accounts, no servers — your devices hold the keys.',
+            contact: 'defidon@protonmail.com',
+            license: 'Apache-2.0',
+            issues: 'https://github.com/bigdestiny2/pearpaste/issues',
+            website: 'https://github.com/bigdestiny2/pearpaste',
+            icon: `${packagerConfig.icon}.png`
+          }
+        }]
+      : [])
   ],
 
   hooks: {

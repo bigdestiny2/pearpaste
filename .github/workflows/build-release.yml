@@ -182,13 +182,17 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      # --targets matches the maker NAME (appImage/flatpak/snap), not the package
+      # name. Snap is excluded from forge.config by default (needs snapcraft+LXD).
       - name: Make AppImage + Flatpak tarball (required)
-        run: npm run make -- --targets pear-electron-forge-maker-appimage,pear-electron-forge-maker-flatpak
+        run: npm run make -- --targets appImage,flatpak
       - name: Make Snap (best-effort)
         continue-on-error: true
+        env:
+          PEARPASTE_BUILD_SNAP: "1"
         run: |
           sudo snap install snapcraft --classic || true
-          npm run make -- --targets pear-electron-forge-maker-snap
+          npm run make -- --targets snap
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
