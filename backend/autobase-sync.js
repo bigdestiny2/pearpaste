@@ -49,6 +49,7 @@ class SyncEngine {
     this.localSearch = null // LocalSearchIndex
     this._searchBee = null
     this._opened = false
+    this._openPromise = null
     // Authorized device set rebuilt deterministically by the reducer.
     //   deviceId -> { signingPubkey, writerKey(hex), roles, revokedAtLamport|null,
     //                 addedAtLamport, isRoot }
@@ -203,6 +204,15 @@ class SyncEngine {
   // --- open / close --------------------------------------------------------
   async open () {
     if (this._opened) return
+    if (this._openPromise) return this._openPromise
+    this._openPromise = this._open().finally(() => {
+      this._openPromise = null
+    })
+    return this._openPromise
+  }
+
+  async _open () {
+    if (this._opened) return
     this._closing = false
     this._appendChain = Promise.resolve() // fresh chain per open (lock->unlock)
     this._pendingDurable.clear()
@@ -231,6 +241,7 @@ class SyncEngine {
       ackInterval: 1000
     })
     await this.base.ready()
+    this._assertNotClosing()
 
     // Persist the autobase key so paired devices bootstrap onto the same base.
     if (!this._bootstrapKey()) {
@@ -238,6 +249,7 @@ class SyncEngine {
         ...(await ctx.vaultStore.getVaultHeader()),
         autobaseKey: b4a.toString(this.base.key, 'hex')
       })
+      this._assertNotClosing()
     }
 
     // local-only (un-topic'd) search index
@@ -250,8 +262,10 @@ class SyncEngine {
     const searchStore = ctx.vaultStore.namespace(NAMESPACES.SEARCH)
     const searchCore = searchStore.get({ name: 'local-search-v2' })
     await searchCore.ready()
+    this._assertNotClosing()
     this._searchBee = beeFromCore(searchCore)
     await this._searchBee.ready()
+    this._assertNotClosing()
 
     const viewArgs = {
       crypto,
@@ -267,9 +281,11 @@ class SyncEngine {
     // set, append a self-signed DEVICE_ADD (root authorizes its own first
     // device — spec §14 first device steps 3-5).
     await this.base.update()
+    this._assertNotClosing()
     if (this.base.writable && this.devices.size === 0 && ctx.state.device) {
       await this._appendDeviceAdd(ctx.state.device, { selfRoot: true })
       await this.base.update()
+      this._assertNotClosing()
     }
 
     // [AUDIT I-1] Restore the Lamport high-water mark on reopen. The clock is
@@ -286,7 +302,9 @@ class SyncEngine {
     // that self-add re-appends a fresh DEVICE_ADD at the writer tail with a
     // small lamport, so the max is taken over ALL nodes, never the tail alone.
     await this.base.update()
+    this._assertNotClosing()
     ctx.state.lamport.observe(await this._maxDurableLamport())
+    this._assertNotClosing()
 
     // [RAW-REMAT] Autobase resumes from the persisted view on reopen — no
     // apply pass runs while the log is quiet, so raw rows pending from a prior
@@ -303,6 +321,7 @@ class SyncEngine {
     // O(tokens)) indexObject path. Idempotent + cheap: skipped entirely once the
     // v2 bee holds any row (steady-state reopens are a single peek).
     await this._rebuildSearchIndexIfEmpty()
+    this._assertNotClosing()
 
     this._opened = true
     ctx.emit('sync-open', { autobaseKey: b4a.toString(this.base.key, 'hex') })
@@ -381,12 +400,19 @@ class SyncEngine {
     return k ? b4a.from(k, 'hex') : null
   }
 
+  _assertNotClosing () {
+    if (!this._closing) return
+    const e = new Error('sync engine closing')
+    e.code = 'ENGINE_CLOSING'
+    throw e
+  }
+
   async close () {
-    if (!this._opened) return
-    this._opened = false
     // Signal queued appends + the durability-confirm loop to abort promptly so
     // a closing engine never blocks shutdown waiting on the append chain.
     this._closing = true
+    if (!this._opened && !this.base && !this._searchBee && !this.view && !this.localSearch) return
+    this._opened = false
     try { if (this.base) await this.base.close() } catch (_) {}
     try { if (this._searchBee) await this._searchBee.close() } catch (_) {}
     this.base = null
@@ -2604,6 +2630,7 @@ export async function attach (ctx) {
   ctx.on('unlocked', () => { ctx.scope.spawn(() => openEngine(), 'sync-open') })
   ctx.on('locked', () => {
     armReady() // re-arm BEFORE close so an in-flight handler waits for re-open
+    if (ctx.state && ctx.state._shuttingDown) return
     ctx.scope.spawn(() => engine.close(), 'sync-close')
   })
   if (ctx.isUnlocked()) await openEngine()

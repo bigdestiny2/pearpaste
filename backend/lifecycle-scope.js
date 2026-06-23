@@ -14,9 +14,11 @@ export class LifecycleScope {
     this.name = name
     this.closing = false
     this.closed = false
+    this.drainTimeoutMs = 5000
     this._tasks = new Set()
     this._disposers = []
     this._abort = createAbortScope()
+    this._closePromise = null
   }
 
   get signal () {
@@ -70,10 +72,16 @@ export class LifecycleScope {
   // disposers newest-first. Safe to call more than once.
   async close () {
     if (this.closed) return
+    if (this._closePromise) return this._closePromise
+    this._closePromise = this._close()
+    return this._closePromise
+  }
+
+  async _close () {
     this.closing = true
     this._abort.abort()
     const pending = [...this._tasks]
-    await Promise.allSettled(pending)
+    if (pending.length > 0) await waitSettled(pending, this.drainTimeoutMs)
     for (let i = this._disposers.length - 1; i >= 0; i--) {
       try {
         await this._disposers[i]()
@@ -125,6 +133,21 @@ function createAbortScope () {
     for (const h of fire) { try { h.fn() } catch (_) {} }
   }
   return { signal, abort }
+}
+
+function waitSettled (promises, timeoutMs) {
+  if (!timeoutMs || timeoutMs < 0) return Promise.allSettled(promises)
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs)
+    if (timer.unref) timer.unref()
+  })
+  return Promise.race([
+    Promise.allSettled(promises),
+    timeout
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 function abortError () {

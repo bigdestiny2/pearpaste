@@ -1,5 +1,11 @@
 // Paste — Windows build orchestrator.
 //
+// ⚠️ DEPRECATED — legacy dist/ build path. DO NOT use for releases.
+//   Canonical desktop build is now electron-forge:  npm run make  →  out/make/
+//   (Paste.msix via maker-msix on a Windows host / CI; see forge.config.js).
+//   Retained ONLY as the Phase-4 rollback fallback until the electron-forge
+//   cutover (docs/PEAR_RUNTIME_MIGRATION.md, Phase 5).
+//
 // Spec refs: §12 (desktop packaging: Pear binary-wrapper path for Windows),
 // §17 (release; sign Windows artifacts; preserve Pear P2P update path),
 // §21 Agent 3 (desktop distribution). Companion: docs/RELEASE.md §3.

@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // Paste Linux packaging helper.
 //
+// ⚠️ DEPRECATED — legacy dist/ build path. DO NOT use for releases.
+//   Canonical desktop build is now electron-forge:  npm run make  →  out/make/
+//   (AppImage + Flatpak via the pear-electron-forge makers on a Linux host / CI;
+//   see forge.config.js). Retained ONLY as the Phase-4 rollback fallback until
+//   the electron-forge cutover (docs/PEAR_RUNTIME_MIGRATION.md, Phase 5).
+//
 // This script keeps Linux distribution honest without pretending this repo has
 // distro signing infrastructure. Preflight is safe on any OS; package/release
 // modes create a distro-neutral tarball on Linux that launches the production

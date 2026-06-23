@@ -1,4 +1,4 @@
-@import url("../shared/design-tokens.css");
+@import url("../shared/design-tokens.css?v=20260622-audit3");
 
 /* Paste desktop styles. Local only, no remote fonts (CSP §12).
    This is a port of the website's design system, scoped to the app shell
@@ -377,10 +377,14 @@ label input[type="checkbox"] {
 .list { display: flex; flex-direction: column; gap: 10px; }
 .row {
   display: flex; align-items: center; gap: 14px;
+  width: 100%;
   padding: 14px 16px;
   border: 1px solid var(--line); border-radius: 14px;
   background: rgba(255, 255, 255, .02);
+  color: inherit;
   cursor: pointer;
+  font: inherit;
+  text-align: left;
   transition: border-color .2s, background .2s, transform .15s;
 }
 .row:hover {

@@ -25,6 +25,34 @@ checklist references are the source of truth: `scripts/release-prod.sh`,
 | **A** | **Pear-native `pear://` link** | A versioned `pear://<fork>.<length>.<z32-key>` link; user installs the Pear runtime once and runs `pear run pear://…` | None required (P2P, content-addressed, Pear-trust prompt) | **Phase 1 — now** |
 | **B** | **Signed installers on our own site** | `.dmg` (macOS), `Setup.exe` (Windows), `.tar.gz`/`.AppImage` (Linux), each embedding the runtime + resolving the link | Required: Developer ID + notarization (macOS), Authenticode (Windows); Linux GPG/minisign | **Phase 2** |
 | **C** | **OS app stores** (Mac App Store / Microsoft Store) | Store-packaged app | Store signing **plus** entitlements review | **Phase 3 — caveated, may be infeasible** |
+| **D** | **P2P landing page + PearBrowser catalogue** | A self-contained marketing site published to Hyperdrive (`hyper://25a06bb3…`), plus a catalogue entry that surfaces Paste (and an **Open** action that launches the Channel A `pear://` link) in PearBrowser | None required (P2P, pinned on HiveRelay) | **Phase 1 — done** |
+
+### Channel D — P2P landing page + catalogue (live)
+
+A peer-to-peer alternative to the `paste.global` web site, requiring no DNS or
+web host:
+
+- **Source:** `pear-ecosystem/03-sites/p2p-sites/pearpaste/index.html` — one
+  self-contained file (inline CSS/JS/SVG, no remote assets), so it seeds cleanly
+  and loads offline.
+- **Publish / update** (reuses the same drive key via the persisted
+  `.hiverelay-seed/` corestore):
+  ```sh
+  # from pear-ecosystem/01-browser/pearbrowser-desktop
+  node scripts/publish-and-pin.js ../../03-sites/p2p-sites/pearpaste \
+    --name pearpaste-site \
+    --key 25a06bb3dddec8138e9eda606cc4a11e9ebbe47815fd5d22064b30cff752bb5b \
+    --storage ../../03-sites/p2p-sites/pearpaste/.hiverelay-seed
+  ```
+- **Discovery:** Paste is listed in the PearBrowser **default catalogue**
+  (`hyper://0c35d12f…`, source `03-sites/pearbrowser-publishers/catalog-source/catalog.json`)
+  and in the browser's built-in featured apps (`ui/shell.js` `FEATURED_APPS`).
+  Re-publish the catalogue after edits:
+  ```sh
+  node scripts/publish-and-pin.js ../../03-sites/pearbrowser-publishers/catalog-source \
+    --name pearbrowser-network-catalog \
+    --storage ../../03-sites/pearbrowser-publishers/catalog
+  ```
 
 ### Channel C caveat — App Sandbox vs P2P (read before committing to stores)
 

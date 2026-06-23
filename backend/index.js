@@ -843,13 +843,39 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     }
   }
 
-  scope.onClose(async () => { swarm.destroy().catch(() => {}) })
+  let swarmDestroyed = false
+  async function destroySwarmBestEffort () {
+    if (swarmDestroyed) return
+    swarmDestroyed = true
+    try {
+      if (swarm && typeof swarm.destroy === 'function') await swarm.destroy()
+    } catch (_) {}
+  }
+
+  let shutdownPromise = null
+  async function shutdown () {
+    if (shutdownPromise) return shutdownPromise
+    shutdownPromise = (async () => {
+      state._shuttingDown = true
+      lock()
+      // Destroy network primitives before draining lifecycle tasks. Several
+      // spawned tasks wait on discovery.flushed()/swarm.flush(); destroying the
+      // swarm first lets those awaits settle instead of holding shutdown open.
+      await destroySwarmBestEffort()
+      try {
+        if (ctx.sync && typeof ctx.sync.close === 'function') await ctx.sync.close()
+      } catch (_) {}
+      await scope.close() // drains loops before Corestore close (spec §10)
+    })()
+    return shutdownPromise
+  }
+
+  scope.onClose(destroySwarmBestEffort)
   scope.onClose(async () => { await vaultStore.close() })
 
   const unregisterGoodbye = goodbye(async () => {
     log.info('shutdown-begin')
-    lock()
-    await scope.close() // drains loops before Corestore/swarm close (spec §10)
+    await shutdown()
     log.info('shutdown-done')
   })
 
@@ -862,7 +888,7 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     ctx,
     log,
     call: (command, params, c) => dispatcher.call(command, params, c),
-    async close () { unregisterGoodbye(); lock(); await scope.close() }
+    async close () { unregisterGoodbye(); await shutdown() }
   }
 }
 

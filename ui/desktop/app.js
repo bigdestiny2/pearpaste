@@ -15,10 +15,10 @@
 //
 // Visual layer ported from website/styles.css (see docs/DESIGN_SPEC.md).
 
-import { createBridgeClient } from '../shared/bridge-client.js'
-import { COPY, assertCopyClean } from '../shared/copy.js'
-import { qrToSvg } from '../shared/qr.js'
-import { h, mount } from '../shared/dom.js'
+import { createBridgeClient } from '../shared/bridge-client.js?v=20260622-audit3'
+import { COPY, assertCopyClean } from '../shared/copy.js?v=20260622-audit3'
+import { qrToSvg } from '../shared/qr.js?v=20260622-audit3'
+import { h, mount } from '../shared/dom.js?v=20260622-audit3'
 
 // pear-electron exposes `app.tray()` for a menubar icon. In `pear run --dev .`
 // the dock icon is locked to the Pear runtime's bundle (can't be overridden);
@@ -53,6 +53,7 @@ const S = {
   relay: null,
   proof: null,
   clipboard: null, // backend clipboard settings/stats
+  backendAvailable: true,
   pendingPhrase: null // { mnemonic, vaultId } shown once after CREATE_VAULT
 }
 
@@ -176,6 +177,14 @@ bridge.onEvent((event, payload) => {
     // opaque {seq} only (no content); we ignore it.
     if (S.view === 'notes') refreshNotes()
     else if (S.view === 'clips') refreshClips()
+  } else if (event === 'backend-unavailable' || event === 'backend-crash' || event === 'backend-shutdown') {
+    S.backendAvailable = false
+    clearOpen(false)
+    setBanner('err', 'Backend unavailable. Check the service status, then refresh once it is running again.', false)
+  } else if (event === 'backend-available' || event === 'web-connected') {
+    const wasUnavailable = !S.backendAvailable
+    S.backendAvailable = true
+    if (wasUnavailable) setBanner('ok', 'Backend connection restored.')
   }
   render()
 })
@@ -932,10 +941,25 @@ function searchScreen () {
       // unresolved (paired device, orphan record) and stay sealed/non-clickable.
       else body.push(h('div', { class: 'list', style: 'margin-top: 16px' }, ...S.searchResults.map((r) => {
         const clickable = !!r.id && (r.type === 'note' || r.type === 'clip')
-        const onclick = clickable
-          ? (r.type === 'clip' ? (() => { S.view = 'clips'; onEnterView('clips'); render() }) : (() => openNoteEditor(r.id)))
+        const openResult = clickable
+          ? (r.type === 'clip'
+              ? (() => { S.view = 'clips'; onEnterView('clips'); render() })
+              : (() => { S.view = 'notes'; openNoteEditor(r.id) }))
           : null
-        return h('div', { class: 'row' + (clickable ? '' : ' disabled'), onclick },
+        const onkeydown = clickable
+          ? ((e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                openResult()
+              }
+            })
+          : null
+        return h(clickable ? 'button' : 'div', {
+          class: 'row' + (clickable ? '' : ' disabled'),
+          type: clickable ? 'button' : null,
+          onclick: openResult,
+          onkeydown
+        },
           h('span', { class: 'ico', html:
             '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
             (r.type === 'clip'
@@ -957,7 +981,7 @@ function searchScreen () {
 // ---- Devices + Pairing ----------------------------------------------------
 function devicesScreen () {
   const body = [
-    sectionHead('Trusted devices', COPY.devicesTitle, 'Each device signs with its own key. Revoke any at any time.'),
+    sectionHead('Trusted devices', COPY.devicesTitle, 'Each device signs with its own key. Revoke paired devices when they should no longer read future content.'),
     bannerEl(),
     h('div', { class: 'actions reveal', 'data-d': '1' },
       h('button', { class: 'primary', onclick: createInvite }, COPY.pairAction),
@@ -974,10 +998,11 @@ function devicesScreen () {
         '</svg>' }),
       h('div', { class: 'meta' },
         h('div', { class: 't' }, d.sealed ? COPY.sealedRow : (d.label || d.deviceId)),
-        h('div', { class: 's' }, d.sealed ? 'sealed device record' : ((d.platform || '') + (d.revoked ? ' · revoked' : '') + ' · ' + (d.roles || []).join(',')))),
+        h('div', { class: 's' }, d.sealed ? 'sealed device record' : [d.platform || '', d.self ? COPY.deviceSelf : null, d.revoked ? 'revoked' : null, (d.roles || []).join(',')].filter(Boolean).join(' · '))),
       h('div', { class: 'row-actions' },
         d.sealed ? h('span', { class: 'badge sealed' }, 'sealed') : null,
-        !d.sealed && !d.revoked && h('button', {
+        !d.sealed && d.self ? h('span', { class: 'badge' }, COPY.deviceSelf) : null,
+        !d.sealed && !d.revoked && !d.self && h('button', {
           class: 'danger sm',
           onclick: () => requestRevokeDevice(d.deviceId, d.label || d.platform || null)
         }, COPY.revokeAction)
@@ -1330,16 +1355,19 @@ async function setupTray () {
   try {
     await bridge.relayStatus() // allowed while locked; just a reachability probe
   } catch (e) {
-    if (e.code === 'NO_BRIDGE') {
+    if (e.code === 'NO_BRIDGE' || e.code === 'BACKEND_UNAVAILABLE' || e.code === 'RPC_TIMEOUT') {
       // Match the regular render path's wrapper hierarchy: .shell-root > .main >
       // .card. Without it, the fallback card centers against the viewport (not
       // the 920-px main column) and ends up clipped under the topbar's flex
       // chrome on smaller windows.
+      const message = e.code === 'NO_BRIDGE'
+        ? 'Backend bridge not connected. Launch via `pear run --dev .` so the Pear-end is available.'
+        : 'Pear Paste backend is not responding. Check the package service status, then refresh this page.'
       mount(appEl, h('div', { class: 'shell-root' },
         h('div', { class: 'main' },
           h('div', { class: 'card center-card' },
             h('div', { style: 'margin-bottom: 16px' }, brandHero({ size: 'md' })),
-            h('div', { class: 'banner err' }, 'Backend bridge not connected. Launch via `pear run --dev .` so the Pear-end is available.')))))
+            h('div', { class: 'banner err' }, message)))))
       return
     }
   }

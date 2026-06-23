@@ -3,7 +3,7 @@
 // {id, command, params} -> {id, ok, result|error} protocol the root index.js
 // bridge exposes.
 //
-// Three transports, auto-detected:
+// Four transports, auto-detected:
 //   1. Pear desktop: a newline-JSON pipe surfaced by pear-electron. The
 //      renderer receives it via window.__pearBridgePipe (wired by the shell)
 //      or, in the simplest pear-electron setup, the renderer is same-process
@@ -14,6 +14,8 @@
 //      (/workers/paste.js) speaks the identical newline-JSON protocol.
 //   3. Dev / e2e harness: an in-process bridge object set on globalThis
 //      (window.__pearpaste). Used so screens can be driven without a GUI.
+//   4. Self-hosted web: a same-origin HTTP/SSE bridge exposed by
+//      server/web.mjs for Umbrel, StartOS, and local browser smoke tests.
 //
 // The client adds NOTHING that could leak — it forwards opaque params and
 // returns the backend's already-renderer-safe result. It also surfaces the
@@ -21,6 +23,8 @@
 // clear plaintext on lock/background without polling.
 
 let _seq = 0
+const DEFAULT_WEB_TIMEOUT_MS = 60000
+const PAIR_WEB_TIMEOUT_MS = 7 * 60 * 1000
 
 export function createBridgeClient () {
   const inproc = (typeof globalThis !== 'undefined' && globalThis.__pearpaste) || null
@@ -184,6 +188,79 @@ export function createBridgeClient () {
         reject(err)
       }
     })
+  } else if (typeof fetch === 'function' &&
+      typeof globalThis !== 'undefined' &&
+      globalThis.location &&
+      /^https?:$/.test(String(globalThis.location.protocol))) {
+    // Same-origin web transport. Requests use POST /rpc, while backend events
+    // stream over EventSource /events. This keeps the renderer contract exactly
+    // the same as the desktop pipe transport without exposing backend modules.
+    const EventSourceCtor = typeof globalThis !== 'undefined' ? globalThis.EventSource : null
+    if (typeof EventSourceCtor === 'function') {
+      try {
+        const events = new EventSourceCtor('/events')
+        events.onopen = () => emitEvent('backend-available', {})
+        events.onmessage = (ev) => {
+          let msg
+          try { msg = JSON.parse(ev.data) } catch (_) { return }
+          if (msg && msg.type === 'event') emitEvent(msg.event, msg.payload)
+        }
+        events.onerror = () => emitEvent('backend-unavailable', {})
+      } catch (_) {}
+    }
+    const postJson = async (path, body, timeoutMs = DEFAULT_WEB_TIMEOUT_MS) => {
+      const ac = typeof AbortController !== 'undefined' && timeoutMs > 0 ? new AbortController() : null
+      const timer = ac
+        ? setTimeout(() => ac.abort(), timeoutMs)
+        : null
+      if (timer && timer.unref) timer.unref()
+      let res
+      try {
+        res = await fetch(path, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body || {}),
+          signal: ac ? ac.signal : undefined
+        })
+      } catch (err) {
+        const e = new Error(err && err.name === 'AbortError' ? 'backend request timed out' : 'backend unavailable')
+        e.code = err && err.name === 'AbortError' ? 'RPC_TIMEOUT' : 'BACKEND_UNAVAILABLE'
+        emitEvent('backend-unavailable', { code: e.code })
+        throw e
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+      const text = await res.text()
+      let msg = null
+      try { msg = text ? JSON.parse(text) : null } catch (_) {}
+      if (!res.ok) {
+        const e = new Error((msg && msg.error && msg.error.message) || ('HTTP ' + res.status))
+        e.code = (msg && msg.error && msg.error.code) || ('HTTP_' + res.status)
+        if (res.status >= 500 || res.status === 0) emitEvent('backend-unavailable', { code: e.code })
+        throw e
+      }
+      return msg
+    }
+    const timeoutFor = (command, params) => {
+      if (command === 'PAIR_ACCEPT') return PAIR_WEB_TIMEOUT_MS
+      if (command === 'PAIR_LOOKUP_SHORTCODE') return Math.max(DEFAULT_WEB_TIMEOUT_MS, Number(params && params.timeoutMs) + 10000 || DEFAULT_WEB_TIMEOUT_MS)
+      if (command === 'PAIR_CREATE_INVITE') return 120000
+      return DEFAULT_WEB_TIMEOUT_MS
+    }
+    setVisibility = (visible) => {
+      postJson('/visibility', { visible: !!visible }, 10000).catch(() => {})
+    }
+    request = async (command, params) => {
+      const id = ++_seq
+      const msg = await postJson('/rpc', { id, command, params }, timeoutFor(command, params))
+      if (!msg || !msg.ok) {
+        const e = new Error(msg && msg.error ? msg.error.message : 'rpc error')
+        e.code = msg && msg.error && msg.error.code
+        throw e
+      }
+      return msg.result
+    }
   } else {
     // No transport yet — fail loudly but recoverably so the UI can show a
     // "backend unavailable" state instead of a blank screen.

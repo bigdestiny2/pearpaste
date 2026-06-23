@@ -14,7 +14,17 @@ progress on `feat/pear-runtime-electron-forge`.
 | 2 Renderer re-wire | ✅ DONE | Third transport (window.bridge adapter) added to `ui/shared/bridge-client.js`; bespoke renderer kept (decision); tray = pear-electron-only for now (Electron `Tray` in Phase 5 polish) |
 | 3 Build layer | 🟡 PARTIAL | `forge.config.js` (ESM) + `build/` assets + `pear.json` scaffold + `upgrade` link minted (`pear://zf4nh8ck…`). `make` validated on macOS only — **Windows (msix) + Linux (appimage/flatpak/snap) validation pending on the handoff boxes** |
 | 4 Release + OTA | ⬜ TODO | Updater worker runs and syncs; the apply-update UI contract + stage→provision→multisig pipeline + cross-version OTA test remain |
-| 5 Docs + cutover | ⬜ TODO | Legacy pear-electron path still the default-shippable; cutover after 3+4 |
+| 5 Docs + cutover | ⬜ TODO | Legacy pear-electron path still the default-shippable; cutover after 3+4. **Includes retiring the legacy `dist/` build scripts (see Build paths below).** |
+
+> **Build paths (read before building).** The canonical desktop build is
+> **electron-forge**: `npm run make` → `out/make/` (e.g. `out/make/Paste-0.1.0-arm64.dmg`).
+> The legacy `dist/`-based scripts (`scripts/build-macos.mjs`,
+> `scripts/build-windows.mjs`, `scripts/package-linux.mjs`) are **DEPRECATED** —
+> kept only as the Phase-4 rollback fallback and to be removed at cutover (Phase 5).
+> Do **not** ship `dist/` output: it is git-ignored, embeds older keys, and the
+> `dist/macos-wrapper` variant emits a `boot.js` that `require`s a `boot.bundle`
+> it does not contain → it crash-loops on launch. Canonical app link:
+> `pear://qnax5k8ojtod51ci9qwkrawdof1hx5w3a7gqbueoqnzzq9dw5hfo`.
 
 **Decisions resolved (per the full-adoption call):** repo stays ESM (Electron ≥28
 ESM main; `preload.cjs` is the one CJS boundary file — sandboxed preloads must be
