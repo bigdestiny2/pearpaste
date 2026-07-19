@@ -267,7 +267,7 @@ only when the matching secret exists** (else unsigned), and uploads via
 `actions/upload-artifact@v4`. Required repo secrets (`APPLE_DEV_ID`,
 `APPLE_NOTARY_*`, `PEARPASTE_MAC_APP`, `WIN_CERT_BASE64`, `WIN_CERT_PASS`,
 `PEARPASTE_WIN_WRAPPER`, `LINUX_MINISIGN_KEY`) and the `PEARPASTE_LINK`
-variable/secret are tabulated in **docs/RELEASE.md §3.4**.
+variable/secret are tabulated in **docs/RELEASE.md §3.5**.
 
 > The Pear runtime + `pear build` asset fetch in CI is **unverified** until the
 > first real run — those steps carry `# TODO(verify on first CI run)` markers in

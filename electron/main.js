@@ -34,8 +34,10 @@ const { name, productName, version, upgrade } = pkg
 
 const protocol = name
 const updaterWorkerSpecifier = '/workers/main.js'
+const APPLY_UPDATE_TIMEOUT_MS = 5 * 60 * 1000
 
 const workers = new Map()
+let applyUpdatePromise = null
 
 const appName = productName ?? name
 
@@ -68,6 +70,34 @@ function sendToAll (name, data) {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send(name, data)
   }
+}
+
+function frameToText (data) {
+  if (typeof data === 'string') return data
+  if (Buffer.isBuffer(data)) return data.toString('utf8')
+  if (data instanceof Uint8Array) return Buffer.from(data).toString('utf8')
+  if (data && data.buffer) {
+    return Buffer.from(data.buffer, data.byteOffset || 0, data.byteLength).toString('utf8')
+  }
+  return data && typeof data.toString === 'function' ? data.toString() : String(data)
+}
+
+function updaterErrorFromFrame (message) {
+  if (message.startsWith('pear:updateError:')) {
+    const err = new Error(message.slice('pear:updateError:'.length) || 'update failed')
+    err.code = 'UPDATE_FAILED'
+    return err
+  }
+
+  let parsed = null
+  try { parsed = JSON.parse(message) } catch (_) {}
+  if (parsed && parsed.type === 'pear:updateError') {
+    const err = new Error(parsed.message || 'update failed')
+    if (parsed.code) err.code = parsed.code
+    return err
+  }
+
+  return null
 }
 
 // Conventional per-OS app dir (boilerplate-verbatim). Workers receive it as
@@ -165,21 +195,52 @@ async function createWindow () {
 }
 
 ipcMain.handle('pear:applyUpdate', () => {
+  if (applyUpdatePromise) return applyUpdatePromise
   const pipe = getWorker(updaterWorkerSpecifier)
 
-  return new Promise((resolve) => {
+  applyUpdatePromise = new Promise((resolve, reject) => {
+    let done = false
+    const timer = setTimeout(() => {
+      const err = new Error('update apply timed out')
+      err.code = 'UPDATE_TIMEOUT'
+      finish(err)
+    }, APPLY_UPDATE_TIMEOUT_MS)
+    if (timer.unref) timer.unref()
+
+    function finish (err, result) {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      pipe.removeListener('data', onData)
+      if (err) reject(err)
+      else resolve(result || { applied: true })
+    }
+
     function onData (data) {
-      const message = data.toString()
+      const message = frameToText(data).trim()
 
       if (message === 'pear:updateApplied') {
-        pipe.removeListener('data', onData)
-        resolve()
+        finish(null, { applied: true })
+        return
+      }
+
+      const err = updaterErrorFromFrame(message)
+      if (err) {
+        finish(err)
       }
     }
 
     pipe.on('data', onData)
-    pipe.write('pear:applyUpdate')
+    try {
+      pipe.write('pear:applyUpdate')
+    } catch (err) {
+      finish(err)
+    }
+  }).finally(() => {
+    applyUpdatePromise = null
   })
+
+  return applyUpdatePromise
 })
 ipcMain.handle('pear:startWorker', (evt, filename) => {
   getWorker(filename)

@@ -3,6 +3,8 @@
 Status from the May 18, 2026 local audit:
 
 - `npm run test:all` passes on Node 22 when run with normal socket permissions.
+- Brittle suites are run one file per process via `scripts/run-brittle-suite.mjs`
+  so Hyperswarm/testnet-heavy files do not share pre-run import state.
 - Sandbox-only runs can fail at Hyperswarm/UDX socket bind with `EPERM`; rerun outside the sandbox before treating that as an app failure.
 - CI runs the mobile worklet smoke suite in addition to unit, integration, e2e, and security tests.
 - CI also runs Linux packaging preflight/dry-run coverage and a React Native mobile app lane (`npm ci`, ESLint, Jest, mobile lockfile checks).
@@ -12,7 +14,7 @@ Status from the May 18, 2026 local audit:
 
 | Layer | Command / gate | Covers | Current gap |
 |---|---|---|---|
-| Lint | `npm run lint` | StandardJS over backend/scripts/test | Existing style debt is exposed instead of hidden |
+| Lint | `npm run lint` | StandardJS over backend/scripts/test | Passing locally; keep as a required gate |
 | Unit | `npm run test:unit` | crypto envelope, identity, notes, clipboard, reducer/search | No renderer DOM assertions |
 | Integration | `npm run test:integration` | relay fallback/custody/seed, verifier behavior | Uses harnesses/stubs for relays where appropriate |
 | E2E headless | `npm run test:e2e` | desktop bridge contract, sealed rows, tap-to-decrypt, lock clear, clip round-trip | No real Pear window automation yet |

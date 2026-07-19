@@ -15,7 +15,7 @@
 // Spec refs: §5 (architecture), §10 (network engine), §15 (API), §22 (contracts).
 
 import Hyperswarm from 'hyperswarm'
-import goodbye from 'graceful-goodbye'
+import gracedown from 'pear-gracedown'
 import b4a from 'b4a'
 import LifecycleScope from './lifecycle-scope.js'
 import VaultStore from './vault-store.js'
@@ -85,7 +85,13 @@ async function flushSwarmBestEffort (swarm, log, label, timeoutMs = 2500) {
   return result
 }
 
-export async function createPearEnd ({ storagePath, log = makeLogger(), relayClientFactory, swarm: injectedSwarm = null } = {}) {
+export async function createPearEnd ({
+  storagePath,
+  log = makeLogger(),
+  relayClientFactory,
+  swarm: injectedSwarm = null,
+  registerGoodbye = true
+} = {}) {
   if (!storagePath) throw new Error('createPearEnd requires storagePath')
 
   const scope = new LifecycleScope('pearpaste')
@@ -451,7 +457,7 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   // ---- Foundation handlers (vault lifecycle + pairing spine) --------------
   dispatcher.register(COMMANDS.CREATE_VAULT, serializeVaultOp(async ({ label, platform, passphrase = '' }) => {
     const mnemonic = identity.generateMnemonic()
-    const rootSeed = identity.deriveRootSeed(mnemonic, passphrase)
+    const rootSeed = await identity.deriveRootSeed(mnemonic, passphrase)
     const newVaultId = identity.vaultIdFromRootSeed(rootSeed)
     // Wipe a prior, different vault's replicated cores before opening this one
     // (Fix A2). Done while state still reflects the outgoing vault so lock()
@@ -489,7 +495,7 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     if (!identity.validateMnemonic(mnemonic)) {
       const e = new Error('invalid recovery phrase'); e.code = 'BAD_MNEMONIC'; throw e
     }
-    const rootSeed = identity.deriveRootSeed(mnemonic, passphrase)
+    const rootSeed = await identity.deriveRootSeed(mnemonic, passphrase)
     const vaultId = identity.vaultIdFromRootSeed(rootSeed)
     if (highSecurity) {
       crypto.wipe(rootSeed)
@@ -548,6 +554,15 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
     await joinVault()
     ctx.emit('unlocked', { restored: true, highSecurity })
     return assertRendererSafe(COMMANDS.RESTORE_VAULT, { vaultId: state.vaultId, restored: true })
+  }))
+
+  // Locked-allowed first-run probe: lets a lock screen distinguish "no vault
+  // on this device yet" (offer Create/Restore/Pair) from "vault exists, ask
+  // for the passphrase" without a failed unlock round-trip. Booleans only —
+  // nothing sensitive crosses.
+  dispatcher.register(COMMANDS.VAULT_STATUS, async () => ({
+    hasVault: vaultStore.hasLocalDevice(),
+    locked: !!state.locked
   }))
 
   dispatcher.register(COMMANDS.UNLOCK_VAULT, serializeVaultOp(async ({ secret }) => {
@@ -873,11 +888,23 @@ export async function createPearEnd ({ storagePath, log = makeLogger(), relayCli
   scope.onClose(destroySwarmBestEffort)
   scope.onClose(async () => { await vaultStore.close() })
 
-  const unregisterGoodbye = goodbye(async () => {
-    log.info('shutdown-begin')
-    await shutdown()
-    log.info('shutdown-done')
-  })
+  let unregisterGoodbye = () => {}
+  if (registerGoodbye) {
+    unregisterGoodbye = gracedown(async () => {
+      log.info('shutdown-begin')
+      await shutdown()
+      log.info('shutdown-done')
+    })
+  } else {
+    // pear-gracedown installs SIGINT/SIGTERM listeners at import time that
+    // re-raise the signal once its (empty) handler list drains, killing hosts
+    // that manage their own shutdown. Registering and immediately
+    // unregistering a no-op handler triggers its cleanup path, which removes
+    // those module-level listeners — unless another gracedown handler is
+    // active in this process, in which case cleanup is skipped and signal
+    // handling is left untouched.
+    gracedown(async () => {})()
+  }
 
   return {
     dispatcher,

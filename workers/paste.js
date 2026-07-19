@@ -8,7 +8,7 @@
 // lifecycle plumbing:
 //   wire      pear-pipe (Pear.worker)  ->  FramedStream(Bare.IPC)
 //   storage   Pear.config.storage      ->  <Bare.argv[2]>/store
-//   teardown  Pear.teardown            ->  graceful-goodbye
+//   teardown  Pear.teardown            ->  pear-gracedown
 // The wire protocol is BYTE-IDENTICAL (newline-JSON, one message per frame):
 //   renderer -> worker : { id, command, params } | { type:'visibility', … }
 //   worker  -> renderer: { id, ok, result|error } | { type:'event', … }
@@ -18,7 +18,7 @@
 // The updater (/workers/main.js) keeps its own corestore under
 // <dir>/pear-runtime/ — never this vault store at <dir>/store.
 
-import goodbye from 'graceful-goodbye'
+import gracedown from 'pear-gracedown'
 import FramedStream from 'framed-stream'
 import path from 'bare-path'
 import { createPearEnd } from '../backend/index.js'
@@ -53,7 +53,7 @@ if (!dir) {
   // renderer -> worker: newline-delimited JSON requests + lifecycle messages
   attachDesktopWorkerPipe({ wire, bridge, log })
 
-  goodbye(async () => { try { await pearEnd.close() } catch (_) {} })
+  gracedown(async () => { try { await pearEnd.close() } catch (_) {} })
 
   log('info', 'desktop-worker-ready')
 }

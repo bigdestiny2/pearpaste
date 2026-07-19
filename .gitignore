@@ -19,6 +19,10 @@ mobile/**/build/
 .idea/
 .vscode/
 .planning/
+# Local agent/session state — launch configs carry machine-specific paths.
+.claude/
+# Session/audit artifacts (trackers, screenshots) — never source.
+outputs/
 website/
 
 # Icon build intermediates (regenerable via scripts/build-icons.sh).

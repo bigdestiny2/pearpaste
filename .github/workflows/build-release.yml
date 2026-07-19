@@ -27,7 +27,13 @@
 # Artifacts (out/make/, uploaded per job):
 #   macOS   — .dmg + .zip   (arm64 on macos-latest, x64 on macos-13)
 #   Windows — .msix          (x64 on windows-latest)
-#   Linux   — .AppImage + flatpak staging tarball (always)  +  .snap (best-effort)
+#   Linux   — .AppImage + flatpak staging tarball (snap is out-of-band)
+#
+# Each build job runs `scripts/smoke-packaged-artifacts.mjs` after `npm run make`.
+# That smoke gate checks the native package container on the runner that built it
+# (DMG/ZIP, MSIX, AppImage, Flatpak tarball), verifies the packaged app still
+# carries the Electron host, Bare workers, preload, and platform sodium-native
+# prebuild, then writes `.sha256` sidecars next to every uploaded artifact.
 #
 # Signing (all optional; absent => UNSIGNED, build still succeeds):
 #   macOS   set MAC_CODESIGN_IDENTITY (+ a notarytool keychain profile) to sign.
@@ -116,6 +122,8 @@ jobs:
           # Blank => forge.config skips osxSign/osxNotarize entirely (unsigned).
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
           KEYCHAIN_PROFILE: ${{ secrets.KEYCHAIN_PROFILE }}
+      - name: Smoke packaged artifacts + checksums
+        run: node scripts/smoke-packaged-artifacts.mjs
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -147,6 +155,8 @@ jobs:
         env:
           # Blank => forge.config omits windowsSignOptions (unsigned .msix).
           WINDOWS_SIGN_HOOK: ${{ secrets.WINDOWS_SIGN_HOOK }}
+      - name: Smoke packaged artifacts + checksums
+        run: node scripts/smoke-packaged-artifacts.mjs
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -156,14 +166,13 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
-  # Linux — AppImage + flatpak staging tarball (always), .snap (best-effort).
+  # Linux — AppImage + flatpak staging tarball (always). Snap is out-of-band.
   # x64 (ubuntu-latest) + arm64 (ubuntu-24.04-arm).
   #   * AppImage maker builds via app-builder-lib's bundled tooling (no apt deps).
   #   * flatpak maker only `tar`s a staging bundle (downstream finishes the
   #     .flatpak on a box) — no flatpak-builder needed here.
-  #   * snap maker needs snapcraft; run as a separate continue-on-error step so a
-  #     snap hiccup never blocks the AppImage/flatpak artifacts. The reliable
-  #     Linux formats are guaranteed; snap is opportunistic in CI.
+  #   * snap maker needs snapcraft+LXD and is gated out of forge.config by
+  #     default. Build it out-of-band with PEARPASTE_BUILD_SNAP=1.
   # ---------------------------------------------------------------------------
   build-linux:
     name: build Linux (${{ matrix.runner }})
@@ -192,6 +201,8 @@ jobs:
       #   PEARPASTE_BUILD_SNAP=1 npm run make   (see docs/handover/BUILD_LINUX.md)
       - name: Make (AppImage + Flatpak tarball)
         run: npm run make
+      - name: Smoke packaged artifacts + checksums
+        run: node scripts/smoke-packaged-artifacts.mjs
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

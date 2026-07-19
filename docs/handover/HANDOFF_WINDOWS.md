@@ -57,6 +57,13 @@ npm run make
 
 > **Recommended: build in CI instead.** The `windows-latest` runner ships the Windows SDK, so MSIX `make` works there with no setup. See [`README.md`](README.md) → "CI: the recommended build path". Local `npm run make` is the fallback.
 
+CI runs `node scripts/smoke-packaged-artifacts.mjs` after `npm run make`: it
+unpacks the MSIX with `makeappx`, confirms the manifest, `Paste.exe`, packaged
+Electron main/preload, Bare workers, and `win32-x64` `sodium-native` Bare
+prebuild are present, then writes the `.sha256` before upload. That is a package
+structure gate only; it does not replace the install/launch/vault/verifier and
+cross-device checks below.
+
 ## 6. Smoke test the installer
 1. Install the `.msix` (trusted/sideload) and launch Paste → opens to the **unlock screen**.
 2. **Create a vault** (the 24-word recovery phrase is shown **exactly once** — record it), write a note, **lock**, **unlock**, re-open the note (plaintext returns).
@@ -82,7 +89,7 @@ From `E2E_TEST_PLAN.md`. Single-box items you can do alone; **MULTI** items need
 - [ ] `verify-encryption.js` exits 0 on the Windows store throughout.
 
 ## 8. Report back
-- `out\make\...\Paste.msix` (and/or `out\Paste-win32-x64\Paste.msix`) and a `.sha256` (`certutil -hashfile <file> SHA256`).
+- `out\make\...\Paste.msix` (and/or `out\Paste-win32-x64\Paste.msix`) and a `.sha256` (`certutil -hashfile <file> SHA256`; CI writes the `out\make\...\Paste.msix.sha256` upload sidecar automatically).
 - The `npm run test:all` tallies + any non-flaky failure (full output).
 - The §7 checklist with **P/F + notes** per item.
 - Any worker-log error (especially `Not writable`, an unhandled reducer exception, or a wedge where one bad op halts a batch).

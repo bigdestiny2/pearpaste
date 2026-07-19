@@ -1,0 +1,33 @@
+# Pear Paste - Umbrel Community App Store packaging.
+#
+# Community-store variant of platforms/umbrel/pearpaste/docker-compose.yml.
+# The app id is prefixed with the store id, so the web container is
+# hiverelay-pearpaste_web_1 and app_proxy must target that name.
+#
+# Release boundaries:
+# - APP_PEARPASTE_IMAGE is generated from release/container-image.json.
+# - Only the web bridge port is fronted by Umbrel app_proxy; no host ports.
+# - The encrypted vault store and HOME persist under ${APP_DATA_DIR}/data.
+
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: hiverelay-pearpaste_web_1
+      APP_PORT: ${APP_PEARPASTE_WEB_PORT}
+
+  web:
+    image: ${APP_PEARPASTE_IMAGE}
+    init: true
+    restart: on-failure
+    stop_grace_period: 1m
+    user: "1000:1000"
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+    environment:
+      HOME: /data
+      NODE_ENV: production
+      PEARPASTE_HOST: 0.0.0.0
+      PEARPASTE_PORT: ${APP_PEARPASTE_WEB_PORT}
+      PEARPASTE_STORAGE: /data/store

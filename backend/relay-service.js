@@ -1,6 +1,6 @@
 // Paste HiveRelay availability layer.
 //
-// Integrates p2p-hiverelay-client@0.9.2 for ENCRYPTED AVAILABILITY, never
+// Integrates p2p-hiverelay-client@0.20.2 for ENCRYPTED AVAILABILITY, never
 // trust. HiveRelay is used to (a) keep the encrypted vault operation log
 // reachable while every personal device is asleep, (b) provide Atomic Blind
 // Custody receipts for temporary clipboard items, and (c) surface a live
@@ -205,7 +205,7 @@ export async function attach (ctx) {
   }
 
   // Observability only (no behavior change): bootstrap[] is honored by the
-  // 0.9.2 client ONLY when it owns its swarm. We run in advanced mode and pass
+  // HiveRelay client ONLY when it owns its swarm. We run in advanced mode and pass
   // ctx.swarm in (the client does NOT own it — §22 single-swarm contract), so
   // any configured bootstrap entries are a silent no-op. Surface that clearly
   // so an advanced operator isn't left wondering why their bootstrap[] had no

@@ -232,6 +232,20 @@ label input[type="checkbox"] {
 .topbar button, .topbar input, .topbar .lockpill {
   -webkit-app-region: no-drag;
 }
+.topbar .update-pill {
+  -webkit-app-region: no-drag;
+  flex: none;
+  max-width: 190px;
+  min-height: 31px;
+}
+.topbar button.update-pill { padding-inline: 11px; }
+.topbar .update-pill svg { flex: none; }
+.topbar .update-pill .update-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---- Lock pill / chip --------------------------------------------------- */
 .chip, .lockpill {
@@ -781,6 +795,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible,
   /* Hide the brand sub-text ("/ private clipboard") before it starts to
      fight the lock pill + Lock button for topbar real estate. */
   .topbar .brand .by { display: none; }
+}
+@media (max-width: 700px) {
+  .topbar .update-pill .update-copy { display: none; }
+  .topbar .update-pill { padding-inline: 9px; }
 }
 @media (max-width: 820px) {
   .nav { width: 64px; padding: 14px 8px; }

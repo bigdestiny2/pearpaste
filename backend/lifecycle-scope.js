@@ -1,6 +1,6 @@
 // Paste lifecycle scope.
 //
-// Borrows the HiveRelay 0.8.13+ cancellation/lifecycle contract: long-running
+// Borrows the current HiveRelay cancellation/lifecycle contract: long-running
 // async loops register here, observe `signal`, and the scope guarantees that
 // teardown drains every registered task before resources (Corestore, swarm,
 // relay) are closed. This prevents "closed" errors from stale async references

@@ -22,10 +22,10 @@ test('mnemonic generate/validate + checksum enforcement', (t) => {
   t.is(identity.generateMnemonic(ent), m, 'entropy -> same mnemonic')
 })
 
-test('rootSeed + vaultId derive deterministically from the phrase', (t) => {
+test('rootSeed + vaultId derive deterministically from the phrase', async (t) => {
   const m = identity.generateMnemonic(b4a.alloc(32, 2))
-  const s1 = identity.deriveRootSeed(m, 'pw')
-  const s2 = identity.deriveRootSeed(m, 'pw')
+  const s1 = await identity.deriveRootSeed(m, 'pw')
+  const s2 = await identity.deriveRootSeed(m, 'pw')
   t.is(b4a.toString(s1, 'hex'), b4a.toString(s2, 'hex'), 'deterministic root seed')
 
   const v1 = identity.vaultIdFromRootSeed(s1)
@@ -33,7 +33,7 @@ test('rootSeed + vaultId derive deterministically from the phrase', (t) => {
   t.is(v1, v2, 'same phrase -> same vaultId across devices')
   t.absent(v1.includes(m.split(' ')[0]), 'vaultId reveals nothing about the phrase')
 
-  const other = identity.vaultIdFromRootSeed(identity.deriveRootSeed(m, 'other-pw'))
+  const other = identity.vaultIdFromRootSeed(await identity.deriveRootSeed(m, 'other-pw'))
   t.not(v1, other, 'different passphrase -> different vault')
 })
 

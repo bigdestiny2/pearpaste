@@ -29,6 +29,34 @@ const PAIR_WEB_TIMEOUT_MS = 7 * 60 * 1000
 export function createBridgeClient () {
   const inproc = (typeof globalThis !== 'undefined' && globalThis.__pearpaste) || null
   let pipe = (typeof globalThis !== 'undefined' && globalThis.__pearBridgePipe) || null
+  const eventListeners = new Set()
+  const pending = new Map()
+  const chunkDecoder = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null
+
+  function onEvent (fn) { eventListeners.add(fn); return () => eventListeners.delete(fn) }
+  function emitEvent (event, payload) {
+    for (const fn of eventListeners) { try { fn(event, payload) } catch (_) {} }
+  }
+
+  function toText (chunk) {
+    if (typeof chunk === 'string') return chunk
+    if (chunkDecoder) {
+      if (chunk instanceof Uint8Array) return chunkDecoder.decode(chunk)
+      if (chunk && chunk.buffer) return chunkDecoder.decode(new Uint8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength))
+      try { return chunkDecoder.decode(chunk) } catch (_) {}
+    }
+    return (chunk && typeof chunk.toString === 'function' && !(chunk instanceof Uint8Array)) ? chunk.toString() : String(chunk)
+  }
+
+  function unavailableUpdateMethod () {
+    const e = new Error('updates are unavailable on this transport')
+    e.code = 'UPDATES_UNAVAILABLE'
+    throw e
+  }
+
+  let supportsUpdates = false
+  let applyUpdate = async () => unavailableUpdateMethod()
+  let appAfterUpdate = async () => unavailableUpdateMethod()
 
   // Pear desktop: the renderer spawns the Bare Pear-end as a worker
   // (pear-run) and talks to it over the returned pipe (pear-pipe on the
@@ -76,17 +104,55 @@ export function createBridgeClient () {
       typeof globalThis.bridge.startWorker === 'function') {
     const eb = globalThis.bridge
     const spec = '/workers/paste.js'
+    const updaterSpec = '/workers/main.js'
     try {
       eb.startWorker(spec)
-      eb.startWorker('/workers/main.js') // OTA updater (no-op under --no-updates)
+      eb.startWorker(updaterSpec) // OTA updater (no-op under --no-updates)
       const dataListeners = new Set()
       const crashListeners = new Set()
       eb.onWorkerIPC(spec, (data) => { for (const fn of dataListeners) { try { fn(data) } catch (_) {} } })
       eb.onWorkerExit(spec, (code) => { for (const fn of crashListeners) { try { fn({ exitCode: code }) } catch (_) {} } })
+      if (typeof eb.onWorkerIPC === 'function') {
+        eb.onWorkerIPC(updaterSpec, (data) => {
+          const frames = toText(data).split(/\r?\n/)
+          for (const raw of frames) {
+            const message = raw.trim()
+            if (!message) continue
+            if (message === 'updating') emitEvent('ota-updating', {})
+            else if (message === 'updated') emitEvent('ota-updated', {})
+            else if (message.startsWith('pear:updateError:')) {
+              emitEvent('ota-error', { message: message.slice('pear:updateError:'.length) || 'update failed' })
+            } else {
+              let parsed = null
+              try { parsed = JSON.parse(message) } catch (_) {}
+              if (parsed && parsed.type === 'pear:updateError') {
+                emitEvent('ota-error', { message: parsed.message || 'update failed', code: parsed.code })
+              }
+            }
+          }
+        })
+      }
+      if (typeof eb.onWorkerExit === 'function') {
+        eb.onWorkerExit(updaterSpec, (code) => emitEvent('ota-worker-exit', { exitCode: code }))
+      }
+      if (typeof eb.applyUpdate === 'function' && typeof eb.appAfterUpdate === 'function') {
+        supportsUpdates = true
+        applyUpdate = async () => {
+          emitEvent('ota-applying', {})
+          try {
+            const result = await eb.applyUpdate()
+            emitEvent('ota-applied', result || {})
+            return result || { applied: true }
+          } catch (err) {
+            emitEvent('ota-error', { message: err && err.message ? err.message : 'update failed', code: err && err.code })
+            throw err
+          }
+        }
+        appAfterUpdate = async () => eb.appAfterUpdate()
+      }
       // Surface worker logs in the renderer console (parity with `pear run`).
-      const dec = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null
-      if (dec && typeof eb.onWorkerStderr === 'function') {
-        eb.onWorkerStderr(spec, (d) => { try { console.error('[paste-worker]', dec.decode(d)) } catch (_) {} })
+      if (chunkDecoder && typeof eb.onWorkerStderr === 'function') {
+        eb.onWorkerStderr(spec, (d) => { try { console.error('[paste-worker]', toText(d)) } catch (_) {} })
       }
       pipe = {
         write (s) { eb.writeWorkerIPC(spec, s); return true },
@@ -100,16 +166,9 @@ export function createBridgeClient () {
     }
   }
 
-  const eventListeners = new Set()
-  const pending = new Map()
-
-  function onEvent (fn) { eventListeners.add(fn); return () => eventListeners.delete(fn) }
-  function emitEvent (event, payload) {
-    for (const fn of eventListeners) { try { fn(event, payload) } catch (_) {} }
-  }
-
   let request
   let setVisibility = () => {}
+  let closeTransport = () => {}
 
   if (inproc && typeof inproc.request === 'function') {
     // In-process bridge (dev/e2e and the default pear-electron same-proc UI).
@@ -147,16 +206,6 @@ export function createBridgeClient () {
     // Uint8Array, and Uint8Array.prototype.toString() yields "104,101,..."
     // (comma-joined byte values), NOT UTF-8 text — which makes every response
     // unparseable and silently drops all replies. Decode explicitly.
-    const _dec = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null
-    const toText = (chunk) => {
-      if (typeof chunk === 'string') return chunk
-      if (_dec) {
-        if (chunk instanceof Uint8Array) return _dec.decode(chunk)
-        if (chunk && chunk.buffer) return _dec.decode(new Uint8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength))
-        try { return _dec.decode(chunk) } catch (_) {}
-      }
-      return (chunk && typeof chunk.toString === 'function' && !(chunk instanceof Uint8Array)) ? chunk.toString() : String(chunk)
-    }
     let buf = ''
     pipe.on('data', (chunk) => {
       buf += toText(chunk)
@@ -195,17 +244,42 @@ export function createBridgeClient () {
     // Same-origin web transport. Requests use POST /rpc, while backend events
     // stream over EventSource /events. This keeps the renderer contract exactly
     // the same as the desktop pipe transport without exposing backend modules.
+    let webHadFailure = false
     const EventSourceCtor = typeof globalThis !== 'undefined' ? globalThis.EventSource : null
     if (typeof EventSourceCtor === 'function') {
       try {
         const events = new EventSourceCtor('/events')
-        events.onopen = () => emitEvent('backend-available', {})
+        let closed = false
+        const closeEvents = () => {
+          if (closed) return
+          closed = true
+          try { events.close() } catch (_) {}
+          if (typeof globalThis.removeEventListener === 'function') {
+            try { globalThis.removeEventListener('pagehide', closeEvents) } catch (_) {}
+            try { globalThis.removeEventListener('beforeunload', closeEvents) } catch (_) {}
+          }
+        }
+        closeTransport = closeEvents
+        if (typeof globalThis.addEventListener === 'function') {
+          try { globalThis.addEventListener('pagehide', closeEvents, { once: true }) } catch (_) {}
+          try { globalThis.addEventListener('beforeunload', closeEvents, { once: true }) } catch (_) {}
+        }
+        events.onopen = () => {
+          if (closed) return
+          webHadFailure = false
+          emitEvent('backend-available', {})
+        }
         events.onmessage = (ev) => {
+          if (closed) return
           let msg
           try { msg = JSON.parse(ev.data) } catch (_) { return }
           if (msg && msg.type === 'event') emitEvent(msg.event, msg.payload)
         }
-        events.onerror = () => emitEvent('backend-unavailable', {})
+        events.onerror = () => {
+          if (closed) return
+          webHadFailure = true
+          emitEvent('backend-unavailable', {})
+        }
       } catch (_) {}
     }
     const postJson = async (path, body, timeoutMs = DEFAULT_WEB_TIMEOUT_MS) => {
@@ -226,6 +300,7 @@ export function createBridgeClient () {
       } catch (err) {
         const e = new Error(err && err.name === 'AbortError' ? 'backend request timed out' : 'backend unavailable')
         e.code = err && err.name === 'AbortError' ? 'RPC_TIMEOUT' : 'BACKEND_UNAVAILABLE'
+        webHadFailure = true
         emitEvent('backend-unavailable', { code: e.code })
         throw e
       } finally {
@@ -237,8 +312,15 @@ export function createBridgeClient () {
       if (!res.ok) {
         const e = new Error((msg && msg.error && msg.error.message) || ('HTTP ' + res.status))
         e.code = (msg && msg.error && msg.error.code) || ('HTTP_' + res.status)
-        if (res.status >= 500 || res.status === 0) emitEvent('backend-unavailable', { code: e.code })
+        if (res.status >= 500 || res.status === 0) {
+          webHadFailure = true
+          emitEvent('backend-unavailable', { code: e.code })
+        }
         throw e
+      }
+      if (webHadFailure) {
+        webHadFailure = false
+        emitEvent('backend-available', {})
       }
       return msg
     }
@@ -271,7 +353,12 @@ export function createBridgeClient () {
     onEvent,
     call: request,
     setVisibility,
+    close: closeTransport,
+    supportsUpdates,
+    applyUpdate,
+    appAfterUpdate,
     // typed helpers (thin — the contract is the backend's)
+    vaultStatus: () => request('VAULT_STATUS', {}),
     createVault: (p) => request('CREATE_VAULT', p),
     restoreVault: (p) => request('RESTORE_VAULT', p),
     unlock: (secret, source = 'passphrase') => request('UNLOCK_VAULT', { secret, source }),

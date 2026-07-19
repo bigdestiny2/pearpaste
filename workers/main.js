@@ -12,7 +12,7 @@
 import PearRuntime from 'pear-runtime'
 import Hyperswarm from 'hyperswarm'
 import Corestore from 'corestore'
-import goodbye from 'graceful-goodbye'
+import gracedown from 'pear-gracedown'
 import FramedStream from 'framed-stream'
 import path from 'bare-path'
 
@@ -45,7 +45,7 @@ console.log('updater storage:', pear.storage)
 pear.updater.on('updating', () => pipe.write('updating'))
 pear.updater.on('updated', () => pipe.write('updated'))
 
-goodbye(async () => {
+gracedown(async () => {
   await swarm.destroy()
   await pear.close()
   await store.close()
@@ -54,7 +54,15 @@ goodbye(async () => {
 pipe.on('data', async (data) => {
   const message = data.toString()
   if (message === 'pear:applyUpdate') {
-    await pear.updater.applyUpdate()
-    pipe.write('pear:updateApplied')
+    try {
+      await pear.updater.applyUpdate()
+      pipe.write('pear:updateApplied')
+    } catch (err) {
+      pipe.write(JSON.stringify({
+        type: 'pear:updateError',
+        message: err && err.message ? err.message : 'update failed',
+        code: err && err.code
+      }))
+    }
   } else console.log(message)
 })

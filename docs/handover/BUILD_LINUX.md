@@ -1,8 +1,9 @@
 # Handover: build the PearPaste Linux packages (AppImage / Flatpak / Snap)
 
 Run this on a **Linux x64** box (Ubuntu 22.04+ / Debian 12+). `npm run make`
-produces, under `out/make/`: an **`.AppImage`**, a **Flatpak staging tarball**
-(`*_flatpak.tar.gz`), and a **`.snap`**, each built by the corresponding
+produces, under `out/make/`: an **`.AppImage`** and a **Flatpak staging
+tarball** (`*_flatpak.tar.gz`). A **`.snap`** is opt-in with
+`PEARPASTE_BUILD_SNAP=1`, built by the corresponding
 `pear-electron-forge-maker-*` maker configured in `forge.config.js`.
 
 > **Build model: Electron Forge + pear-runtime.** Paste is now a standard
@@ -28,7 +29,7 @@ Per-maker native prerequisites (the pear makers are deliberately lightweight):
 |---|---|---|
 | `pear-electron-forge-maker-appimage` | `*.AppImage` | **None** beyond npm deps. Builds via `app-builder-lib`'s bundled binary — **no `libfuse2`, no system `appimagetool`** needed at build time. (libFUSE is only needed to *run* an AppImage, not to write one.) |
 | `pear-electron-forge-maker-flatpak` | `*_flatpak.tar.gz` (staging tarball, **not** a finished `.flatpak`) | **`tar` only** (preinstalled). The maker does **not** invoke `flatpak`/`flatpak-builder` — it tars a staged bundle. To turn the tarball into a distributable `.flatpak`, do a downstream finishing step (see `BUILD_FLATPAK.md`). |
-| `pear-electron-forge-maker-snap` | `*.snap` | **`snapcraft` + `lxd`** (snapcraft builds via LXD). Install: `sudo snap install snapcraft --classic`, `sudo snap install lxd`, `sudo usermod -a -G lxd $USER`, `sudo lxd init --auto`. (CI installs these automatically — see §4.) |
+| `pear-electron-forge-maker-snap` | `*.snap` | **`snapcraft` + `lxd`** (snapcraft builds via LXD). Install: `sudo snap install snapcraft --classic`, `sudo snap install lxd`, `sudo usermod -a -G lxd $USER`, `sudo lxd init --auto`. Snap is out-of-band and only enabled when `PEARPASTE_BUILD_SNAP=1`. |
 
 > `npm ci` pulls the linux-x64 `sodium-native` prebuild (the only native addon).
 > No C++ toolchain required for the app itself.
@@ -53,10 +54,10 @@ screen. Close it once confirmed.
 npm run make
 ```
 `electron-forge make` runs every linux maker whose `platforms` include `linux`.
-Output under `out/make/`:
+By default the snap maker is gated out of `forge.config.js`, so output under
+`out/make/` is:
 - `**/Paste-*.AppImage`
 - `**/*_flatpak.tar.gz` (Flatpak staging tarball)
-- `**/*.snap`
 
 There is **no separate signed/unsigned command** on Linux: AppImage and the
 Flatpak tarball are unsigned by nature; Snap signing/review is a Snap Store-side
@@ -88,6 +89,15 @@ PEARPASTE_BUILD_SNAP=1 npm run make        # adds the snap maker, builds .snap
 Local `npm run make` (without the env var) is the manual fallback for AppImage +
 Flatpak, matching CI.
 
+CI also runs `node scripts/smoke-packaged-artifacts.mjs` immediately after
+`npm run make`. On Linux that gate requires the AppImage and Flatpak staging
+tarball, extracts/lists them, confirms the packaged Electron main/preload, Bare
+workers, and runner-arch `sodium-native` Bare prebuild are present, and writes a
+`.sha256` sidecar for each uploaded artifact. This proves artifact structure and
+payload presence only; real GUI launch, vault create/unlock, storage verifier
+output, finished Flatpak install, Snap install, and cross-device behavior remain
+the manual smoke/E2E gates below.
+
 ## 5. Sanity-check before sending back
 - **AppImage:** `chmod +x` it and run it → confirm it opens to the unlock screen
   and you can create + unlock a vault.
@@ -102,8 +112,9 @@ Flatpak, matching CI.
   Exit **`0`** = no plaintext at rest, AEAD-only. Non-zero = leak, **report it**.
 
 ## 6. Output → send back
-The artifacts under `out/make/` (`.AppImage`, `*_flatpak.tar.gz`, `.snap`) and a
-`.sha256` for each (`sha256sum <file> > <file>.sha256`).
+The artifacts under `out/make/` (`.AppImage`, `*_flatpak.tar.gz`, and out-of-band
+`.snap` when built) and a `.sha256` for each (`sha256sum <file> > <file>.sha256`;
+CI writes these automatically).
 
 ## Troubleshooting
 - **Snap `make` fails** → snapcraft/LXD not set up: run the four commands in §0,

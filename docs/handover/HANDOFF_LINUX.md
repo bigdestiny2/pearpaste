@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-14 · **Repo:** `bigdestiny2/pearpaste` · **Your role:** produce the Linux package(s) via the Electron Forge path and run the Linux + cross-device E2E, then report back.
 
-> **Build model: Electron Forge + pear-runtime.** Paste is now a standard Electron app that embeds `pear-runtime`, packaged with **Electron Forge**. Build with `npm ci` then `npm run make` → `out/make/`: `Paste-*.AppImage`, `*_flatpak.tar.gz` (Flatpak staging tarball), `*.snap`. The old `npm run build:linux` / `scripts/package-linux.mjs` (`.deb`/AppImage launcher) and `scripts/build-flatpak.mjs` are the **deprecated legacy pear-electron path**, kept only for dual-boot until cutover.
+> **Build model: Electron Forge + pear-runtime.** Paste is now a standard Electron app that embeds `pear-runtime`, packaged with **Electron Forge**. Build with `npm ci` then `npm run make` → `out/make/`: `Paste-*.AppImage`, `*_flatpak.tar.gz` (Flatpak staging tarball). Snap is opt-in/out-of-band with `PEARPASTE_BUILD_SNAP=1`. The old `npm run build:linux` / `scripts/package-linux.mjs` (`.deb`/AppImage launcher) and `scripts/build-flatpak.mjs` are the **deprecated legacy pear-electron path**, kept only for dual-boot until cutover.
 
 Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (AppImage/Flatpak tarball/Snap) and [`BUILD_FLATPAK.md`](BUILD_FLATPAK.md) (finishing the Flatpak). CI (recommended build path): [`README.md`](README.md). Full scenario catalog: [`../E2E_TEST_PLAN.md`](../E2E_TEST_PLAN.md). Your **pairing partner** for the multi-device scenarios is the maintainer's **macOS / M3 Ultra** box on the same testnet/LAN.
 
@@ -23,7 +23,7 @@ Self-contained. Deep build internals: [`BUILD_LINUX.md`](BUILD_LINUX.md) (AppIma
 - Per-maker native prereqs:
   - **AppImage** (`pear-electron-forge-maker-appimage`): **nothing** beyond npm deps — no `libfuse2`/`appimagetool` at build time.
   - **Flatpak** (`pear-electron-forge-maker-flatpak`): **`tar` only**; `make` emits a `*_flatpak.tar.gz` staging tarball, **not** a finished `.flatpak`. Finishing it needs `flatpak` + `flatpak-builder` + runtimes — see `BUILD_FLATPAK.md`.
-  - **Snap** (`pear-electron-forge-maker-snap`): **`snapcraft` + `lxd`** — `sudo snap install snapcraft --classic`, `sudo snap install lxd`, `sudo usermod -a -G lxd $USER`, `sudo lxd init --auto`. (CI installs these automatically.)
+  - **Snap** (`pear-electron-forge-maker-snap`): **`snapcraft` + `lxd`** — `sudo snap install snapcraft --classic`, `sudo snap install lxd`, `sudo usermod -a -G lxd $USER`, `sudo lxd init --auto`. Enable with `PEARPASTE_BUILD_SNAP=1`; CI does not build snap by default.
 
 ## 2. Get the code
 ```sh
@@ -54,11 +54,12 @@ npm run make
 `electron-forge make` runs every linux maker → under `out/make/`:
 - `**/Paste-*.AppImage`
 - `**/*_flatpak.tar.gz` (Flatpak **staging tarball** — finish into a `.flatpak` per `BUILD_FLATPAK.md`)
-- `**/*.snap`
 
-To build one maker only: `npm run make -- --targets pear-electron-forge-maker-appimage`. AppImage and the Flatpak tarball are unsigned by nature; Snap signing/review is a Snap-Store-side step at upload, not at `make`.
+To build snap too: `PEARPASTE_BUILD_SNAP=1 npm run make`. AppImage and the
+Flatpak tarball are unsigned by nature; Snap signing/review is a Snap-Store-side
+step at upload, not at `make`.
 
-> **Recommended: build in CI instead.** The CI building block installs snapcraft + LXD automatically and needs no apt/flatpak/appimage setup. See [`README.md`](README.md) → "CI: the recommended build path". Local `npm run make` is the fallback.
+> **Recommended: build in CI instead.** The CI building block needs no apt/flatpak/appimage setup and then runs `node scripts/smoke-packaged-artifacts.mjs`, which extracts/lists the AppImage and Flatpak tarball, checks for the packaged Electron host, Bare workers, preload, and Linux `sodium-native` Bare prebuild, and writes `.sha256` sidecars before upload. That CI proof does not replace the manual launch/vault/cross-device checks below. See [`README.md`](README.md) → "CI: the recommended build path". Local `npm run make` is the fallback.
 
 ## 6. Smoke test the package
 1. Run the AppImage:
@@ -78,7 +79,7 @@ To build one maker only: `npm run make -- --targets pear-electron-forge-maker-ap
 From `E2E_TEST_PLAN.md`. Single-box items you can do alone; **MULTI** items need the Mac on the same `@hyperswarm/testnet` bootstrap or an isolated LAN DHT.
 
 **Linux platform gate (§5 Linux):**
-- [ ] `npm run make` produces the AppImage / Flatpak tarball / Snap; the **AppImage launches** on the target distro (and Snap/finished Flatpak if you exercised them).
+- [ ] `npm run make` produces the AppImage / Flatpak tarball; the **AppImage launches** on the target distro (and Snap/finished Flatpak if you exercised them).
 - [ ] **Clipboard backend behaves on BOTH X11 and Wayland** — this is the Linux-specific risk. Test copy/paste + the 60s auto-clear under each session type.
 - [ ] Tray / global paste (if enabled).
 
@@ -90,7 +91,7 @@ From `E2E_TEST_PLAN.md`. Single-box items you can do alone; **MULTI** items need
 - [ ] `verify-encryption.js` exits 0 on the Linux store throughout.
 
 ## 8. Report back
-- The `out/make/` artifacts (`.AppImage`, `*_flatpak.tar.gz`, `.snap`, and the finished `.flatpak` if you built it) each with a `.sha256` (`sha256sum <file> > <file>.sha256`).
+- The `out/make/` artifacts (`.AppImage`, `*_flatpak.tar.gz`, plus `.snap` and the finished `.flatpak` if you built them) each with a `.sha256` (`sha256sum <file> > <file>.sha256`; CI writes these automatically).
 - The `npm run test:all` tallies + any non-flaky failure (full output).
 - The §7 checklist with **P/F + notes** per item (note the X11 vs Wayland clipboard result explicitly).
 - Any worker-log error (especially `Not writable`, an unhandled reducer exception, or a wedge where one bad op halts a batch).

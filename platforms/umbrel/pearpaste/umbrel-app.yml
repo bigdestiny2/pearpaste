@@ -1,0 +1,23 @@
+manifestVersion: 1
+id: pearpaste
+category: files
+name: Pear Paste
+version: "0.1.0"
+tagline: End-to-end encrypted notes and clipboard sync
+description: >-
+  Pear Paste is a personal, local-first vault for encrypted notes and clipboard
+  history. It uses the Pear and Holepunch peer-to-peer stack so your devices can
+  sync without a central plaintext service.
+releaseNotes: ""
+developer: Big Destiny
+website: https://github.com/bigdestiny2/pearpaste
+dependencies: []
+repo: https://github.com/bigdestiny2/pearpaste
+support: https://github.com/bigdestiny2/pearpaste/issues
+port: 9195
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: Big Destiny
+submission: ""

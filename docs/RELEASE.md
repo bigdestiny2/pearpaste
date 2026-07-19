@@ -71,6 +71,38 @@ the gate**. Pear's P2P update path means the production link updates without
 rebuilding native wrappers. The full desktop production-readiness checklist
 (accounts, certs, costs, phased rollout) lives in **docs/SHIPPING.md**.
 
+### 2.1 Electron Forge OTA contract on this branch
+
+The pear-runtime/Electron Forge path now has a renderer-facing OTA loop that is
+coherent without importing backend code into the UI:
+
+1. `workers/main.js` owns the public update drive only. It emits `updating` and
+   `updated` frames from `pear.updater`, accepts `pear:applyUpdate`, and replies
+   with `pear:updateApplied` or a structured `pear:updateError`.
+2. `electron/main.js` relays updater worker frames to every BrowserWindow and
+   exposes `pear:applyUpdate` with one in-flight apply, timeout protection, and
+   error propagation. `app:afterUpdate` performs the relaunch/quit step.
+3. `electron/preload.cjs` exposes the safe renderer surface:
+   `window.bridge.applyUpdate()` and `window.bridge.appAfterUpdate()`.
+4. `ui/shared/bridge-client.js` maps updater frames to renderer events
+   (`ota-updating`, `ota-updated`, `ota-error`) and typed helpers
+   (`supportsUpdates`, `applyUpdate()`, `appAfterUpdate()`).
+5. `ui/desktop/app.js` renders the user flow in the topbar:
+   update downloaded → Apply update → Restart.
+
+Focused regression harness:
+
+```sh
+node scripts/run-brittle-suite.mjs test/unit/electron-ota-bridge.test.js
+```
+
+That harness fakes the preload bridge and proves the renderer contract,
+including RPC isolation between `/workers/paste.js` and `/workers/main.js`,
+successful apply/restart, and failed apply/error propagation. A real production
+OTA drill still requires maintainer-controlled links/signers: install vN, stage
+vN+1 to the configured `package.json#upgrade` line, wait for `ota-updated`, click
+Apply update, then Restart and confirm the app reports vN+1.
+
 ---
 
 ## 3. Native desktop wrappers
@@ -114,7 +146,7 @@ Per spec §12/§17:
 > mistaken for a release.
 
 The whole matrix is also driven by the `release.yml` GitHub Actions workflow
-(§3.4): `workflow_dispatch` (with a `signed` boolean) or a `v*` tag builds all
+(§3.5): `workflow_dispatch` (with a `signed` boolean) or a `v*` tag builds all
 three installers, signing only when the relevant secret exists, else emitting
 the unsigned artifact.
 
@@ -289,7 +321,59 @@ in the release lane.
 > verified, the script **requires `PEARPASTE_MAC_APP`** so it never invents a
 > flag/behaviour.
 
-### 3.4 CI release workflow (`.github/workflows/release.yml`)
+### 3.4 Self-hosted container, StartOS, and Umbrel
+
+The self-hosted image release has one source of truth:
+
+- Root `package.json` owns the version tag.
+- `release/container-image.json` owns the GHCR repository, target platforms,
+  optional immutable multi-arch digest, StartOS package revision, internal web
+  port, Umbrel launch port, and StartOS preferred launch port.
+- `scripts/container-release.mjs` is the only path that should publish or pin a
+  digest, and the only path that should regenerate Umbrel metadata.
+
+Useful commands:
+
+```sh
+npm run container:status
+npm run container:check
+npm run startos:verify
+START_CLI=/path/to/start-cli npm run startos:verify-artifacts
+npm run container:check-store -- --store ../../00-core/blindspark-umbrel-store
+npm run container:publish -- --apply-digest
+npm run container:sync-store -- --store ../../00-core/blindspark-umbrel-store
+```
+
+`container:publish -- --apply-digest` runs `docker buildx build` for
+`linux/amd64,linux/arm64`, pushes `ghcr.io/bigdestiny2/pearpaste:<version>`,
+captures Docker's multi-arch index digest from the build metadata, writes it to
+`release/container-image.json`, and regenerates both Umbrel package exports.
+StartOS reads the same metadata directly when bundling the manifest.
+`startos:verify` builds the StartOS JavaScript ingredient and checks the final
+manifest exports for the package version, image ref, supported arches, volume,
+and release metadata before `start-cli s9pk pack` is attempted.
+After `make x86` and `make arm`, `startos:verify-artifacts` inspects the built
+`.s9pk` files with `start-cli`, confirms each package manifest matches the
+current release metadata, and prints SHA-256 hashes for release notes.
+After the digest is pinned, `container:sync-store` mirrors
+`platforms/umbrel/hiverelay-pearpaste` into the HiveRelay community-store
+checkout, and `container:check-store` proves the checked-out app package still
+matches the generated source package.
+
+Umbrel has two package directories:
+
+- `platforms/umbrel/pearpaste` — canonical/official-style app id.
+- `platforms/umbrel/hiverelay-pearpaste` — HiveRelay community-store app id for
+  `https://github.com/bigdestiny2/blindspark-umbrel-store`.
+
+If the first publish happens outside this script, pin the digest through the
+controlled path instead of editing manifests:
+
+```sh
+npm run container:pin-digest -- --digest sha256:<multi-arch-digest>
+```
+
+### 3.5 CI release workflow (`.github/workflows/release.yml`)
 
 A dedicated workflow builds all three installers (separate from the always-on
 `ci.yml`). Triggers:

@@ -96,6 +96,15 @@ The `windows-latest` runner already carries the Windows SDK, so MSIX `make` work
 there with no extra setup; pass the Windows signing secrets to sign, or omit them
 for an unsigned artifact. Local `npm run make` is the manual fallback.
 
+CI also runs `node scripts/smoke-packaged-artifacts.mjs` immediately after
+`npm run make`. On Windows that gate requires a `.msix`, unpacks it with
+`makeappx`, confirms `AppxManifest.xml`, `Paste.exe`, the packaged Electron
+main/preload, Bare workers, and the `win32-x64` `sodium-native` Bare prebuild are
+present, and writes a `.sha256` sidecar before upload. This proves the MSIX
+container and packaged payload structure only; it does not prove local install,
+GUI launch, vault create/unlock, storage verifier output, Authenticode trust, or
+SmartScreen reputation.
+
 ## 5. Sanity-check before sending back
 - Install the `.msix` (a signed/trusted one, or enable sideloading for the dev
   cert) and launch Paste → confirm it opens to the unlock screen and you can
@@ -109,7 +118,8 @@ for an unsigned artifact. Local `npm run make` is the manual fallback.
 
 ## 6. Output → send back
 `out\make\...\Paste.msix` (and/or `out\Paste-win32-x64\Paste.msix`), plus a
-`.sha256` for each (`certutil -hashfile <file> SHA256`).
+`.sha256` for each (`certutil -hashfile <file> SHA256`; CI writes the
+`out\make\...\Paste.msix.sha256` upload sidecar automatically).
 
 ## Troubleshooting
 - **`make` fails looking for `makeappx.exe`** → the Windows SDK / Windows Kits 10

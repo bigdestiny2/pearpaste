@@ -1,0 +1,16 @@
+{
+  "repository": "ghcr.io/bigdestiny2/pearpaste",
+  "digest": null,
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "startOsArches": [
+    "x86_64",
+    "aarch64"
+  ],
+  "startOsPackageRevision": 1,
+  "webPort": 3000,
+  "umbrelPort": 9195,
+  "startOsPort": 9196
+}

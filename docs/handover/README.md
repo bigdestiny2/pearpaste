@@ -9,7 +9,7 @@ Operational runbooks for producing the native desktop installers via the
 > OS is `npm ci` then `npm run make` (`electron-forge make`), which writes
 > artifacts under **`out/make/`**:
 > - **Windows:** `Paste.msix`
-> - **Linux:** `Paste-*.AppImage`, `*_flatpak.tar.gz` (Flatpak staging tarball), `*.snap`
+> - **Linux:** `Paste-*.AppImage`, `*_flatpak.tar.gz` (Flatpak staging tarball); `.snap` is opt-in/out-of-band
 > - **macOS:** `Paste-*.dmg` (+ `.zip`)
 >
 > The old `npm run build:win` / `build:linux` / `build:mac` scripts
@@ -34,14 +34,42 @@ the signing env/secrets are set:
 | `windows-latest` | `Paste.msix` (Windows SDK is preinstalled on the runner) |
 | `macos-latest` | `Paste.dmg` + `.zip` arm64 |
 | `macos-13` | `Paste.dmg` + `.zip` x64 (Intel) |
-| `ubuntu-latest` | `.AppImage` + Flatpak tarball (x64); `.snap` best-effort |
-| `ubuntu-24.04-arm` | same (arm64; **public repos only** — fails on private repos) |
+| `ubuntu-latest` | `.AppImage` + Flatpak staging tarball (x64) |
+| `ubuntu-24.04-arm` | `.AppImage` + Flatpak staging tarball (arm64; **public repos only** — fails on private repos) |
 
 > We call `npm run make` directly rather than `holepunchto/actions/make-pear-app@v1`
 > because that composite action **hard-fails** macOS/Windows when signing
 > credentials are absent — it cannot produce the unsigned dev/CI builds we need
-> today. The Linux `.snap` runs as a `continue-on-error` step (it needs
-> `snapcraft`) so a snap hiccup never blocks the AppImage/Flatpak artifacts.
+> today. Snap is not built in CI by default: it needs `snapcraft` + LXD and is
+> gated behind `PEARPASTE_BUILD_SNAP=1` for an out-of-band Linux box or
+> snapcraft.io remote build.
+
+## CI artifact smoke proof
+After each `npm run make`, CI runs:
+
+```sh
+node scripts/smoke-packaged-artifacts.mjs
+```
+
+That step is the Phase 3 packaged-artifact smoke gate. It runs on the same
+native runner that produced the artifact, fails the job if a required artifact is
+missing or malformed, and writes `.sha256` sidecars beside every uploaded file.
+
+| Runner family | Required artifacts | Automated proof |
+|---|---|---|
+| macOS | `.dmg`, `.zip` | `hdiutil verify`, mount the DMG, `unzip -t`, extract the ZIP, then inspect `Paste.app` for its executable, `package.json`, Electron main/preload, Bare workers, and the `darwin-universal` `sodium-native` Bare prebuild. |
+| Windows | `.msix` | `makeappx unpack`, then inspect the unpacked package for `AppxManifest.xml`, `Paste.exe`, Electron main/preload, Bare workers, and the `win32-x64` `sodium-native` Bare prebuild. |
+| Linux | `.AppImage`, `*_flatpak.tar.gz` | AppImage `--appimage-extract`, Flatpak tarball `tar -tzf`, then inspect each payload for Electron main/preload, Bare workers, and the runner-arch `sodium-native` Bare prebuild. |
+
+**Proof boundary:** CI now proves that Forge emitted the expected native
+containers, that each container can be opened by the platform-native tooling, and
+that the packaged payload still contains the files needed to boot the Electron
+host and Bare vault worker. It also proves checksum sidecars are generated before
+upload. CI does **not** prove installability on a user machine, GUI launch,
+vault create/unlock, `verify-encryption.js` against a real runtime store,
+notarization, Authenticode/SmartScreen reputation, Snap Store review, finished
+Flatpak installation, cross-device sync, or OTA update behavior; those remain the
+manual handoff gates below and in `E2E_TEST_PLAN.md`.
 
 > Local `npm run make` on your own Windows/Linux/Mac box is the **manual
 > fallback / signing path** when you can't use CI (e.g. signing with a cert that
@@ -72,11 +100,11 @@ UNSIGNED artifact** that still builds cleanly (locally AND in this CI).
 - **Linux Flatpak (`make`):** `tar` only (emits a staging tarball). Finishing it
   into a `.flatpak` needs `flatpak` + `flatpak-builder` + the runtimes — see
   `BUILD_FLATPAK.md`.
-- **Linux Snap:** `snapcraft` + `lxd` (CI installs these automatically).
+- **Linux Snap:** `snapcraft` + `lxd` for out-of-band builds with `PEARPASTE_BUILD_SNAP=1`.
 - **All OSes:** Node 22 LTS, Git, `npm ci` (pulls the platform `sodium-native`
   prebuild — the only native addon; no C++ toolchain needed for the app).
 
 ## What you'll send back
 - Windows: `out/make/.../Paste.msix` + `.sha256`
-- Linux: `out/make/.../Paste-*.AppImage`, `*_flatpak.tar.gz`, `*.snap` + `.sha256` each
+- Linux: `out/make/.../Paste-*.AppImage`, `*_flatpak.tar.gz` (+ out-of-band `*.snap` when built) + `.sha256` each
 - macOS: `out/make/.../Paste-*.dmg` (+ `.zip`) + `.sha256`

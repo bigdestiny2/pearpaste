@@ -16,8 +16,8 @@ import {
   View, Text, FlatList, StyleSheet, ActivityIndicator, Modal, TouchableOpacity
 } from 'react-native'
 import { COPY, errorText } from '../lib/copy'
-import { theme, hexA } from '../lib/theme'
-import { Eyebrow, H1, Lede, Hint, Banner, Button, Card, SealedRow } from '../lib/ui'
+import { theme } from '../lib/theme'
+import { Eyebrow, H1, Lede, Hint, Banner, Button, SealedRow } from '../lib/ui'
 import { PairScreen } from './PairScreen'
 import { getMobilePearEnd } from '../lib/MobilePearEnd'
 
@@ -145,16 +145,16 @@ export function DevicesScreen ({ rpc, unlocked, relayCount = 0, pairRequest = nu
               const title = d.sealed ? COPY.devices.sealedRow : (d.label || d.deviceId || 'unknown')
               const meta = d.sealed
                 ? null
-                : [d.platform, (d.roles || []).join(','), d.revoked ? COPY.devices.revokedSuffix : null]
+                : [d.platform, d.self ? COPY.devices.selfSuffix : null, (d.roles || []).join(','), d.revoked ? COPY.devices.revokedSuffix : null]
                     .filter(Boolean).join(' · ')
-              const canRevoke = !d.sealed && !d.revoked
+              const canRevoke = !d.sealed && !d.revoked && !d.self
               return (
                 <View style={styles.deviceRow}>
                   <SealedRow
                     icon={d.revoked ? '⌀' : '▣'}
                     title={title}
                     meta={meta}
-                    badge={d.sealed ? 'sealed' : (d.revoked ? COPY.devices.revokedSuffix : 'active')}
+                    badge={d.sealed ? 'sealed' : (d.self ? COPY.devices.selfSuffix : (d.revoked ? COPY.devices.revokedSuffix : 'active'))}
                     badgeTone={d.sealed ? 'gradient' : (d.revoked ? 'muted' : 'mint')}
                   />
                   {canRevoke && (
