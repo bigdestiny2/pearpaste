@@ -37,7 +37,7 @@ no test today wires *two real Autobase instances and replicates between them*. T
 
 | # | Device / shell | Min OS | Build/runtime | Role in multi-writer tests | Notes |
 |---|---|---|---|---|---|
-| D1 | macOS desktop (Apple Silicon) | macOS 13 Ventura+ | `pear run --dev .`; release = `pear run pear://<key>` | Primary desktop writer | Maintainer reference: **M3 Ultra Mac Studio (arm64)**. Signed/notarized `.app` is a release gate, see §10. |
+| D1 | macOS desktop (Apple Silicon) | macOS 13 Ventura+ | `pear run --dev .`; release = `pear run pear://<key>` | Primary desktop writer | Maintainer reference: **M3 Ultra workstation (arm64)**. Signed/notarized `.app` is a release gate, see §10. |
 | D2 | Windows desktop | Windows 10 64-bit+ | `pear run`; wrapper via `npm run build:win` | Second desktop writer (soak) | Authenticode + SmartScreen gate, §10. |
 | D3 | Linux desktop | glibc 2.31+ (Ubuntu 20.04+) | `pear run`; AppImage/.deb/.rpm via `npm run build:linux` | Second desktop writer (soak) | Clipboard backend (X11/Wayland) is the platform risk. |
 | M1 | iOS — **PearPasteMobile** (RN-CLI) | iOS 15.1+ | Xcode 26.x, `react-native-bare-kit@0.14.0` | Physical writer #1 | `min_ios_version_supported`. **See variant caveat below.** |

@@ -277,7 +277,7 @@ function buildDeb (pkg, link, icons) {
   const control = `Package: ${pkg.name}
 Version: ${pkg.version}
 Architecture: ${arch}
-Maintainer: Paste Maintainers <defidon@protonmail.com>
+Maintainer: Paste Maintainers <bigdestiny2>
 Priority: optional
 Section: utils
 Installed-Size: ${installedKib}

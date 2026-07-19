@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-08
 **Scope:** Full-stack review by 5 area specialists (P2P core, Crypto/Security, Desktop, Mobile, Build/Release/Docs) plus a dedicated relay specialist who verified and applied fixes.
-**Repo:** `/Users/localllm/Downloads/pearpaste`
+**Repo:** `~/Downloads/pearpaste`
 
 ---
 
@@ -26,14 +26,14 @@
 
 **Final status: `working-great`** (verification status was `working-with-caveats`; all recommended fixes were then applied and the status was upgraded).
 
-The relay specialist reviewed `backend/relay-service.js` (~880 lines), the empty-by-default config layer, the pin/probe scripts, all three relay integration tests + harness, `docs/RELAY_CUSTODY.md`, and the **real installed `p2p-hiverelay-client@0.9.2` source**. The relay layer holds end to end.
+The relay specialist reviewed `backend/relay-service.js` (~880 lines), the empty-by-default config layer, the pin/probe scripts, all three relay integration tests + harness, `docs/RELAY_CUSTODY.md`, and the **current `p2p-hiverelay-client@0.20.2` split-client package line**. The relay layer holds end to end.
 
 **What was verified:**
 
 - **Config resolution (end-to-end):** Three-tier `loadFleetConfig()` — bundled `config/fleet-relays.js` (priority 3) → `<storage>/fleet-relays.json` (priority 2) → `PEARPASTE_RELAYS` env (priority 1, `knownRelays`/WSS-bridge pinning only). Each layer independently try/caught. Env override and file override both confirmed working; malformed per-install JSON logs `fleet-config-storage-bad` and continues. `foundationPubkeys` validated as 64-hex + deduped. Bundled config is empty across all three fields → pure HyperDHT auto-discovery. Local-first use is never blocked by config.
 - **Silent fallback:** Three independent degrade paths (absent optional dep, import failure, `client.start()` failure) each set `degradedReason` and return `{ok:false, local:true}` no-ops. No relay path throws. Confirmed by integration tests AND by a real backend boot that auto-discovered and connected to a **live 8-relay fleet with empty config** and completed `relay-seed-done`.
 - **Blindness (rigorous):** The only two outbound app-payload calls — `client.seed()` and `client.publishCustodyIntent()` — are BOTH preceded by `assertCiphertextOnly()` + `recordRelayExport()`, unconditionally, before the client check (so even the degraded path proves the payload was clean). `assertCiphertextOnly()` recursively walks nested objects/arrays and scans serialized JSON for the plaintext sentinel. Other client calls send only public identifiers. PVSS `splitForCustody`/`publish` are never used by the app. Live-fleet blindness tests (#24/#25) pass.
-- **Real 0.9.2 API match:** Advanced-mode constructor sets `_ownsSwarm=_ownsStore=false`; `destroy()` only tears down owned resources (so the shared Hyperswarm/Corestore survive) and removes only its own `connection` listener — the teardown contract is honored. All method signatures and event payloads match relay-service usage.
+- **Current 0.20.2 API match:** Advanced-mode construction leaves the shared Hyperswarm/Corestore owned by PearPaste; `destroy()` only tears down client-owned resources and removes its own listeners, so the teardown contract is honored. All method signatures and event payloads match relay-service usage.
 - **Custody receipts:** TTL/expiry and ciphertext-root binding are correct; `getCustodyStatus()` compares the relay's reported root to ours and flags `receiptsMatchRoot=false` on mismatch (never silently trusts). Quorum failure keeps the clip local.
 - **Tests:** `test:integration` 12/12 (90/90 asserts, then 96/96 after new assertions). `test:unit` 34/34 (166/166). Security suite 23/25 — **the 2 failures are in the notes/reducer layer, not relay**, and are NOT sandbox/EPERM issues (proven pre-existing by stash-and-rerun on baseline).
 
@@ -115,7 +115,7 @@ The relay specialist reviewed `backend/relay-service.js` (~880 lines), the empty
 | Build/Release | "View/Read the source" links point to a GitHub user profile, not the repository | `website/index.html:115,333,360` | Point all source links at the actual repository URL and make the demo clone URL match. |
 | Build/Release | Duplicate Pear config (`pear.json` vs `package.json#pear`) drifts — two sources of truth | `pear.json:27-33` vs `package.json:36-48` | Keep a single Pear manifest. Pear reads `package.json#pear` when present; remove `pear.json` (or vice-versa) and update `scripts/release-prod.sh:99` which copies `pear.json` into the staged mirror. |
 | Build/Release | `engines.node >=20` conflicts with the documented/CI-pinned Node 22 | `package.json:101-102` | Raise `engines` to `>=22` to match what is tested/shipped, or add a Node 20 CI matrix entry so the declared floor is actually exercised. |
-| Relay *(fixed)* | `seeded` event handler reads `e.appKey` but the real 0.9.2 client emits `{key,...}` | `backend/relay-service.js:294` | **FIXED:** now reads `e && (e.appKey || e.key)`. |
+| Relay *(fixed)* | `seeded` event handler reads `e.appKey` but the current split client emits `{key,...}` | `backend/relay-service.js:294` | **FIXED:** now reads `e && (e.appKey || e.key)`. |
 | Relay *(fixed)* | `bootstrap[]` fleet-config field is silently ignored in Pear-native (advanced) mode | `backend/relay-service.js:273` | **FIXED:** annotated the example JSON and added a `relay-fleet-bootstrap-ignored` warn when `bootstrap[]` is set. |
 
 ### Info (5, non-blocking)
@@ -168,7 +168,7 @@ The relay specialist reviewed `backend/relay-service.js` (~880 lines), the empty
 ### 4.3 Relay / availability layer
 *(HiveRelay encrypted availability + Atomic Blind Custody + DHT auto-discovery)*
 
-**Summary:** See Section 2 for the full verdict. The relay layer is well-built; config resolution, silent fallback, and blindness all hold, verified against the real `p2p-hiverelay-client@0.9.2` source and a live 8-relay fleet. **Final status `working-great`** after 4 low-risk fixes.
+**Summary:** See Section 2 for the full verdict. The relay layer is well-built; config resolution, silent fallback, and blindness all hold, verified against the current `p2p-hiverelay-client@0.20.2` split-client package line and a live 8-relay fleet. **Final status `working-great`** after 4 low-risk fixes.
 
 **Key strengths:** Three-tier config with independent try/catch per layer; empty-default pure-DHT auto-discovery; three independent no-op degrade paths that never throw; both outbound app-payload calls unconditionally guarded by `assertCiphertextOnly()` + `recordRelayExport()` before the client check; recursive nested-field scanning; real-client teardown contract honored (shared swarm/store preserved); custody receipts bind to our ciphertext root and flag mismatches; quorum failure keeps clips local.
 

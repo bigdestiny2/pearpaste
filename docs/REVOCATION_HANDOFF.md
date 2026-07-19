@@ -52,7 +52,7 @@ Make device revocation REAL: a revoked device must lose READ access to content c
 1. Spawn a focused **opus** subagent (background) with the phase brief; design doc as spec.
 2. When it lands, **independently re-run the FULL suite yourself** (sandbox OFF). Do NOT trust the agent's report alone — a subagent's final message can be lost to a transient rate-limit; verify from the working tree (`git status`, `git diff`, lint, full suite).
 3. **Review the diff** — especially `autobase-sync.js` and any off-brief file touches (confirm deviations are justified; Phase 2's `index.js` touch was a legitimate epoch-key-persistence need).
-4. **Commit.** Author MUST be `bigdestiny2 <33146784+bigdestiny2@users.noreply.github.com>`. `git config user.email` is set to it — but **VERIFY it before every commit** (a denied Bash once swallowed the `git config` and produced a stray `defidon@protonmail.com` commit that needed an amend+force-push).
+4. **Commit.** Author MUST be `bigdestiny2 <33146784+bigdestiny2@users.noreply.github.com>`. `git config user.email` is set to it — but **VERIFY it before every commit** (a denied Bash once swallowed the `git config` and produced a stray `bigdestiny2` commit that needed an amend+force-push).
 5. **Rebase onto origin + FAST-FORWARD push:** `git fetch origin total-review-followups && git rebase origin/total-review-followups && git push origin total-review-followups`. **NEVER force-push** — the Windows/Linux **build boxes share this branch** (they push glibc docs, the Flatpak spike, etc.). Their files are disjoint from the backend code, so rebases are clean. Update task state.
 
 ## 4. Verification — CRITICAL

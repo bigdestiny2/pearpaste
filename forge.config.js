@@ -148,7 +148,7 @@ export default {
             summary: 'Private, end-to-end encrypted note + clipboard sync over P2P',
             description:
               'Personal, end-to-end encrypted note and clipboard sync over the Pear / Holepunch P2P stack. No accounts, no servers — your devices hold the keys.',
-            contact: 'defidon@protonmail.com',
+            contact: 'bigdestiny2',
             license: 'Apache-2.0',
             issues: 'https://github.com/bigdestiny2/pearpaste/issues',
             website: 'https://github.com/bigdestiny2/pearpaste',
