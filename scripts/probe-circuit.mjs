@@ -6,7 +6,7 @@
 // fails. That call requires the connected relay to advertise the circuit
 // protocol — getRelays() reports `hasCircuitProtocol` per relay. The
 // 2026-05-19 fleet status doc covers seed/custody health but not whether
-// circuit was enabled in v0.8.14. This script answers that.
+// circuit is advertised by the current HiveRelay fleet. This script answers that.
 //
 // Run from the pearpaste repo root:
 //   node scripts/probe-circuit.mjs
@@ -80,7 +80,7 @@ if (!relays.length) {
   if (circuit === 0) {
     console.log('\nVERDICT: circuit channel is NOT advertised by any reached relay.')
     console.log('  → Our pair-circuit-fallback will return all-circuits-failed.')
-    console.log('  → Upstream ask: enable circuit channel server-side on v0.8.14.')
+    console.log('  → Upstream ask: enable circuit channel server-side on the current HiveRelay fleet.')
   } else if (circuit < relays.length) {
     console.log('\nVERDICT: PARTIAL — some relays advertise circuit, some don\'t.')
     console.log('  → Fallback works if it lands on a circuit-capable relay; flaky otherwise.')

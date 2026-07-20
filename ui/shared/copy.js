@@ -78,6 +78,7 @@ export const COPY = Object.freeze({
   pairExpires: 'Expires',
   pairAccepting: 'Enter an invite or short code from another device to join its vault.',
   pairAcceptAction: 'Join vault',
+  deviceSelf: 'this device',
   revokeAction: 'Revoke',
   revokeConfirm: 'Revoke this device? Future content uses rotated keys it cannot read.',
   // Modal-form revoke confirmation (replaces the native confirm()). Mirrors

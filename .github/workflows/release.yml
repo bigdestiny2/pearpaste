@@ -1,3 +1,21 @@
+# ===========================================================================
+# DEPRECATED — LEGACY pear-electron build path. DO NOT EXTEND.
+# ---------------------------------------------------------------------------
+# This workflow builds installers via the OLD scripts/build-{macos,windows}.mjs
+# + scripts/package-linux.mjs + `pear build` (the pear-electron UI-library
+# model). The pear-runtime + Electron-Forge migration SUPERSEDES this path.
+#
+#   >>> CURRENT release-build workflow: .github/workflows/build-release.yml <<<
+#       (holepunchto/actions/make-pear-app@v1 -> electron-forge make)
+#
+# Kept only for the dual-boot window (the legacy `pear run --dev .` path must
+# keep working until a later cutover). It is intentionally left intact but
+# frozen: add no new build logic here. It will be removed at the Phase 5
+# cutover. Its signing secrets (APPLE_DEV_ID, APPLE_NOTARY_*, WIN_CERT_BASE64,
+# WIN_CERT_PASS) are distinct from build-release.yml's; see that file's header
+# for the current secret list.
+# ===========================================================================
+#
 # Paste — native installer release workflow (Agent 3 desktop distribution).
 #
 # Builds the three native installers from the current Pear `pear build

@@ -1,0 +1,7 @@
+{
+  "multisig": {
+    "publicKeys": ["<SIGNER_1_PUBKEY>", "<SIGNER_2_PUBKEY>", "<SIGNER_3_PUBKEY>"],
+    "namespace": "bigdestiny2/pearpaste",
+    "quorum": 2
+  }
+}

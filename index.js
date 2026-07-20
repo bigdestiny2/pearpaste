@@ -14,11 +14,27 @@
 // This file is robust if the `Pear` global is absent (plain Node dev/test): it
 // still boots the Pear-end and exposes the same bridge object so the e2e tests
 // and a non-Pear harness can drive it without a GUI.
-
-import { createPearEnd } from './backend/index.js'
-import { createBridge } from './backend/desktop-bridge.js'
+//
+// DUAL-BOOT (docs/PEAR_RUNTIME_MIGRATION.md): this is also the package.json
+// `main`, which Electron reads as ITS entry too — Pear ignores `pear.main`
+// and reads the root `main`, so one runtime-detected entry serves both:
+//   Electron (Forge path)  -> defer to ./electron/main.js
+//   Pear     (legacy path) -> pear-electron launcher below
+//   plain Node (tests/dev) -> in-process Pear-end + bridge below
 
 const hasPear = typeof globalThis.Pear !== 'undefined'
+const hasElectron = !hasPear &&
+  typeof process !== 'undefined' && process.versions && !!process.versions.electron &&
+  // Electron MAIN process only (the renderer also has versions.electron;
+  // process.type distinguishes 'browser' (main) from 'renderer'/'worker').
+  process.type === 'browser'
+
+if (hasElectron) {
+  await import('./electron/main.js')
+}
+
+const { createPearEnd } = hasElectron ? {} : await import('./backend/index.js')
+const { createBridge } = hasElectron ? {} : await import('./backend/desktop-bridge.js')
 
 // ---- storage path ---------------------------------------------------------
 function resolveStoragePath () {
@@ -49,7 +65,8 @@ async function startLauncher () {
     Bridge = (await import('pear-bridge')).default
   } catch (err) {
     console.error(JSON.stringify({
-      level: 'error', msg: 'desktop-ui-unavailable',
+      level: 'error',
+      msg: 'desktop-ui-unavailable',
       err: String((err && err.message) || err)
     }))
     return { launcher: false }
@@ -80,9 +97,10 @@ export async function boot () {
 }
 
 // Auto-boot when run as the Pear/desktop entry. Under test the harness imports
-// { boot } / createBridge instead and never triggers this branch.
-const isMain = hasPear ||
-  (typeof process !== 'undefined' && process.argv && /index\.js$/.test(process.argv[1] || ''))
+// { boot } / createBridge instead and never triggers this branch. Under
+// Electron the ./electron/main.js import above IS the boot — skip this one.
+const isMain = !hasElectron && (hasPear ||
+  (typeof process !== 'undefined' && process.argv && /index\.js$/.test(process.argv[1] || '')))
 if (isMain) {
   boot().catch((err) => {
     console.error(JSON.stringify({ level: 'error', msg: 'boot-failed', err: String((err && err.stack) || err) }))

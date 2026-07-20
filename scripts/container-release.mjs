@@ -1,0 +1,502 @@
+#!/usr/bin/env node
+// Central release helper for the self-hosted Pear Paste container.
+//
+// package.json owns the human version. release/container-image.json owns the
+// registry, supported platforms, and optional immutable multi-arch digest.
+
+import { spawnSync } from 'child_process'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const CONFIG_PATH = path.join(ROOT, 'release', 'container-image.json')
+const PACKAGE_PATH = path.join(ROOT, 'package.json')
+const UMBREL_PACKAGES = [
+  {
+    label: 'Umbrel official package',
+    dir: path.join(ROOT, 'platforms', 'umbrel', 'pearpaste'),
+    appId: 'pearpaste',
+    appHost: 'pearpaste_web_1'
+  },
+  {
+    label: 'Umbrel community-store package',
+    dir: path.join(ROOT, 'platforms', 'umbrel', 'hiverelay-pearpaste'),
+    appId: 'hiverelay-pearpaste',
+    appHost: 'hiverelay-pearpaste_web_1'
+  }
+]
+const COMMUNITY_STORE_ID = 'hiverelay'
+const COMMUNITY_PACKAGE = UMBREL_PACKAGES.find((pkg) => pkg.appId === 'hiverelay-pearpaste')
+const DEFAULT_COMMUNITY_STORE = path.resolve(ROOT, '..', '..', '00-core', 'blindspark-umbrel-store')
+
+const argv = process.argv.slice(2)
+const command = argv.shift() || 'status'
+const has = (flag) => argv.includes(flag)
+const val = (flag) => {
+  const index = argv.indexOf(flag)
+  if (index === -1) return undefined
+  return argv[index + 1]
+}
+
+const C = {
+  ok: '\x1b[32m',
+  warn: '\x1b[33m',
+  err: '\x1b[31m',
+  dim: '\x1b[2m',
+  x: '\x1b[0m'
+}
+
+const log = (message) => console.log(`[container] ${message}`)
+const ok = (message) => console.log(`${C.ok}[container:ok]${C.x} ${message}`)
+const warn = (message) => console.log(`${C.warn}[container:warn]${C.x} ${message}`)
+const die = (message) => {
+  console.error(`${C.err}[container:error]${C.x} ${message}`)
+  process.exit(1)
+}
+
+function readJson (absPath) {
+  return JSON.parse(fs.readFileSync(absPath, 'utf8'))
+}
+
+function writeJson (absPath, value) {
+  fs.writeFileSync(absPath, `${JSON.stringify(value, null, 2)}\n`)
+}
+
+function resolvePathFromRoot (value) {
+  return path.isAbsolute(value) ? value : path.resolve(ROOT, value)
+}
+
+function packageVersion () {
+  const pkg = readJson(PACKAGE_PATH)
+  if (!pkg.version || typeof pkg.version !== 'string') {
+    die('package.json must contain a string version')
+  }
+  return pkg.version
+}
+
+function normalizeDigest (digest) {
+  if (digest === null || digest === undefined || digest === '') return null
+  if (typeof digest !== 'string') die('container digest must be a string or null')
+  const trimmed = digest.trim()
+  if (!/^sha256:[a-f0-9]{64}$/.test(trimmed)) {
+    die(`expected a multi-arch digest like sha256:<64 hex chars>, got ${digest}`)
+  }
+  return trimmed
+}
+
+function readConfig () {
+  const config = readJson(CONFIG_PATH)
+  if (!config.repository || typeof config.repository !== 'string') {
+    die('release/container-image.json must contain a repository string')
+  }
+  if (!Array.isArray(config.platforms) || config.platforms.length === 0) {
+    die('release/container-image.json must contain at least one Docker platform')
+  }
+  if (!Array.isArray(config.startOsArches) || config.startOsArches.length === 0) {
+    die('release/container-image.json must contain at least one StartOS arch')
+  }
+  const revision = Number(config.startOsPackageRevision)
+  if (!Number.isInteger(revision) || revision < 1) {
+    die('release/container-image.json startOsPackageRevision must be a positive integer')
+  }
+  const webPort = Number(config.webPort || config.uiPort)
+  if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65535) {
+    die('release/container-image.json webPort must be a TCP port')
+  }
+  const umbrelPort = Number(config.umbrelPort || config.uiPort || webPort)
+  if (!Number.isInteger(umbrelPort) || umbrelPort < 1 || umbrelPort > 65535) {
+    die('release/container-image.json umbrelPort must be a TCP port')
+  }
+  const startOsPort = Number(config.startOsPort || config.uiPort || webPort)
+  if (!Number.isInteger(startOsPort) || startOsPort < 1 || startOsPort > 65535) {
+    die('release/container-image.json startOsPort must be a TCP port')
+  }
+  return {
+    ...config,
+    digest: normalizeDigest(config.digest),
+    startOsPackageRevision: revision,
+    webPort,
+    umbrelPort,
+    startOsPort
+  }
+}
+
+function releaseState (overrideDigest) {
+  const config = readConfig()
+  const version = packageVersion()
+  const imageTag = `${config.repository}:${version}`
+  const digest = overrideDigest === undefined ? config.digest : normalizeDigest(overrideDigest)
+  return {
+    config,
+    version,
+    imageTag,
+    digest,
+    imageRef: digest ? `${imageTag}@${digest}` : imageTag,
+    platforms: config.platforms,
+    startOsVersion: `${version}:${config.startOsPackageRevision}`,
+    webPort: config.webPort,
+    umbrelPort: config.umbrelPort,
+    startOsPort: config.startOsPort
+  }
+}
+
+function expectedUmbrelExports (state) {
+  return `# Generated by npm run container:sync.
+# Source of truth: package.json version + release/container-image.json.
+export APP_PEARPASTE_IMAGE="${state.imageRef}"
+export APP_PEARPASTE_WEB_PORT="${state.webPort}"
+export APP_PEARPASTE_UMBREL_PORT="${state.umbrelPort}"
+`
+}
+
+function writeIfChanged (absPath, content) {
+  const current = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf8') : ''
+  if (current === content) return false
+  fs.writeFileSync(absPath, content)
+  return true
+}
+
+function expectedUmbrelApp (pkg, state) {
+  const appPath = path.join(pkg.dir, 'umbrel-app.yml')
+  const current = fs.readFileSync(appPath, 'utf8')
+  let next = current.replace(/^version:\s*["']?.*?["']?\s*$/m, `version: "${state.version}"`)
+  if (next === current && !/^version:/m.test(current)) {
+    die(`cannot find version field in ${path.relative(ROOT, appPath)}`)
+  }
+  next = next.replace(/^port:\s*[0-9]+\s*$/m, `port: ${state.umbrelPort}`)
+  if (!/^port:/m.test(current)) die(`cannot find port field in ${path.relative(ROOT, appPath)}`)
+  return next
+}
+
+function syncGeneratedFiles () {
+  const state = releaseState()
+  const changed = []
+  for (const pkg of UMBREL_PACKAGES) {
+    const exportsPath = path.join(pkg.dir, 'exports.sh')
+    const appPath = path.join(pkg.dir, 'umbrel-app.yml')
+    if (writeIfChanged(exportsPath, expectedUmbrelExports(state))) {
+      changed.push(path.relative(ROOT, exportsPath))
+    }
+    if (writeIfChanged(appPath, expectedUmbrelApp(pkg, state))) {
+      changed.push(path.relative(ROOT, appPath))
+    }
+  }
+  if (changed.length === 0) ok('generated platform metadata is already in sync')
+  else ok(`updated ${changed.join(', ')}`)
+}
+
+function checkGeneratedFiles () {
+  const state = releaseState()
+  let failures = 0
+  const expectedExports = expectedUmbrelExports(state)
+  for (const pkg of UMBREL_PACKAGES) {
+    const exportsPath = path.join(pkg.dir, 'exports.sh')
+    const appPath = path.join(pkg.dir, 'umbrel-app.yml')
+    const composePath = path.join(pkg.dir, 'docker-compose.yml')
+
+    const actualExports = fs.existsSync(exportsPath) ? fs.readFileSync(exportsPath, 'utf8') : ''
+    if (actualExports !== expectedExports) {
+      warn(`${path.relative(ROOT, exportsPath)} is out of sync; run npm run container:sync`)
+      failures++
+    } else {
+      ok(`${pkg.label} exports image ref is in sync`)
+    }
+
+    const expectedApp = expectedUmbrelApp(pkg, state)
+    const actualApp = fs.readFileSync(appPath, 'utf8')
+    if (actualApp !== expectedApp) {
+      warn(`${path.relative(ROOT, appPath)} version/port is out of sync; run npm run container:sync`)
+      failures++
+    } else {
+      ok(`${pkg.label} manifest version and port are in sync`)
+    }
+
+    const compose = fs.readFileSync(composePath, 'utf8')
+    const expectedImageLine = 'image: $' + '{APP_PEARPASTE_IMAGE}'
+    const expectedHostLine = `APP_HOST: ${pkg.appHost}`
+    if (!compose.includes(expectedImageLine)) {
+      warn(`${path.relative(ROOT, composePath)} must consume APP_PEARPASTE_IMAGE`)
+      failures++
+    } else if (!compose.includes(expectedHostLine)) {
+      warn(`${path.relative(ROOT, composePath)} must target ${pkg.appHost}`)
+      failures++
+    } else if (!compose.includes('APP_PORT: $' + '{APP_PEARPASTE_WEB_PORT}')) {
+      warn(`${path.relative(ROOT, composePath)} must proxy APP_PEARPASTE_WEB_PORT`)
+      failures++
+    } else if (/^\s*ports:\s*$/m.test(compose)) {
+      warn(`${path.relative(ROOT, composePath)} must not publish raw host ports`)
+      failures++
+    } else {
+      ok(`${pkg.label} compose uses generated image, host, and internal port`)
+    }
+  }
+
+  if (failures > 0) process.exit(1)
+}
+
+function communityStorePath () {
+  const explicit = val('--store') || process.env.PEARPASTE_UMBREL_STORE
+  if (explicit) return resolvePathFromRoot(explicit)
+  if (fs.existsSync(DEFAULT_COMMUNITY_STORE)) return DEFAULT_COMMUNITY_STORE
+  die('community store checkout not found; pass --store <path> or set PEARPASTE_UMBREL_STORE')
+}
+
+function assertCommunityStore (storeRoot) {
+  const storeManifestPath = path.join(storeRoot, 'umbrel-app-store.yml')
+  if (!fs.existsSync(storeManifestPath)) {
+    die(`${storeRoot} does not look like an Umbrel community app store; missing umbrel-app-store.yml`)
+  }
+  const storeManifest = fs.readFileSync(storeManifestPath, 'utf8')
+  if (!new RegExp(`^id:\\s*${COMMUNITY_STORE_ID}\\s*$`, 'm').test(storeManifest)) {
+    die(`${path.relative(ROOT, storeManifestPath)} must have store id "${COMMUNITY_STORE_ID}"`)
+  }
+}
+
+function walkFiles (dir) {
+  if (!fs.existsSync(dir)) return []
+  const out = []
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const abs = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...walkFiles(abs))
+    } else if (entry.isFile()) {
+      out.push(abs)
+    }
+  }
+  return out
+}
+
+function relativeFileSet (dir) {
+  return new Set(walkFiles(dir).map((file) => path.relative(dir, file)))
+}
+
+function diffDirectories (left, right) {
+  const leftFiles = relativeFileSet(left)
+  const rightFiles = relativeFileSet(right)
+  const diffs = []
+  const all = [...new Set([...leftFiles, ...rightFiles])].sort()
+
+  for (const rel of all) {
+    const leftPath = path.join(left, rel)
+    const rightPath = path.join(right, rel)
+    if (!leftFiles.has(rel)) {
+      diffs.push(`extra in store: ${rel}`)
+    } else if (!rightFiles.has(rel)) {
+      diffs.push(`missing from store: ${rel}`)
+    } else if (!fs.readFileSync(leftPath).equals(fs.readFileSync(rightPath))) {
+      diffs.push(`content differs: ${rel}`)
+    }
+  }
+
+  return diffs
+}
+
+function syncCommunityStore () {
+  const storeRoot = communityStorePath()
+  assertCommunityStore(storeRoot)
+
+  const sourceDir = COMMUNITY_PACKAGE.dir
+  const targetDir = path.join(storeRoot, COMMUNITY_PACKAGE.appId)
+  if (has('--dry-run')) {
+    checkGeneratedFiles()
+    log(`would mirror ${path.relative(ROOT, sourceDir)} -> ${targetDir}`)
+    return
+  }
+
+  syncGeneratedFiles()
+  fs.rmSync(targetDir, { recursive: true, force: true })
+  fs.mkdirSync(path.dirname(targetDir), { recursive: true })
+  fs.cpSync(sourceDir, targetDir, { recursive: true })
+  ok(`synced ${COMMUNITY_PACKAGE.appId} to ${targetDir}`)
+}
+
+function checkCommunityStore () {
+  checkGeneratedFiles()
+  const storeRoot = communityStorePath()
+  assertCommunityStore(storeRoot)
+
+  const sourceDir = COMMUNITY_PACKAGE.dir
+  const targetDir = path.join(storeRoot, COMMUNITY_PACKAGE.appId)
+  const diffs = diffDirectories(sourceDir, targetDir)
+  if (diffs.length) {
+    for (const diff of diffs) warn(`${COMMUNITY_PACKAGE.appId} ${diff}`)
+    die(`community-store package is out of sync; run npm run container:sync-store -- --store ${storeRoot}`)
+  }
+
+  ok(`community-store package matches ${path.relative(ROOT, sourceDir)}`)
+}
+
+function printStatus () {
+  const state = releaseState()
+  log(`version: ${state.version}`)
+  log(`tag: ${state.imageTag}`)
+  log(`digest: ${state.digest || '(not pinned)'}`)
+  log(`release ref: ${state.imageRef}`)
+  log(`platforms: ${state.platforms.join(', ')}`)
+  log(`StartOS version: ${state.startOsVersion}`)
+  log(`web port: ${state.webPort}`)
+  log(`Umbrel launch port: ${state.umbrelPort}`)
+  log(`StartOS preferred launch port: ${state.startOsPort}`)
+  log('')
+  log('Publish without editing manifests by hand:')
+  log('  npm run container:publish -- --apply-digest')
+  log('')
+  log('If the digest was captured elsewhere:')
+  log('  npm run container:pin-digest -- --digest sha256:<multi-arch-digest>')
+  log('')
+  log('Sync/check the HiveRelay community-store checkout:')
+  log('  npm run container:sync-store -- --store ../../00-core/blindspark-umbrel-store')
+  log('  npm run container:check-store -- --store ../../00-core/blindspark-umbrel-store')
+}
+
+function updateDigest (digest) {
+  if (!digest) die('pin-digest requires --digest sha256:<multi-arch-digest>')
+  const config = readConfig()
+  config.digest = normalizeDigest(digest)
+  writeJson(CONFIG_PATH, config)
+  syncGeneratedFiles()
+  ok(`pinned ${releaseState().imageRef}`)
+}
+
+function clearDigest () {
+  const config = readConfig()
+  config.digest = null
+  writeJson(CONFIG_PATH, config)
+  syncGeneratedFiles()
+  ok(`cleared digest; image ref is ${releaseState().imageRef}`)
+}
+
+function runDocker (args, options = {}) {
+  if (options.dryRun) {
+    log(`docker ${args.join(' ')}`)
+    return { status: 0 }
+  }
+  return spawnSync('docker', args, {
+    cwd: ROOT,
+    stdio: 'inherit'
+  })
+}
+
+function readMetadataDigest (metadataPath) {
+  if (!fs.existsSync(metadataPath)) return null
+  const metadata = readJson(metadataPath)
+  return normalizeDigest(metadata['containerimage.digest'])
+}
+
+function buildLocal () {
+  const state = releaseState(null)
+  const args = [
+    'build',
+    '--build-arg',
+    `PEARPASTE_VERSION=${state.version}`,
+    '--tag',
+    'pearpaste:local',
+    '--tag',
+    state.imageTag,
+    '.'
+  ]
+  const result = runDocker(args, { dryRun: has('--dry-run') })
+  if (result.status !== 0) process.exit(result.status || 1)
+}
+
+function publish () {
+  const state = releaseState(null)
+  const dryRun = has('--dry-run')
+  const applyDigest = has('--apply-digest')
+  const metadataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pearpaste-container-'))
+  const metadataPath = path.join(metadataDir, 'metadata.json')
+  const args = [
+    'buildx',
+    'build',
+    '--platform',
+    state.platforms.join(','),
+    '--build-arg',
+    `PEARPASTE_VERSION=${state.version}`,
+    '--tag',
+    state.imageTag,
+    '--metadata-file',
+    metadataPath,
+    '--push',
+    '.'
+  ]
+
+  if (has('--no-cache')) args.splice(args.length - 1, 0, '--no-cache')
+
+  const result = runDocker(args, { dryRun })
+  if (result.status !== 0) process.exit(result.status || 1)
+  if (dryRun) return
+
+  const digest = readMetadataDigest(metadataPath)
+  if (!digest) {
+    warn(`publish finished, but Docker did not write a digest to ${metadataPath}`)
+    log(`Inspect manually: docker buildx imagetools inspect ${state.imageTag}`)
+    process.exit(1)
+  }
+
+  ok(`published ${state.imageTag}@${digest}`)
+  if (applyDigest) {
+    updateDigest(digest)
+  } else {
+    log(`Pin this exact image with: npm run container:pin-digest -- --digest ${digest}`)
+  }
+}
+
+function usage () {
+  console.log(`Usage: node scripts/container-release.mjs <command>
+
+Commands:
+  status                  Show the derived image tag/ref and release commands.
+  sync                    Regenerate platform files from central metadata.
+  check                   Verify generated platform files are current.
+  sync-store [--store path] [--dry-run]
+                          Mirror the HiveRelay community-store app package.
+  check-store [--store path]
+                          Verify the community-store app package is current.
+  build-local [--dry-run] Build a local Docker image with the central tag.
+  publish [--dry-run] [--apply-digest] [--no-cache]
+                          Push the multi-arch image with docker buildx.
+  pin-digest --digest sha256:<digest>
+                          Record the immutable multi-arch digest and sync files.
+  clear-digest            Return manifests to the mutable version tag.
+`)
+}
+
+switch (command) {
+  case 'status':
+    printStatus()
+    break
+  case 'sync':
+    syncGeneratedFiles()
+    break
+  case 'check':
+    checkGeneratedFiles()
+    break
+  case 'sync-store':
+    syncCommunityStore()
+    break
+  case 'check-store':
+    checkCommunityStore()
+    break
+  case 'build-local':
+    buildLocal()
+    break
+  case 'publish':
+    publish()
+    break
+  case 'pin-digest':
+    updateDigest(val('--digest') || argv[0])
+    break
+  case 'clear-digest':
+    clearDigest()
+    break
+  case 'help':
+  case '--help':
+  case '-h':
+    usage()
+    break
+  default:
+    usage()
+    die(`unknown command: ${command}`)
+}

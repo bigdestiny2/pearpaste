@@ -11,6 +11,7 @@
 import { ERROR_CODES } from './shared-ops.js'
 
 export const COMMANDS = Object.freeze({
+  VAULT_STATUS: 'VAULT_STATUS',
   UNLOCK_VAULT: 'UNLOCK_VAULT',
   LOCK_VAULT: 'LOCK_VAULT',
   CREATE_VAULT: 'CREATE_VAULT',
@@ -44,6 +45,7 @@ export const COMMANDS = Object.freeze({
 // Commands allowed while the vault is locked. Everything else is rejected with
 // VAULT_LOCKED until UNLOCK_VAULT succeeds.
 export const UNLOCKED_NOT_REQUIRED = new Set([
+  COMMANDS.VAULT_STATUS,
   COMMANDS.UNLOCK_VAULT,
   COMMANDS.CREATE_VAULT,
   COMMANDS.RESTORE_VAULT,

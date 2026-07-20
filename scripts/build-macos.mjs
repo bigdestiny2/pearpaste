@@ -1,5 +1,13 @@
 // Paste — macOS build orchestrator (launcher model).
 //
+// ⚠️ DEPRECATED — legacy dist/ build path. DO NOT use for releases.
+//   Canonical desktop build is now electron-forge:  npm run make  →  out/make/
+//   (see forge.config.js; pear-electron). This bare-runtime launcher builder
+//   writes to dist/ and is retained ONLY as the Phase-4 rollback fallback until
+//   the electron-forge cutover (docs/PEAR_RUNTIME_MIGRATION.md, Phase 5).
+//   NOTE: the dist/macos-wrapper variant emits a boot.js that requires a
+//   boot.bundle it does not ship, so it crash-loops — never ship dist/ output.
+//
 // Spec refs: §12 (desktop packaging), §17 (release; sign + notarize), §21
 // Agent 3 (desktop distribution). Sibling of scripts/build-windows.mjs.
 //
@@ -62,7 +70,7 @@ const MODE = has('--release')
 const UNSIGNED = has('--unsigned')
 
 // The production app link the launcher runs. Overridable for staging/dev.
-const PRODUCTION_LINK = 'pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy'
+const PRODUCTION_LINK = 'pear://qnax5k8ojtod51ci9qwkrawdof1hx5w3a7gqbueoqnzzq9dw5hfo'
 const APP_LINK = val('--link', 'PEARPASTE_LINK') || PRODUCTION_LINK
 
 const PRODUCT_NAME = 'Paste'

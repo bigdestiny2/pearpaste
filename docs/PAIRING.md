@@ -161,9 +161,10 @@ touches a relay or any replicated core.
    mnemonic, if no passphrase) so subsequent routine unlocks use
    `UNLOCK_VAULT` without re-entering the phrase (spec §14/§23 "support both;
    never require a cloud account").
-5. Locate the vault by its deterministic topic and sync from peers/relays. If
-   no peers/relays are reachable, the user can import an encrypted backup file
-   (`IMPORT_ENCRYPTED_BACKUP`).
+5. Locate the vault by its deterministic topic and sync from peers/relays. This
+   build does not yet ship an encrypted backup import UI/handler; if no peers
+   or relays are reachable, recovery is blocked until a trusted device or relay
+   can provide the encrypted log.
 
 ### 4.1 Normal vs high-security mode (spec §23)
 

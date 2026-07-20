@@ -13,9 +13,9 @@ Product thesis: a personal, fast, always-available, end-to-end encrypted note an
 This specification treats the user's existing repos as prior art, not as code to fork blindly.
 
 - Local prior-art pages:
-  - `/Users/localllm/Downloads/p2p-sites/pearbrowser/index.html`
-  - `/Users/localllm/Downloads/p2p-sites/p2phiverelay/index.html`
-  - `/Users/localllm/Downloads/p2p-sites/p2pbuilders/index.html`
+  - `~/Downloads/p2p-sites/pearbrowser/index.html`
+  - `~/Downloads/p2p-sites/p2phiverelay/index.html`
+  - `~/Downloads/p2p-sites/p2pbuilders/index.html`
 - Upstream prior-art repos:
   - [bigdestiny2/P2P-Hiverelay](https://github.com/bigdestiny2/P2P-Hiverelay)
   - [bigdestiny2/pearbrowser-desktop](https://github.com/bigdestiny2/pearbrowser-desktop)
@@ -41,11 +41,11 @@ Key takeaways from Pear docs:
 
 Key takeaways from HiveRelay:
 
-- The repo is currently a monorepo with `packages/core`, `packages/client`, `packages/services`, and `packages/verifier`; package metadata and release notes show `0.8.13`, while some README copy still references earlier `0.8.x` status.
+- HiveRelay is a `0.20.2` monorepo with `packages/core`, `packages/client`, `packages/services`, and `packages/verifier`; PearPaste defaults to npm `latest` for the core/client packages and gates release on that dist-tag resolving to the promoted HiveRelay line.
 - HiveRelay provides always-on availability, relay discovery, proof/verification primitives, circuit-relay patterns, and blind custody patterns.
 - The current security docs distinguish what is mathematically enforced from what remains residual risk: relays can see encrypted bytes and metadata, can refuse service, but should not receive plaintext or data keys in blind mode.
 - Atomic Blind Custody gives quorum receipts, source retirement, and witness tombstones for encrypted custody flows, while honestly not proving physical deletion.
-- Release `0.8.13` adds a cancellation/lifecycle contract that prevents stale async references after relay restart, important for long-running availability.
+- Current HiveRelay releases include the cancellation/lifecycle contract, blind custody, lease APIs, anchored proof surfaces, and bounded relay metadata needed for long-running encrypted availability.
 
 Key takeaways from PearBrowser Desktop:
 
@@ -567,7 +567,7 @@ Connection policy:
 - Relay-assisted replication when direct peers are unavailable.
 - Exponential reconnect with jitter.
 - No duplicate swarm instances.
-- Teardown drains async loops before closing Corestore, borrowing the HiveRelay `LifecycleScope` idea from release `0.8.13`.
+- Teardown drains async loops before closing Corestore, borrowing the current HiveRelay `LifecycleScope` contract.
 
 ## 11. HiveRelay Integration
 
@@ -734,7 +734,9 @@ Recovery restore:
 1. User enters 24-word phrase and optional passphrase.
 2. Device derives root seed.
 3. Device locates vault by deterministic topic.
-4. If no peers/relays found, user can import an encrypted backup file.
+4. If no peers/relays are reachable, restore is blocked in this build until a
+   trusted device or relay can provide the encrypted log. Encrypted backup
+   import/export is reserved future work, not a shipped recovery path.
 5. Device creates a new device key and either:
    - self-authorizes if root key signs recovery add, or
    - requires existing device approval depending on security setting.
@@ -742,7 +744,9 @@ Recovery restore:
 Security setting:
 
 - Normal: recovery phrase can add a device.
-- High security: recovery phrase decrypts local backup, but adding a network device requires an existing admin device.
+- High security: recovery phrase verifies the vault identity but does not
+  persist local vault keys or join the network; adding a network device requires
+  an existing admin device.
 
 ## 15. API Surface
 
@@ -771,6 +775,12 @@ SEARCH
 RELAY_STATUS
 RELAY_SET_ENABLED
 VERIFY_ENCRYPTION
+```
+
+Reserved schema names declared for future backup work, but not handled or
+surfaced in this build:
+
+```ts
 EXPORT_ENCRYPTED_BACKUP
 IMPORT_ENCRYPTED_BACKUP
 ```
@@ -1029,7 +1039,7 @@ Ownership:
 
 Responsibilities:
 
-- Integrate `p2p-hiverelay-client` `0.8.13` or later.
+- Integrate the HiveRelay `0.20.2` packages through npm `latest` by default (`p2p-hiverelay` core plus `p2p-hiverelay-client`) and move release builds to the matching published semver range after promotion.
 - Discover relays through HiveRelay client.
 - Seed encrypted vault logs with p2p-only/blind settings.
 - Implement custody intent path for temporary clips and encrypted backup capsules.

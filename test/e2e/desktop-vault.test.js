@@ -76,11 +76,21 @@ test('Agent 3 acceptance: sealed list, tap-to-decrypt, lock clears, clip round-t
   // UX copy hygiene (spec §19) — no "Sign in"/"Cloud sync"/etc.
   t.ok(assertCopyClean(COPY), 'UX copy contains no banned phrases')
 
+  // 0. first-run probe: locked-allowed VAULT_STATUS reports no vault yet, so
+  // the lock screen can open on Create instead of asking for a passphrase
+  // that doesn't exist.
+  const status0 = await call(bridge, 'VAULT_STATUS', {})
+  t.ok(status0.ok, 'VAULT_STATUS is allowed while locked')
+  t.alike(status0.result, { hasVault: false, locked: true }, 'fresh install reports no vault, locked')
+
   // 1. create vault (mnemonic shown exactly once)
   const created = await call(bridge, 'CREATE_VAULT', { label: 'desktop', platform: 'macos', passphrase: 'pw' })
   t.ok(created.ok, 'CREATE_VAULT ok')
   const mnemonic = created.result.mnemonic
   t.is(bridge._mnemonicCount(), 1, 'mnemonic returned exactly once')
+
+  const status1 = await call(bridge, 'VAULT_STATUS', {})
+  t.alike(status1.result, { hasVault: true, locked: false }, 'after create: vault exists and is unlocked')
 
   // 2. NOTE_UPSERT then NOTE_LIST is sealed (no plaintext body/title)
   const secret = SENTINEL_PREFIX + 'DESKTOP_E2E_BODY'

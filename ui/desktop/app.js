@@ -15,10 +15,10 @@
 //
 // Visual layer ported from website/styles.css (see docs/DESIGN_SPEC.md).
 
-import { createBridgeClient } from '../shared/bridge-client.js'
-import { COPY, assertCopyClean } from '../shared/copy.js'
-import { qrToSvg } from '../shared/qr.js'
-import { h, mount } from '../shared/dom.js'
+import { createBridgeClient } from '../shared/bridge-client.js?v=20260627-ota'
+import { COPY, assertCopyClean } from '../shared/copy.js?v=20260622-audit3'
+import { qrToSvg } from '../shared/qr.js?v=20260622-audit3'
+import { h, mount } from '../shared/dom.js?v=20260622-audit3'
 
 // pear-electron exposes `app.tray()` for a menubar icon. In `pear run --dev .`
 // the dock icon is locked to the Pear runtime's bundle (can't be overridden);
@@ -39,12 +39,16 @@ const REDUCE_MOTION = typeof window !== 'undefined' && window.matchMedia &&
 // ---- session state (NO vault keys ever; only the one open item's plaintext) -
 const S = {
   locked: true,
+  hasVault: null, // VAULT_STATUS probe: null = unknown, false = first run
+  lockMode: null, // sticky lock-screen tab; survives re-renders (banners, busy states)
+  lockInvite: '', // sticky pair-invite text (public payload, not a secret)
   view: 'notes',
   banner: null, // { kind, text }
   notes: [],
   clips: [],
   devices: [],
   searchResults: null,
+  searchQuery: '', // sticky so re-renders don't wipe the typed query
   open: null, // { type:'note'|'clip', id, data, openedAt } — the ONE decrypted item
   openTimer: null,
   visibilityMs: 60000,
@@ -53,6 +57,8 @@ const S = {
   relay: null,
   proof: null,
   clipboard: null, // backend clipboard settings/stats
+  backendAvailable: true,
+  update: { supported: !!bridge.supportsUpdates, status: 'idle', error: null },
   pendingPhrase: null // { mnemonic, vaultId } shown once after CREATE_VAULT
 }
 
@@ -116,6 +122,8 @@ const NAV_ICONS = {
 
 const LOCK_OPEN_PATH = '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018-2"/>'
 const LOCK_CLOSED_PATH = '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/>'
+const UPDATE_PATH = '<path d="M21 12a9 9 0 11-2.6-6.4"/><path d="M21 4v6h-6"/>'
+const RESTART_PATH = '<path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M20 9a8 8 0 00-13.7-4.7L4 6.6"/><path d="M4 15a8 8 0 0013.7 4.7L20 17.4"/>'
 
 function setBanner (kind, text, autohide = true) {
   S.banner = text ? { kind, text } : null
@@ -176,6 +184,42 @@ bridge.onEvent((event, payload) => {
     // opaque {seq} only (no content); we ignore it.
     if (S.view === 'notes') refreshNotes()
     else if (S.view === 'clips') refreshClips()
+  } else if (event === 'backend-unavailable' || event === 'backend-crash' || event === 'backend-shutdown') {
+    S.backendAvailable = false
+    clearOpen(false)
+    setBanner('err', 'Backend unavailable. Check the service status, then refresh once it is running again.', false)
+  } else if (event === 'backend-available' || event === 'web-connected') {
+    const wasUnavailable = !S.backendAvailable
+    S.backendAvailable = true
+    if (wasUnavailable) setBanner('ok', 'Backend connection restored.')
+  } else if (event === 'ota-updating') {
+    if (S.update.supported && S.update.status !== 'applied') {
+      S.update.status = 'downloading'
+      S.update.error = null
+    }
+  } else if (event === 'ota-updated') {
+    if (S.update.supported) {
+      S.update.status = 'ready'
+      S.update.error = null
+      setBanner('warn', 'Paste update downloaded. Apply it when you are ready to restart.', false)
+    }
+  } else if (event === 'ota-applying') {
+    if (S.update.supported) {
+      S.update.status = 'applying'
+      S.update.error = null
+    }
+  } else if (event === 'ota-applied') {
+    if (S.update.supported) {
+      S.update.status = 'applied'
+      S.update.error = null
+      setBanner('ok', 'Update installed. Restart Paste to finish.', false)
+    }
+  } else if (event === 'ota-error') {
+    if (S.update.supported) {
+      S.update.status = 'error'
+      S.update.error = (payload && payload.message) || 'update failed'
+      setBanner('err', 'Update failed: ' + S.update.error, false)
+    }
   }
   render()
 })
@@ -267,6 +311,38 @@ function lockPill () {
     unlocked ? 'Unlocked' : 'Locked')
 }
 
+function updatePill () {
+  if (!S.update.supported || S.update.status === 'idle') return null
+  if (S.update.status === 'downloading') {
+    return h('span', { class: 'chip warn update-pill', title: 'Paste update is downloading' },
+      svg(UPDATE_PATH, { size: 13, strokeWidth: 1.8 }),
+      h('span', { class: 'update-copy' }, 'Downloading update'))
+  }
+  if (S.update.status === 'ready' || S.update.status === 'error') {
+    return h('button', {
+      class: 'sm ghost update-pill',
+      title: S.update.status === 'error' ? (S.update.error || 'Update failed') : 'Apply downloaded Paste update',
+      onclick: applyAvailableUpdate
+    },
+    svg(UPDATE_PATH, { size: 13, strokeWidth: 1.8 }),
+    h('span', { class: 'update-copy' }, S.update.status === 'error' ? 'Retry update' : 'Apply update'))
+  }
+  if (S.update.status === 'applying') {
+    return h('button', { class: 'sm ghost update-pill busy', disabled: true },
+      h('span', { class: 'spinner', 'aria-hidden': 'true' }),
+      h('span', { class: 'update-copy' }, 'Applying update'))
+  }
+  if (S.update.status === 'applied') {
+    return h('button', {
+      class: 'sm primary update-pill',
+      onclick: restartAfterUpdate
+    },
+    svg(RESTART_PATH, { size: 13, strokeWidth: 1.8 }),
+    h('span', { class: 'update-copy' }, 'Restart'))
+  }
+  return null
+}
+
 function topbar () {
   return h('div', { class: 'topbar' },
     h('span', { class: 'brand' },
@@ -275,12 +351,38 @@ function topbar () {
       h('span', { class: 'by' }, '/ private clipboard')
     ),
     h('span', { class: 'spacer' }),
+    updatePill(),
     lockPill(),
     !S.locked && h('button', {
       class: 'sm ghost',
       onclick: async () => { try { await bridge.lock() } catch (_) {} }
     }, COPY.lockAction)
   )
+}
+
+async function applyAvailableUpdate () {
+  if (!S.update.supported || S.update.status === 'applying') return
+  S.update.status = 'applying'
+  S.update.error = null
+  render()
+  try {
+    await bridge.applyUpdate()
+    S.update.status = 'applied'
+    setBanner('ok', 'Update installed. Restart Paste to finish.', false)
+  } catch (e) {
+    S.update.status = 'error'
+    S.update.error = e && e.message ? e.message : 'update failed'
+    setBanner('err', 'Update failed: ' + S.update.error, false)
+  }
+  render()
+}
+
+async function restartAfterUpdate () {
+  try {
+    await bridge.appAfterUpdate()
+  } catch (e) {
+    setBanner('err', 'Could not restart after update: ' + (e && e.message ? e.message : 'unknown error'), false)
+  }
 }
 
 function navItem (id, label, iconKey) {
@@ -317,9 +419,12 @@ function unlockScreen () {
   let secret = ''
   let mnemonic = ''
   let passphrase = ''
-  let inviteBlob = ''
+  let inviteBlob = S.lockInvite || ''
   let pairSecret = ''
-  let mode = 'unlock' // 'unlock' | 'create' | 'restore' | 'pair'
+  // 'unlock' | 'create' | 'restore' | 'pair'. Sticky via S.lockMode so a
+  // banner/busy re-render doesn't yank the user back to the Unlock tab
+  // mid-create/mid-pair. First run (no vault on this device) starts on Create.
+  let mode = S.lockMode || (S.hasVault === false ? 'create' : 'unlock')
 
   const wrap = h('div')
   function paint () {
@@ -340,10 +445,10 @@ function unlockScreen () {
     // a throwaway local one.
     body.push(h('div', { style: 'display:flex; justify-content:center; margin-bottom: 20px' },
       h('div', { class: 'seg', role: 'tablist', 'aria-label': 'Vault mode' },
-        h('button', { class: mode === 'unlock' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'unlock' ? 'true' : 'false', onclick: () => { mode = 'unlock'; paint() } }, 'Unlock'),
-        h('button', { class: mode === 'create' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'create' ? 'true' : 'false', onclick: () => { mode = 'create'; paint() } }, 'Create'),
-        h('button', { class: mode === 'restore' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'restore' ? 'true' : 'false', onclick: () => { mode = 'restore'; paint() } }, 'Restore'),
-        h('button', { class: mode === 'pair' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'pair' ? 'true' : 'false', onclick: () => { mode = 'pair'; paint() } }, 'Pair')
+        h('button', { class: mode === 'unlock' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'unlock' ? 'true' : 'false', onclick: () => { mode = 'unlock'; S.lockMode = mode; paint() } }, 'Unlock'),
+        h('button', { class: mode === 'create' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'create' ? 'true' : 'false', onclick: () => { mode = 'create'; S.lockMode = mode; paint() } }, 'Create'),
+        h('button', { class: mode === 'restore' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'restore' ? 'true' : 'false', onclick: () => { mode = 'restore'; S.lockMode = mode; paint() } }, 'Restore'),
+        h('button', { class: mode === 'pair' ? 'active' : '', role: 'tab', 'aria-selected': mode === 'pair' ? 'true' : 'false', onclick: () => { mode = 'pair'; S.lockMode = mode; paint() } }, 'Pair')
       )))
 
     body.push(bannerEl())
@@ -354,7 +459,10 @@ function unlockScreen () {
       body.push(h('input', { type: 'password', placeholder: 'Passphrase', oninput: (e) => { secret = e.target.value } }))
       body.push(h('div', { class: 'actions' },
         h('button', { class: 'primary', onclick: async () => {
-          try { await bridge.unlock(secret, 'passphrase'); S.locked = false; S.view = 'notes'; onEnterView('notes'); setBanner('ok', 'Vault unlocked.'); render() } catch (e) { setBanner('err', e.code === 'NO_VAULT' ? 'No vault on this device yet — create, restore, or pair.' : COPY.errorPrefix + e.message) }
+          try { await bridge.unlock(secret, 'passphrase'); S.locked = false; S.hasVault = true; S.lockMode = null; S.view = 'notes'; onEnterView('notes'); setBanner('ok', 'Vault unlocked.'); render() } catch (e) {
+            if (e.code === 'NO_VAULT') { S.hasVault = false; S.lockMode = null } // re-render lands on Create
+            setBanner('err', e.code === 'NO_VAULT' ? 'No vault on this device yet — create, restore, or pair.' : COPY.errorPrefix + e.message)
+          }
         } }, COPY.unlockAction)
       ))
     } else if (mode === 'create') {
@@ -367,6 +475,8 @@ function unlockScreen () {
             const r = await bridge.createVault({ label: 'desktop', platform: hostPlatform(), passphrase })
             S.pendingPhrase = { mnemonic: r.mnemonic, vaultId: r.vaultId }
             S.locked = false
+            S.hasVault = true
+            S.lockMode = null
             render() // -> phrase screen
           } catch (e) { setBanner('err', COPY.errorPrefix + e.message) }
         } }, COPY.createAction)
@@ -383,7 +493,7 @@ function unlockScreen () {
             await bridge.restoreVault({ mnemonic, passphrase })
             // root-device split: RESTORE sets keys; UNLOCK reloads signer.
             try { await bridge.unlock(passphrase || mnemonic, 'passphrase') } catch (_) {}
-            S.locked = false; S.view = 'notes'; onEnterView('notes'); setBanner('ok', 'Vault restored.'); render()
+            S.locked = false; S.hasVault = true; S.lockMode = null; S.view = 'notes'; onEnterView('notes'); setBanner('ok', 'Vault restored.'); render()
           } catch (e) { setBanner('err', e.code === 'BAD_MNEMONIC' ? 'That recovery phrase is not valid.' : COPY.errorPrefix + e.message) }
         } }, COPY.restoreAction)
       ))
@@ -398,7 +508,8 @@ function unlockScreen () {
       body.push(h('label', null, 'Short code or full invite'))
       body.push(h('textarea', {
         placeholder: 'A1B2-C3D4   — or paste the full invite payload',
-        oninput: (e) => { inviteBlob = e.target.value.trim() }
+        value: inviteBlob,
+        oninput: (e) => { inviteBlob = e.target.value.trim(); S.lockInvite = inviteBlob }
       }))
       body.push(h('label', null, 'Unlock passphrase for this device'))
       body.push(h('input', {
@@ -426,7 +537,8 @@ function unlockScreen () {
               }
               setBanner('warn', 'Pairing — syncing from your unlocked device…', false)
               await bridge.pairAccept(blob, 'desktop', hostPlatform(), pairSecret)
-              S.locked = false; S.view = 'notes'; onEnterView('notes')
+              S.locked = false; S.hasVault = true; S.lockMode = null; S.lockInvite = ''
+              S.view = 'notes'; onEnterView('notes')
               setBanner('ok', 'Device paired. Sync is starting.')
             } catch (e) {
               if (e.code === 'SHORTCODE_NOT_FOUND') setBanner('err', 'Short code not found on the DHT. Check it matches the code on your unlocked device (and that the invite hasn\'t expired), then try again.')
@@ -468,7 +580,7 @@ function phraseScreen () {
       h('div', { class: 'phrase-grid' }, ...words.map((w, i) =>
         h('div', { class: 'w' }, h('span', { class: 'n' }, String(i + 1).padStart(2, '0')), w))),
       h('label', { style: 'text-transform:none; letter-spacing:.01em; font-weight:500; color:var(--muted)' },
-        h('input', { type: 'checkbox', onchange: (e) => { confirmed = e.target.checked; paint() } }),
+        h('input', { type: 'checkbox', checked: confirmed, onchange: (e) => { confirmed = e.target.checked; paint() } }),
         ' ' + COPY.phraseConfirm),
       h('div', { class: 'actions' },
         h('button', { class: 'primary', disabled: !confirmed, onclick: () => {
@@ -484,9 +596,27 @@ function phraseScreen () {
 }
 
 // ---- Notes ----------------------------------------------------------------
+// List rows carry a privacy-coarse HOUR bucket (backend timeBucket: epoch ms
+// truncated to the hour, as a string). Render it as a human time at matching
+// granularity — never the raw number.
+function formatBucket (b) {
+  const ms = Number(b)
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  const d = new Date(ms)
+  const now = new Date()
+  const hour = d.toLocaleTimeString(undefined, { hour: 'numeric' })
+  if (d.toDateString() === now.toDateString()) return 'today ' + hour
+  const yday = new Date(now)
+  yday.setDate(now.getDate() - 1)
+  if (d.toDateString() === yday.toDateString()) return 'yesterday ' + hour
+  const sameYear = d.getFullYear() === now.getFullYear()
+  return d.toLocaleDateString(undefined, sameYear
+    ? { month: 'short', day: 'numeric' }
+    : { month: 'short', day: 'numeric', year: 'numeric' })
+}
 function bucketLabel (b) {
-  if (!b) return ''
-  return 'modified ' + String(b)
+  const t = formatBucket(b)
+  return t ? 'modified ' + t : ''
 }
 function notesScreen () {
   const body = [
@@ -848,7 +978,7 @@ function clipsScreen () {
           '</svg>' }),
         h('div', { class: 'meta', onclick: () => copyClip(c.id) },
           h('div', { class: 't' }, COPY.sealedRow),
-          h('div', { class: 's' }, (c.kind || 'text') + ' · ' + (c.bucket || ''))),
+          h('div', { class: 's' }, (c.kind || 'text') + (formatBucket(c.bucket) ? ' · ' + formatBucket(c.bucket) : ''))),
         h('div', { class: 'row-actions' },
           h('span', { class: 'badge sealed' }, 'sealed'),
           h('button', { class: 'sm', onclick: () => copyClip(c.id) }, COPY.copyClip))
@@ -914,15 +1044,28 @@ async function copyClip (clipId) {
 
 // ---- Search ---------------------------------------------------------------
 function searchScreen () {
-  let q = ''
+  let q = S.searchQuery || ''
   const wrap = h('div')
+  async function doSearch () {
+    if (!q.trim()) { S.searchResults = null; paint(); return }
+    S.searchQuery = q
+    try { S.searchResults = (await bridge.search(q)).results || [] } catch (err) { setBanner('err', COPY.errorPrefix + err.message) }
+    paint()
+  }
   function paint () {
     const body = [
       sectionHead('Local index', 'Search', 'Results are sealed until you open one.'),
       bannerEl(),
-      h('input', { placeholder: COPY.searchPlaceholder, 'aria-label': COPY.searchPlaceholder, oninput: (e) => { q = e.target.value }, onkeydown: async (e) => {
-        if (e.key === 'Enter') { try { S.searchResults = (await bridge.search(q)).results || [] } catch (err) { setBanner('err', COPY.errorPrefix + err.message) } paint() }
-      } })
+      h('div', { style: 'display:flex; gap:10px; align-items:stretch' },
+        h('input', {
+          style: 'flex:1 1 auto; margin:0',
+          placeholder: COPY.searchPlaceholder,
+          'aria-label': COPY.searchPlaceholder,
+          value: q,
+          oninput: (e) => { q = e.target.value },
+          onkeydown: (e) => { if (e.key === 'Enter') doSearch() }
+        }),
+        h('button', { class: 'primary', style: 'margin:0', onclick: doSearch }, 'Search'))
     ]
     if (S.searchResults != null) {
       if (!S.searchResults.length) body.push(h('div', { class: 'empty', style: 'margin-top: 16px' }, COPY.searchEmpty))
@@ -932,10 +1075,25 @@ function searchScreen () {
       // unresolved (paired device, orphan record) and stay sealed/non-clickable.
       else body.push(h('div', { class: 'list', style: 'margin-top: 16px' }, ...S.searchResults.map((r) => {
         const clickable = !!r.id && (r.type === 'note' || r.type === 'clip')
-        const onclick = clickable
-          ? (r.type === 'clip' ? (() => { S.view = 'clips'; onEnterView('clips'); render() }) : (() => openNoteEditor(r.id)))
+        const openResult = clickable
+          ? (r.type === 'clip'
+              ? (() => { S.view = 'clips'; onEnterView('clips'); render() })
+              : (() => { S.view = 'notes'; openNoteEditor(r.id) }))
           : null
-        return h('div', { class: 'row' + (clickable ? '' : ' disabled'), onclick },
+        const onkeydown = clickable
+          ? ((e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                openResult()
+              }
+            })
+          : null
+        return h(clickable ? 'button' : 'div', {
+          class: 'row' + (clickable ? '' : ' disabled'),
+          type: clickable ? 'button' : null,
+          onclick: openResult,
+          onkeydown
+        },
           h('span', { class: 'ico', html:
             '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
             (r.type === 'clip'
@@ -957,7 +1115,7 @@ function searchScreen () {
 // ---- Devices + Pairing ----------------------------------------------------
 function devicesScreen () {
   const body = [
-    sectionHead('Trusted devices', COPY.devicesTitle, 'Each device signs with its own key. Revoke any at any time.'),
+    sectionHead('Trusted devices', COPY.devicesTitle, 'Each device signs with its own key. Revoke paired devices when they should no longer read future content.'),
     bannerEl(),
     h('div', { class: 'actions reveal', 'data-d': '1' },
       h('button', { class: 'primary', onclick: createInvite }, COPY.pairAction),
@@ -974,10 +1132,11 @@ function devicesScreen () {
         '</svg>' }),
       h('div', { class: 'meta' },
         h('div', { class: 't' }, d.sealed ? COPY.sealedRow : (d.label || d.deviceId)),
-        h('div', { class: 's' }, d.sealed ? 'sealed device record' : ((d.platform || '') + (d.revoked ? ' · revoked' : '') + ' · ' + (d.roles || []).join(',')))),
+        h('div', { class: 's' }, d.sealed ? 'sealed device record' : [d.platform || '', d.self ? COPY.deviceSelf : null, d.revoked ? 'revoked' : null, (d.roles || []).join(',')].filter(Boolean).join(' · '))),
       h('div', { class: 'row-actions' },
         d.sealed ? h('span', { class: 'badge sealed' }, 'sealed') : null,
-        !d.sealed && !d.revoked && h('button', {
+        !d.sealed && d.self ? h('span', { class: 'badge' }, COPY.deviceSelf) : null,
+        !d.sealed && !d.revoked && !d.self && h('button', {
           class: 'danger sm',
           onclick: () => requestRevokeDevice(d.deviceId, d.label || d.platform || null)
         }, COPY.revokeAction)
@@ -1330,19 +1489,37 @@ async function setupTray () {
   try {
     await bridge.relayStatus() // allowed while locked; just a reachability probe
   } catch (e) {
-    if (e.code === 'NO_BRIDGE') {
+    if (e.code === 'NO_BRIDGE' || e.code === 'BACKEND_UNAVAILABLE' || e.code === 'RPC_TIMEOUT') {
       // Match the regular render path's wrapper hierarchy: .shell-root > .main >
       // .card. Without it, the fallback card centers against the viewport (not
       // the 920-px main column) and ends up clipped under the topbar's flex
       // chrome on smaller windows.
+      const message = e.code === 'NO_BRIDGE'
+        ? 'Backend bridge not connected. Launch via `pear run --dev .` so the Pear-end is available.'
+        : 'Pear Paste backend is not responding. Check the package service status, then refresh this page.'
       mount(appEl, h('div', { class: 'shell-root' },
         h('div', { class: 'main' },
           h('div', { class: 'card center-card' },
             h('div', { style: 'margin-bottom: 16px' }, brandHero({ size: 'md' })),
-            h('div', { class: 'banner err' }, 'Backend bridge not connected. Launch via `pear run --dev .` so the Pear-end is available.')))))
+            h('div', { class: 'banner err' }, message)))))
       return
     }
   }
+  // First-run probe: no vault on this device -> lock screen opens on Create.
+  // If the backend session is already unlocked (e.g. the web UI was reloaded
+  // while the server kept running), resume it instead of asking for the
+  // passphrase again — the lock screen would be theater: the backend answers
+  // content RPCs either way. Best-effort; on any failure we keep the safe
+  // default (locked, Unlock tab).
+  try {
+    const vs = await bridge.vaultStatus()
+    if (vs && typeof vs.hasVault === 'boolean') S.hasVault = vs.hasVault
+    if (vs && vs.hasVault && vs.locked === false) {
+      S.locked = false
+      S.view = 'notes'
+      onEnterView('notes')
+    }
+  } catch (_) {}
   // We start locked; UNLOCK/CREATE/RESTORE drives the rest.
   render()
 })()

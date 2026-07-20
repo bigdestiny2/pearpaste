@@ -1,0 +1,32 @@
+manifestVersion: 1
+id: hiverelay-pearpaste
+category: files
+name: Pear Paste
+version: "0.1.0"
+tagline: End-to-end encrypted notes and clipboard sync
+description: >-
+  Pear Paste is a personal, local-first vault for encrypted notes and clipboard
+  history. It uses the Pear and Holepunch peer-to-peer stack so your devices can
+  sync without a central plaintext service.
+
+
+  This community-store build runs the self-hosted Pear Paste web bridge on your
+  Umbrel and persists the encrypted vault store under the app data volume. Open
+  the app after install, then create a vault or restore one from its recovery
+  phrase. Keep the recovery phrase offline.
+developer: Big Destiny
+website: https://github.com/bigdestiny2/pearpaste
+dependencies: []
+repo: https://github.com/bigdestiny2/pearpaste
+support: https://github.com/bigdestiny2/pearpaste/issues
+port: 9195
+icon: https://cdn.jsdelivr.net/gh/bigdestiny2/blindspark-umbrel-store@main/hiverelay-pearpaste/icon.svg
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+releaseNotes: >-
+  Initial HiveRelay community-store package with the self-hosted Pear Paste web
+  bridge, persistent encrypted vault storage, and the Pear Paste browser UI.
+submitter: bigdestiny2
+submission: ""

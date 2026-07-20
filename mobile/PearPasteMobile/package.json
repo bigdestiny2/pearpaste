@@ -7,7 +7,7 @@
     "android": "react-native run-android",
     "bundle:bare": "node ../scripts/bundle-bare.mjs",
     "ios": "react-native run-ios",
-    "lint": "eslint .",
+    "lint": "node scripts/lint-mobile-shell.mjs",
     "start": "react-native start",
     "test": "jest"
   },

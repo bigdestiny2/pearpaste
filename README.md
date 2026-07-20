@@ -21,10 +21,17 @@ Installers for macOS, Windows, and Linux are on [paste.global](https://www.paste
 With the [Pear runtime](https://pears.com) installed, any platform can also run Paste directly over P2P — no installer:
 
 ```sh
-pear run pear://u6oyh38gcn3ouk6wnzpoetzpeg7gs1w5s9f5aw5quocr1eubsoiy
+pear run pear://qnax5k8ojtod51ci9qwkrawdof1hx5w3a7gqbueoqnzzq9dw5hfo
 ```
 
 The desktop packages (macOS, Windows, Linux) are thin launchers that run that same link via the Pear runtime, so app updates flow peer-to-peer without re-downloading an installer.
+
+### Find Paste over P2P
+
+Paste also ships a fully peer-to-peer landing page and is listed in the PearBrowser app catalogue — no DNS, no web host:
+
+- **Landing page (Hyperdrive):** `hyper://25a06bb3dddec8138e9eda606cc4a11e9ebbe47815fd5d22064b30cff752bb5b/` — open it in [PearBrowser](https://github.com/bigdestiny2/pearbrowser-desktop). It is a single self-contained page (no remote assets), pinned on HiveRelay, and the source lives in `pear-ecosystem/03-sites/p2p-sites/pearpaste/`.
+- **App catalogue:** Paste appears in PearBrowser's default catalogue and built-in featured apps. The catalogue's **Open** action launches the `pear://` app above in its own window.
 
 ## Why Paste Exists
 
@@ -271,6 +278,8 @@ Paste is not yet a general-audience stable release. Current status:
 - Mobile worklet bundles: committed and guarded
 - Relay: optional infrastructure component
 - Installers: shipping path documented, public release hardening still ongoing
+- P2P landing page: published to Hyperdrive (`hyper://25a06bb3…`) and pinned on HiveRelay
+- Discovery: listed in the PearBrowser default catalogue and built-in featured apps
 
 Notable pre-beta caveats:
 

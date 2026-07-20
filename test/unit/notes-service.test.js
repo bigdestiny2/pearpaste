@@ -37,6 +37,17 @@ function scanForSentinel (dir) {
   return hit
 }
 
+async function waitFor (predicate, { timeoutMs = 8000, intervalMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let last = false
+  while (Date.now() < deadline) {
+    last = await predicate()
+    if (last) return true
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+  }
+  return !!last
+}
+
 test('NOTE_LIST is sealed; NOTE_OPEN returns plaintext; sentinel never at rest', async (t) => {
   const dir = tmp('seal')
   const pe = await createPearEnd({ storagePath: dir, relayClientFactory: false })
@@ -357,6 +368,57 @@ test('NOTE_UPSERT expiresAt=0: persistent note (default)', async (t) => {
   t.absent(list.notes[0].expiresAt, 'persistent note row has no expiresAt (null/undefined)')
   const opened = await pearEnd.call(COMMANDS.NOTE_OPEN, { noteId: up.noteId })
   t.absent(opened.note.expiresAt, 'persistent note decrypts with no expiresAt set')
+})
+
+test('expired clips cannot open/copy and are swept from the materialized view', async (t) => {
+  // Clipboard entries are intentionally short-lived. The list path already
+  // hides expired rows; the stale-id paths (CLIP_OPEN / CLIP_COPY) must refuse
+  // them too, and the background sweeper must emit CLIP_DELETE so the sealed
+  // row leaves the view instead of persisting forever.
+  const dir = tmp('clip-expiry')
+  const pearEnd = await createPearEnd({ storagePath: dir, relayClientFactory: false })
+  t.teardown(async () => { await pearEnd.close(); fs.rmSync(dir, { recursive: true, force: true }) })
+
+  await pearEnd.call(COMMANDS.CREATE_VAULT, { label: 'test', platform: 'macos', passphrase: 'pw' })
+
+  const clipId = 'expired-clip'
+  const objectId = 'clip:' + clipId
+  const clipBody = SENTINEL_PREFIX + 'EXPIRED_CLIP'
+  await pearEnd.ctx.sync.ready(15000)
+  await pearEnd.ctx.sync.refresh()
+  const objectBlindId = await pearEnd.ctx.sync.appendOp(ops.OP_TYPES.CLIP_ADD, ops.SCHEMAS.CLIP, objectId, {
+    clipId,
+    kind: 'text',
+    body: clipBody,
+    sourceDeviceId: pearEnd.ctx.state.device.deviceId,
+    capturedAt: Date.now() - 5000,
+    expiresAt: Date.now() - 1000
+  })
+  await pearEnd.ctx.sync.refresh()
+
+  const sealedBefore = await pearEnd.ctx.sync.view.scanClips()
+  t.ok(sealedBefore.some(row => row.objectBlindId === objectBlindId), 'expired clip row exists before the sweeper runs')
+
+  const list = await pearEnd.call(COMMANDS.CLIP_LIST, {})
+  t.is(list.clips.length, 0, 'expired clip is filtered out of CLIP_LIST')
+  await t.exception(
+    () => pearEnd.call(COMMANDS.CLIP_OPEN, { clipId }),
+    /not found/i,
+    'CLIP_OPEN refuses an expired clip id'
+  )
+  await t.exception(
+    () => pearEnd.call(COMMANDS.CLIP_COPY, { clipId }),
+    /not found/i,
+    'CLIP_COPY refuses an expired clip id'
+  )
+
+  pearEnd.ctx.emit('unlocked')
+  const swept = await waitFor(async () => {
+    await pearEnd.ctx.sync.refresh()
+    const rows = await pearEnd.ctx.sync.view.scanClips()
+    return !rows.some(row => row.objectBlindId === objectBlindId)
+  })
+  t.ok(swept, 'expired clip sweeper emits CLIP_DELETE and removes the sealed row')
 })
 
 test('SEARCH filters expired temporary notes + surfaces expiresAt on live ones', async (t) => {

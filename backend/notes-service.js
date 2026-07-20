@@ -122,6 +122,16 @@ export async function attach (ctx) {
     } catch (_) { return null }
   }
 
+  function isExpired (record, now = Date.now()) {
+    return !!(record && record.expiresAt && record.expiresAt <= now)
+  }
+
+  function throwNotFound (type) {
+    const e = new Error(type + ' not found')
+    e.code = 'NOT_FOUND'
+    throw e
+  }
+
   // ---- NOTE_LIST (sealed rows only) -------------------------------------
   ctx.dispatcher.register(COMMANDS.NOTE_LIST, async ({ limit = 200 }) => {
     const s = await awaitSync()
@@ -153,7 +163,7 @@ export async function attach (ctx) {
         // deleted from the moment expiry passes, even if the sweeper
         // hasn't yet emitted the hard-delete op. Keeps the user-visible
         // contract honest while delete replication catches up.
-        if (note.expiresAt && note.expiresAt <= now) continue
+        if (isExpired(note, now)) continue
         meta = {
           id: note.noteId,
           type: 'note',
@@ -204,9 +214,7 @@ export async function attach (ctx) {
     // the !env / deletedAt branches so callers can pattern-match on "not
     // found" without caring whether the row was hard-deleted, soft-deleted,
     // or expired.
-    if (note.expiresAt && note.expiresAt <= Date.now()) {
-      const e = new Error('note not found'); e.code = 'NOT_FOUND'; throw e
-    }
+    if (isExpired(note)) throwNotFound('note')
     const { __lww, title, ...clean } = note
     // Legacy migration: if a stored note still carries the old `title`
     // field but no `label`, surface title as the label so the renderer
@@ -292,7 +300,7 @@ export async function attach (ctx) {
       // Same raw-row epoch fallback as NOTE_LIST (clip raw rows skip objmeta).
       const clip = openSealedRowSafe(s, objectId, envelope)
       if (clip) {
-        if (clip.expiresAt && clip.expiresAt < now) continue // expired
+        if (isExpired(clip, now)) continue // expired
         meta = {
           id: clip.clipId,
           type: 'clip',
@@ -321,6 +329,7 @@ export async function attach (ctx) {
       clip = openSealedRowSafe(s, null, hit.envelope) // raw-row epoch fallback
       if (!clip) throw err
     }
+    if (isExpired(clip)) throwNotFound('clip')
     const { __lww, ...clean } = clip
     openItem(objectId, clean, ctx.state.visibilityMs)
     return { clip: clean }
@@ -375,6 +384,7 @@ export async function attach (ctx) {
       clip = openSealedRowSafe(s, null, hit.envelope) // raw-row epoch fallback
       if (!clip) throw err
     }
+    if (isExpired(clip)) throwNotFound('clip')
     const body = String(clip.body)
     // app-held plaintext is NOT cached — return for OS clipboard then drop.
     closeItem(objectId)
@@ -422,7 +432,7 @@ export async function attach (ctx) {
             const note = openSealedRowSafe(s, objectId, env)
             if (note) {
               if (note.deletedAt) continue
-              if (note.expiresAt && note.expiresAt <= now) continue
+              if (isExpired(note, now)) continue
               expiresAt = note.expiresAt || null
             }
           }
@@ -485,13 +495,49 @@ export async function attach (ctx) {
       ctx.log.warn('sweep-failed', { err: String((err && err.message) || err) })
     }
   }
+
+  async function sweepExpiredClips () {
+    let s
+    try { s = ctx.sync; if (!s || !s._opened) return } catch (_) { return }
+    let scanned = 0
+    let swept = 0
+    try {
+      const sealed = await s.view.scanClips()
+      const now = Date.now()
+      for (const { bucket, objectBlindId, envelope } of sealed) {
+        scanned++
+        try {
+          const objectId = await resolveObjectId(s, objectBlindId)
+          const clip = openSealedRowSafe(s, objectId, envelope)
+          if (!clip) continue
+          if (!isExpired(clip, now)) continue
+          const clipId = clip.clipId || (objectId && objectId.startsWith('clip:') ? objectId.slice(5) : null)
+          if (!clipId) continue
+          const targetId = objectId || ('clip:' + clipId)
+          closeItem(targetId)
+          await s.appendOp(ops.OP_TYPES.CLIP_DELETE, ops.SCHEMAS.CLIP, targetId, { clipId, bucket })
+          swept++
+        } catch (err) {
+          ctx.log.warn('sweep-clip-failed', { err: String((err && err.message) || err) })
+        }
+      }
+      if (swept > 0) ctx.log.info('temp-clip-sweep', { scanned, swept })
+    } catch (err) {
+      ctx.log.warn('sweep-clips-failed', { err: String((err && err.message) || err) })
+    }
+  }
+
+  async function sweepExpiredRecords () {
+    await sweepExpiredNotes()
+    await sweepExpiredClips()
+  }
   // Run once on unlock (catches anything that expired while the vault was
   // locked) and then on a 5-min cadence. Both paths are coalesced — there's
   // no harm in concurrent sweeps but the loop already serialises.
-  ctx.on('unlocked', () => { ctx.scope.spawn(() => sweepExpiredNotes(), 'sweep-on-unlock') })
+  ctx.on('unlocked', () => { ctx.scope.spawn(() => sweepExpiredRecords(), 'sweep-on-unlock') })
   ctx.scope.spawn(async (scope) => {
     while (!scope.cancelled) {
-      try { await sweepExpiredNotes() } catch (_) {}
+      try { await sweepExpiredRecords() } catch (_) {}
       try { await scope.sleep(SWEEP_INTERVAL_MS) } catch (_) { break }
     }
   }, 'sweep-temp-notes')

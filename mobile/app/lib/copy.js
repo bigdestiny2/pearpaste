@@ -40,7 +40,7 @@ export const COPY = Object.freeze({
     field: '24-word recovery phrase',
     passphraseField: 'Passphrase (if you set one)',
     button: 'Restore vault',
-    hint: 'Restoring derives your keys on this device. If no other device or relay is reachable you can import an encrypted backup file.',
+    hint: 'Restoring derives your keys on this device from your recovery phrase. Pairing another device still requires approval from an unlocked device when high-security restore is enabled.',
     bad: 'That recovery phrase is not valid. Check word order and spelling.'
   },
 
@@ -61,9 +61,10 @@ export const COPY = Object.freeze({
 
   devices: {
     title: 'Devices',
-    blurb: 'Each device signs with its own key. Revoke any at any time — keys rotate and the revoked device cannot read content that arrives after.',
+    blurb: 'Each device signs with its own key. Revoke paired devices when they should no longer read future content.',
     empty: 'No paired devices yet. Pair one with the button below.',
     pairAction: 'Pair a new device',
+    selfSuffix: 'this device',
     revoke: 'Revoke',
     sealedRow: 'Sealed device record',
     revokedSuffix: 'revoked',

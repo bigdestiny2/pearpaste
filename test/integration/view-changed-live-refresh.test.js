@@ -33,6 +33,20 @@ import { createPearEnd } from '../../backend/index.js'
 function tmp (tag) { return fs.mkdtempSync(path.join(os.tmpdir(), 'pp-vchg-' + tag + '-')) }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+async function waitForPairApproval (approvalPromise, timeoutMs = 90000) {
+  let timer = null
+  try {
+    return await Promise.race([
+      approvalPromise,
+      new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('inviter never saw a pairing approval request — DHT connect failed')), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 // Poll `pred()` (pumping the joiner's engine each tick) until it holds or we
 // time out. Returns ms-since-start when it held, else null.
 async function waitFor (engine, pred, { timeoutMs = 30000, every = 250 } = {}) {
@@ -116,10 +130,7 @@ test('receiver ctx emits a payload-less `view-changed` when a remote note materi
     platform: 'test',
     unlockSecret: 'pw-joiner'
   })
-  await Promise.race([
-    gotApproval,
-    sleep(90000).then(() => { throw new Error('inviter never saw a pairing approval request — DHT connect failed') })
-  ])
+  await waitForPairApproval(gotApproval)
   await A.call('PAIR_APPROVE', { requestId: approvalReq.requestId })
   const paired = await acceptP
   t.ok(paired && paired.ok, 'PAIR_ACCEPT resolved (joiner brought up its engine)')

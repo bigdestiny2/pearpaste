@@ -10,13 +10,13 @@ import { OP_TYPES, SCHEMAS, assertHeaderPublicOnly, ForbiddenFieldError } from '
 
 const MNEMONIC = identity.generateMnemonic(b4a.alloc(32, 7))
 
-test('mnemonic + KDF derivation is deterministic and passphrase-bound', (t) => {
+test('mnemonic + KDF derivation is deterministic and passphrase-bound', async (t) => {
   t.ok(identity.validateMnemonic(MNEMONIC), 'generated mnemonic is valid')
   t.is(MNEMONIC.split(' ').length, 24, '24 words')
 
-  const seedA = identity.deriveRootSeed(MNEMONIC, 'pw')
-  const seedB = identity.deriveRootSeed(MNEMONIC, 'pw')
-  const seedC = identity.deriveRootSeed(MNEMONIC, 'different')
+  const seedA = await identity.deriveRootSeed(MNEMONIC, 'pw')
+  const seedB = await identity.deriveRootSeed(MNEMONIC, 'pw')
+  const seedC = await identity.deriveRootSeed(MNEMONIC, 'different')
   t.is(b4a.toString(seedA, 'hex'), b4a.toString(seedB, 'hex'), 'same phrase+pw -> same seed')
   t.not(b4a.toString(seedA, 'hex'), b4a.toString(seedC, 'hex'), 'passphrase changes seed')
 
@@ -42,8 +42,8 @@ test('blindId is keyed, deterministic, and hides the raw id', (t) => {
   t.absent(a.includes('secret'), 'raw id not present in blindId')
 })
 
-test('envelope encrypt/decrypt round-trips; wrong key rejected', (t) => {
-  const seed = identity.deriveRootSeed(MNEMONIC, 'pw')
+test('envelope encrypt/decrypt round-trips; wrong key rejected', async (t) => {
+  const seed = await identity.deriveRootSeed(MNEMONIC, 'pw')
   const { vaultKey } = crypto.deriveVaultKeys(seed)
   const objectId = 'note:abc'
   const objectBlindId = crypto.blindId(crypto.randomBytes(32), objectId)
@@ -109,8 +109,8 @@ test('canonical encoding is key-order stable', (t) => {
 // (a) Legacy byte-compat: a no-epochTag seal under epochKey == vaultKey yields
 // the SAME keyId, the SAME AAD, and the SAME round-trip as the historical path,
 // AND the `epochKey` / `vaultKey` parameter names are interchangeable.
-test('phase0: legacy epochTag="" seal is byte-identical to the historical seal (keyId + AAD + round-trip)', (t) => {
-  const seed = identity.deriveRootSeed(MNEMONIC, 'pw')
+test('phase0: legacy epochTag="" seal is byte-identical to the historical seal (keyId + AAD + round-trip)', async (t) => {
+  const seed = await identity.deriveRootSeed(MNEMONIC, 'pw')
   const { vaultKey } = crypto.deriveVaultKeys(seed)
   const objectId = 'note:legacy'
   const objectBlindId = crypto.blindId(crypto.randomBytes(32), objectId)
@@ -162,7 +162,7 @@ test('phase0: legacy epochTag="" seal is byte-identical to the historical seal (
 // no epochTag anywhere) — exactly what an existing vault has at rest — still
 // opens after this change, confirming nothing in the read path regressed.
 test('phase0: a pre-change (legacy) envelope still opens unchanged', async (t) => {
-  const seed = identity.deriveRootSeed(MNEMONIC, 'pw')
+  const seed = await identity.deriveRootSeed(MNEMONIC, 'pw')
   const { vaultKey } = crypto.deriveVaultKeys(seed)
   const objectId = 'note:atrest'
   const objectBlindId = crypto.blindId(crypto.randomBytes(32), objectId)

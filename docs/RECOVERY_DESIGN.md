@@ -1,6 +1,6 @@
 # PearPaste Account Recovery — Design Note
 
-**Status:** Draft. Blocked on upstream npm publish of `p2p-hiverelay-client@0.9.2`.
+**Status:** Draft. Unblocked for local workspace integration with HiveRelay `0.20.2`; product UX is still pending.
 **Author/date:** 2026-06-01.
 **Scope:** Add an optional, relay-assisted social-recovery path on top of the existing 24-word phrase. The phrase path stays primary and unchanged.
 
@@ -130,7 +130,7 @@ The phrase recovery flow is **untouched** — it remains the primary, single-act
 
 ---
 
-## 5. Implementation plan (when 0.9.2 is on npm)
+## 5. Implementation plan
 
 ### 5.1 Dependency bump
 
@@ -138,11 +138,12 @@ The phrase recovery flow is **untouched** — it remains the primary, single-act
 
 ```json
 "optionalDependencies": {
-  "p2p-hiverelay-client": "^0.9.2"
+  "p2p-hiverelay": "latest",
+  "p2p-hiverelay-client": "latest"
 }
 ```
 
-Code comments in `backend/relay-service.js:3` and `backend/lifecycle-scope.js:3` referencing `0.8.13` get bumped to `0.9.2`.
+This repo now consumes HiveRelay through npm `latest` by default. The release gate must verify that `latest` resolves to the promoted HiveRelay `0.20.2` package line before shipping, and local or CI integration should not fall back to the old `0.9.x` client line.
 
 ### 5.2 New backend module: `backend/recovery.js`
 
@@ -166,16 +167,23 @@ Pure-function module (mirrors `identity.js` style):
 - `test/integration/recovery-custody.test.js` — full split via `_relay-harness.js`, poll receipts, reconstruct.
 - `test/security/sec-recovery.test.js` — below-threshold cannot reconstruct, malformed share rejected, wrong-vault intent rejected, replay of stale intent rejected.
 
-### 5.5 Other 0.8.x → 0.9.2 changes we'd pick up
+### 5.5 Current HiveRelay behavior PearPaste already inherits
 
-Free wins from the same upgrade — none require code changes on our side, but worth verifying:
+The current `0.20.2` HiveRelay package line already includes the earlier custody and
+availability hardening this design originally waited on. None of these require
+extra PearPaste dependency work, but the recovery implementation should keep
+them covered in smoke tests:
 
-- **v0.8.15** Blind-path audit hardening. We already pass `blind: true`; the operator-redaction tightening is automatic.
-- **v0.8.20** `anchored=true` now requires every blob block present locally (not just metadata length). Strictly stronger durability claim.
-- **v0.8.21** Cross-relay autonomous self-heal. Better availability.
-- **v0.8.22** Defensive timeouts on `drive.ready()` / `_isDriveFullyReplicated`. Prevents one hung drive from deadlocking the reseed loop.
-- **v0.8.24** Per-key mutation locks on custody/seed. Closes documented races.
-- **v0.8.27** Claim-path erasure witness. Cryptographic proof of destruction available immediately on retirement, not after `retainUntil`.
+- Blind-path audit hardening. PearPaste already passes `blind: true`; relay-side
+  redaction tightening is automatic.
+- `anchored=true` requires every blob block to be present locally, not only
+  metadata length.
+- Cross-relay autonomous self-heal improves encrypted availability.
+- Defensive timeouts on `drive.ready()` and replication checks prevent one hung
+  drive from deadlocking a reseed loop.
+- Per-key mutation locks on custody/seed close documented races.
+- Claim-path erasure witnesses provide immediate signed destruction evidence on
+  retirement instead of waiting for `retainUntil`.
 
 ---
 
@@ -191,9 +199,9 @@ Free wins from the same upgrade — none require code changes on our side, but w
 
 ## 7. Status / blockers
 
-- **Blocker:** `p2p-hiverelay-client@0.9.2` is **not on npm**. Latest npm release: `0.8.14` (verified `npm view p2p-hiverelay-client versions`). Source for 0.9.2 lives at `packages/client/` in `bigdestiny2/P2P-Hiverelay@main` but has not been `npm publish`ed. CHANGELOG entries for 0.9.0/0.9.1/0.9.2 are dated 2026-05-30 → 2026-05-31.
-- **Action queued:** Open a GitHub issue on `bigdestiny2/P2P-Hiverelay` requesting an npm publish of the 0.9.2 client. Draft text lives alongside this note.
-- **No code changes to PearPaste yet.** Everything in §5 is a queued patch; nothing has been written or installed.
+- **Dependency state:** PearPaste `package.json` defaults `p2p-hiverelay` and `p2p-hiverelay-client` to npm `latest`; refresh `package-lock.json` after the HiveRelay npm `latest` dist-tag is promoted to `0.20.2`.
+- **Product blocker:** social-recovery enrollment/recovery UI and guardian flows still need implementation and test coverage.
+- **Release blocker:** before shipping standalone builds, prove npm `latest` resolves to HiveRelay `0.20.2` and refresh the lockfile from the promoted registry line.
 
 ---
 

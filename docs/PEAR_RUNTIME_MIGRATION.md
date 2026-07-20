@@ -1,7 +1,38 @@
 # RFC: Migrate Paste to the `pear-runtime` + Electron-Forge boilerplate
 
-**Status:** DRAFT — for review. **No code changes in this PR.** This document only proposes a plan.
-**Author:** (migration planning) · **Date:** 2026-06-12 · **Branch:** `docs/pear-runtime-migration-plan`
+**Status:** APPROVED — full adoption of the new conventions ("we adopt all of the
+new conventions and standards for the refactor", 2026-06-12). Implementation in
+progress on `feat/pear-runtime-electron-forge`.
+**Author:** (migration planning) · **Date:** 2026-06-12 · **Plan branch:** `docs/pear-runtime-migration-plan`
+
+## Implementation status (updated as phases land)
+
+| Phase | Status | Notes |
+|---|---|---|
+| 0 Spike | ✅ DONE | Boilerplate sources studied; toolchain validated directly in-repo |
+| 1 Dual-boot entry | ✅ DONE | `electron/main.js` + `workers/{main,paste}.js`; `index.js` is the single runtime-detected entry (NOTE: Pear ignores `pear.main` and reads root `main` — both runtimes share it). Electron app boots, vault create/unlock/note/devices all work over the new FramedStream(Bare.IPC) transport; `verify-encryption` exits 0 on the new conventional store; legacy `pear run --dev .` boots unchanged |
+| 2 Renderer re-wire | ✅ DONE | Third transport (window.bridge adapter) added to `ui/shared/bridge-client.js`; bespoke renderer kept (decision); tray = pear-electron-only for now (Electron `Tray` in Phase 5 polish) |
+| 3 Build layer | 🟡 SMOKE-GATED | `forge.config.js` (ESM) + `build/` assets + `pear.json` scaffold + `upgrade` link minted (`pear://zf4nh8ck…`). `.github/workflows/build-release.yml` now runs `npm run make` on native macOS/Windows/Linux runners, opens/unpacks each required artifact (`.dmg`, `.zip`, `.msix`, `.AppImage`, Flatpak staging tarball), verifies the packaged Electron host/Bare workers/preload + runner-arch `sodium-native` prebuild, and uploads `.sha256` sidecars. Manual install/GUI/vault/verifier/signing/cross-device proof remains in `docs/handover/*`. |
+| 4 Release + OTA | ✅ BRANCH-DONE | Renderer-facing OTA contract landed: updater worker events (`updating`/`updated`/error) surface through `ui/shared/bridge-client.js`, the desktop topbar can apply + restart via the Electron preload bridge, and `test/unit/electron-ota-bridge.test.js` proves the path without a real release. The real vN→vN+1 staged OTA drill remains a maintainer release exercise because production link/signing material is not in-repo |
+| 5 Docs + cutover | ⬜ TODO | Legacy pear-electron path still the default-shippable; cutover after 3+4. **Includes retiring the legacy `dist/` build scripts (see Build paths below).** |
+
+> **Build paths (read before building).** The canonical desktop build is
+> **electron-forge**: `npm run make` → `out/make/` (e.g. `out/make/Paste-0.1.0-arm64.dmg`).
+> The legacy `dist/`-based scripts (`scripts/build-macos.mjs`,
+> `scripts/build-windows.mjs`, `scripts/package-linux.mjs`) are **DEPRECATED** —
+> kept only as the Phase-4 rollback fallback and to be removed at cutover (Phase 5).
+> Do **not** ship `dist/` output: it is git-ignored, embeds older keys, and the
+> `dist/macos-wrapper` variant emits a `boot.js` that `require`s a `boot.bundle`
+> it does not contain → it crash-loops on launch. Canonical app link:
+> `pear://qnax5k8ojtod51ci9qwkrawdof1hx5w3a7gqbueoqnzzq9dw5hfo`.
+
+**Decisions resolved (per the full-adoption call):** repo stays ESM (Electron ≥28
+ESM main; `preload.cjs` is the one CJS boundary file — sandboxed preloads must be
+CJS); bespoke `ui/desktop/app.js` renderer kept (pear-interface is a demo
+toolkit, not a convention); fresh release-line links minted rather than reusing
+`pear://u6oyh38…` (existing installs are pre-beta/throwaway); `pear.json`
+multisig scaffolded with placeholder signer keys — real signers/quorum are
+maintainer-owned and block only the production-release step.
 
 ---
 
@@ -198,10 +229,32 @@ Author `forge.config.*` + makers; wire `pear build --package`. Replace
 artifact with `verify-encryption.js` + a vault smoke test** before deleting the
 old script. Add `pear.json` (multisig) + `upgrade` + version-bump discipline.
 
-**Phase 4 — Release pipeline + OTA.**
-Re-implement `release-prod.sh` as stage→provision→multisig; wire
-`pear.updater`/`bridge.applyUpdate()`; do a real cross-version OTA update test
-(install vN, ship vN+1, confirm auto-update).
+**Phase 4 — Release pipeline + OTA.** Branch implementation landed
+2026-06-27:
+
+- `workers/main.js` keeps the OTA updater isolated from Paste vault data and now
+  returns either `pear:updateApplied` or a structured `pear:updateError` frame
+  for renderer-initiated applies.
+- `electron/main.js` exposes a non-hanging `pear:applyUpdate` IPC handler
+  (single in-flight apply, timeout, worker error propagation) plus the existing
+  `app:afterUpdate` relaunch/quit path.
+- `electron/preload.cjs` exposes those methods as `window.bridge.applyUpdate()`
+  and `window.bridge.appAfterUpdate()`.
+- `ui/shared/bridge-client.js` advertises `supportsUpdates`, maps updater worker
+  frames to renderer events (`ota-updating`, `ota-updated`, `ota-error`), and
+  exposes typed `applyUpdate()` / `appAfterUpdate()` helpers.
+- `ui/desktop/app.js` shows the flow in the topbar:
+  downloaded update → Apply update → Restart.
+- `test/unit/electron-ota-bridge.test.js` fakes the Electron preload bridge and
+  proves updater frames stay separate from Paste RPC, apply resolves/rejects
+  coherently, and restart goes through the Electron bridge.
+
+Production release sequencing remains: Forge build → `pear stage` →
+`pear provision` → `pear multisig` → seeded availability. The actual
+cross-version OTA drill (install vN, stage vN+1, confirm the topbar apply +
+restart lands on vN+1) needs maintainer-owned production/staging links and
+signer quorum, so it is documented as a release-run gate rather than simulated
+in unit tests.
 
 **Phase 5 — Docs + cutover.**
 Rewrite `docs/RELEASE.md`, `docs/handover/*`, `E2E_TEST_PLAN.md`; flip the default
@@ -233,11 +286,13 @@ A phase is "done" only when, for the code it touches:
 | Gate | Where |
 |---|---|
 | `npm run test:all` green (unit 45 · integration 41 · e2e 3 · security 27 · mobile 4) | every phase |
+| Native artifact container opens/unpacks and packaged Electron/Bare payload + `sodium-native` prebuild are present | Phase 3 CI, `.github/workflows/build-release.yml` via `scripts/smoke-packaged-artifacts.mjs` |
+| `.sha256` sidecar emitted beside every uploaded native artifact | Phase 3 CI, `.github/workflows/build-release.yml` |
 | `verify-encryption.js` exits 0 on a **packaged** artifact | Phase 3, per platform |
 | Vault create/unlock smoke on packaged artifact | Phase 3, per platform |
 | GUI parity pass (create/restore/pair/revoke/notes/clips/relay) | Phase 2 |
 | Cross-device pair + sync (Mac↔Win) on packaged builds | Phase 4 |
-| Cross-version OTA auto-update works | Phase 4 |
+| Cross-version OTA auto-update works | Phase 4 release-run gate (`test/unit/electron-ota-bridge.test.js` covers the renderer contract on this branch; real vN→vN+1 staging needs maintainer links/signers) |
 | macOS notarized · Windows signed (or SmartScreen noted) · Linux appimage/flatpak | Phase 3/4 |
 
 ---

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>global.paste.Paste</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>Paste</name>
+  <summary>End-to-end encrypted notes and clipboard, synced peer-to-peer</summary>
+  <description>
+    <p>
+      Paste is a personal, end-to-end encrypted note and clipboard that syncs
+      peer-to-peer across all your own devices over the Pear / Holepunch network.
+      Copy on your laptop, paste on your phone — everything is encrypted on-device
+      before it leaves. No account, no cloud, and no server holds your content.
+    </p>
+    <p>
+      This Flatpak bundles its own runtime (the Freedesktop platform), so it runs
+      on older Linux distributions — such as Ubuntu 20.04 (glibc 2.31) — that the
+      native .deb / AppImage cannot support, because the bundled Electron runtime
+      requires a newer glibc than those hosts provide.
+    </p>
+  </description>
+  <launchable type="desktop-id">global.paste.Paste.desktop</launchable>
+  <developer id="global.paste">
+    <name>Paste</name>
+  </developer>
+  <url type="homepage">https://github.com/bigdestiny2/pearpaste</url>
+  <url type="bugtracker">https://github.com/bigdestiny2/pearpaste/issues</url>
+  <url type="vcs-browser">https://github.com/bigdestiny2/pearpaste</url>
+  <content_rating type="oars-1.1" />
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <provides>
+    <!-- Must match the Forge flatpak maker's generated binary (appName "Paste"). -->
+    <binary>Paste</binary>
+  </provides>
+  <!-- NOTE: the Forge flatpak maker copies this file verbatim — the release
+       version below is NOT auto-stamped from package.json, so bump it per release. -->
+  <releases>
+    <release version="0.1.0" date="2026-06-12">
+      <description>
+        <p>End-to-end encrypted notes + clipboard, synced peer-to-peer. Flatpak bundles its own runtime to run on older Linux.</p>
+      </description>
+    </release>
+  </releases>
+</component>
