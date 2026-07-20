@@ -53,9 +53,10 @@ let packagerConfig = {
   // ~18 GB. Runtime needs ONLY: index.js, electron/, workers/, backend/, ui/,
   // index.html, assets/, build/, pear.json + pruned production node_modules.
   ignore: [
-    /^\/(out|dist|mobile|website|docs|test|scripts|flatpak|patches|coverage|artifacts)(\/|$)/,
+    /^\/(out|outputs|dist|mobile|website|docs|test|scripts|flatpak|patches|coverage|artifacts|platforms|server|release)(\/|$)/,
     /^\/\.(git|github|claude|planning|pear-stage|vscode|idea)(\/|$)/,
-    /^\/\.(gitignore|gitattributes|npmrc|prettierrc|nvmrc|DS_Store)$/,
+    /^\/\.(gitignore|gitattributes|npmrc|prettierrc|nvmrc|DS_Store|dockerignore)$/,
+    /^\/Dockerfile$/,
     /^\/\.env(\.|$)/,
     /^\/[^/]*\.(log|md|txt)$/
   ]

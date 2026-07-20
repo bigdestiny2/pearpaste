@@ -8,7 +8,10 @@ import path from 'node:path'
 
 const makeDir = path.resolve('out', 'make')
 const platform = process.platform
-const runnerArch = normalizeArch(process.env.RUNNER_ARCH || process.arch)
+// PEARPASTE_TARGET_ARCH lets a cross-built artifact (mac x64 made on an arm64
+// runner via `electron-forge make --arch x64`) declare what it SHOULD contain;
+// otherwise assume the artifact targets the machine that built it.
+const runnerArch = normalizeArch(process.env.PEARPASTE_TARGET_ARCH || process.env.RUNNER_ARCH || process.arch)
 const prebuildDir = expectedPrebuildDir(platform, runnerArch)
 
 const artifacts = await findArtifacts(makeDir)

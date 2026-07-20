@@ -43,6 +43,10 @@
       ],
       "ignore": [
         "/out",
+        "/outputs",
+        "/platforms",
+        "/server",
+        "/release",
         "/.git",
         "/.github",
         "/.claude",

@@ -25,7 +25,7 @@
 #   push tags v*      — builds all platforms for a tagged release.
 #
 # Artifacts (out/make/, uploaded per job):
-#   macOS   — .dmg + .zip   (arm64 on macos-latest, x64 on macos-13)
+#   macOS   — .dmg + .zip   (arm64 + x64, both on macos-latest; x64 cross-built)
 #   Windows — .msix          (x64 on windows-latest)
 #   Linux   — .AppImage + flatpak staging tarball (snap is out-of-band)
 #
@@ -96,17 +96,20 @@ jobs:
       - run: npm run test:all
 
   # ---------------------------------------------------------------------------
-  # macOS — .dmg + .zip. arm64 (macos-latest) + x64 (macos-13, Intel).
+  # macOS — .dmg + .zip, arm64 + x64. GitHub retired the free Intel runners
+  # (macos-13 jobs queue forever), so BOTH arches build on the arm64 runner;
+  # x64 is cross-built via `electron-forge make --arch x64` and the smoke gate
+  # is told the intended arch through PEARPASTE_TARGET_ARCH.
   # Unsigned unless MAC_CODESIGN_IDENTITY (+ notary profile) is provided.
   # ---------------------------------------------------------------------------
   build-macos:
-    name: build macOS (${{ matrix.runner }})
+    name: build macOS (${{ matrix.arch }})
     needs: test-gate
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-latest, macos-13]
-    runs-on: ${{ matrix.runner }}
+        arch: [arm64, x64]
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -117,17 +120,19 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Make (electron-forge)
-        run: npm run make
+        run: npm run make -- --arch ${{ matrix.arch }}
         env:
           # Blank => forge.config skips osxSign/osxNotarize entirely (unsigned).
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
           KEYCHAIN_PROFILE: ${{ secrets.KEYCHAIN_PROFILE }}
       - name: Smoke packaged artifacts + checksums
         run: node scripts/smoke-packaged-artifacts.mjs
+        env:
+          PEARPASTE_TARGET_ARCH: ${{ matrix.arch }}
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: paste-macos-${{ matrix.runner }}
+          name: paste-macos-${{ matrix.arch }}
           path: out/make/**
           if-no-files-found: error
           retention-days: 14
